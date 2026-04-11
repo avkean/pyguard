@@ -385,20 +385,22 @@ interface NameGen {
     gen(): string;
 }
 
-// Confusable-identifier generator. Emits names of the form
-// `_<letter><chars>` where letter ∈ {l, I, O} and chars ∈ {l, I, O, 0, 1}.
-// Two emitted names look nearly identical under fast scanning and carry
-// zero semantic value, which is the primary anti-LLM defence.
+// Random-identifier generator. Emits names of the form `_<letters>` where
+// every character is drawn uniformly from the 52-letter mixed-case Latin
+// alphabet. Names carry zero semantic value — the anti-LLM defence is the
+// absence of meaning, not visual confusability. A wider alphabet also
+// makes the output readable enough to debug without diluting the core
+// property that identifiers tell a reader nothing about what they hold.
 function makeNameGen(): NameGen {
     const used = new Set<string>();
-    const pool = "lIO01";
-    const firstPool = "lIO";
+    const pool =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     return {
         gen(): string {
             for (let attempts = 0; attempts < 256; attempts++) {
                 const r = randomBytes(16);
                 const len = 8 + (r[0] % 5); // 8..12
-                let s = "_" + firstPool[r[1] % firstPool.length];
+                let s = "_" + pool[r[1] % pool.length];
                 for (let i = 2; i < len; i++) {
                     s += pool[r[i] % pool.length];
                 }

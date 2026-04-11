@@ -3,39 +3,42 @@
 @tailwind utilities;
 
 :root {
-  --background: 240 10% 3%;
-  --foreground: 0 0% 98%;
+  /* shadcn/radix tokens — kept so third-party UI primitives still work.
+     Values mirror the tailwind.config.ts palette: surfaces are blue-900
+     family, accent is Tailwind blue-300/500. */
+  --background: 232 16% 9%;   /* #13141a surface */
+  --foreground: 220 8% 92%;
 
-  --card: 240 10% 4.5%;
-  --card-foreground: 0 0% 98%;
+  --card: 230 14% 12%;        /* #191a20 surface.raised */
+  --card-foreground: 220 8% 92%;
 
-  --popover: 240 10% 4.5%;
-  --popover-foreground: 0 0% 98%;
+  --popover: 218 50% 12%;
+  --popover-foreground: 220 8% 92%;
 
-  --primary: 217 91% 60%;
+  --primary: 217 91% 60%;     /* blue-500 #3b82f6 */
   --primary-foreground: 0 0% 100%;
 
-  --secondary: 240 4% 12%;
-  --secondary-foreground: 0 0% 98%;
+  --secondary: 220 45% 16%;
+  --secondary-foreground: 220 8% 92%;
 
-  --muted: 240 4% 10%;
-  --muted-foreground: 0 0% 63%;
+  --muted: 220 40% 14%;
+  --muted-foreground: 220 6% 58%;
 
-  --accent: 217 91% 60%;
+  --accent: 212 96% 78%;      /* blue-300 #93c5fd */
   --accent-foreground: 0 0% 100%;
 
-  --destructive: 0 72% 51%;
-  --destructive-foreground: 0 0% 98%;
+  --destructive: 358 75% 59%;
+  --destructive-foreground: 0 0% 100%;
 
-  --border: 0 0% 100% / 0.08;
-  --input: 240 4% 12%;
+  --border: 0 0% 100% / 0.06;
+  --input: 220 45% 16%;
   --ring: 217 91% 60%;
 
   --radius: 0.5rem;
 }
 
 * {
-  @apply border-border;
+  border-color: rgba(255, 255, 255, 0.06);
 }
 
 html,
@@ -44,12 +47,21 @@ body {
 }
 
 body {
-  @apply bg-background text-foreground;
-  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, sans-serif;
+  background-color: #13141a;
+  color: #e9eaec;
+  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #070708;
   font-feature-settings: "ss01", "cv11";
+  text-rendering: optimizeLegibility;
+}
+
+/* Explicit font-family helpers (useful when a component needs to switch off
+   the inherited sans) */
+.font-sans {
+  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
 }
 
 .font-mono,
@@ -62,13 +74,11 @@ pre {
 
 .font-serif {
   font-family: var(--font-serif), ui-serif, Georgia, "Times New Roman", serif;
-  font-feature-settings: "kern", "liga";
+  font-feature-settings: "kern", "liga", "ss01";
 }
 
 /* --------------------------------------------------------------------- */
-/* CodeMirror container — the theme in lib/editor-theme.ts handles colors */
-/* and typography; this just ensures the outer div fills its parent and   */
-/* hides any lingering native scrollbars the theme can't reach.           */
+/* CodeMirror container                                                   */
 /* --------------------------------------------------------------------- */
 
 .code-editor {
@@ -85,8 +95,6 @@ pre {
   outline: none;
 }
 
-/* Hide scrollbars on every descendant of the code editor (belt + braces
-   for the in-theme scrollbar hiding). */
 .code-editor *::-webkit-scrollbar {
   display: none;
   width: 0;
@@ -96,6 +104,29 @@ pre {
 .code-editor * {
   scrollbar-width: none;
   -ms-overflow-style: none;
+}
+
+/* --------------------------------------------------------------------- */
+/* Page-level scrollbar — slim, matches the palette                       */
+/* --------------------------------------------------------------------- */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.12);
+  background-clip: padding-box;
+  border: 2px solid transparent;
 }
 
 /* --------------------------------------------------------------------- */
@@ -113,4 +144,14 @@ pre {
 
 .animate-shimmer {
   animation: shimmer-slide 1.6s ease-in-out infinite;
+}
+
+/* --------------------------------------------------------------------- */
+/* Selection — uses the accent blue, soft                                 */
+/* --------------------------------------------------------------------- */
+
+::selection {
+  /* blue-300 @ 22% */
+  background: rgba(147, 197, 253, 0.22);
+  color: #ffffff;
 }
