@@ -1,0 +1,569 @@
+"""PyGuard v5 build-time IR compiler.
+
+Runs INSIDE Pyodide in the browser at build time. Takes user Python source,
+parses it via Python's stdlib `ast` module, and walks the AST to emit a
+custom IR tree. The IR is then JSON-serialised and handed back to TS for
+encryption + bundling into the stub.
+
+The output IR is structurally similar to a Python AST but uses opaque
+numeric op tags (per-build randomised on the TS side, not here) and
+flattens identifier strings into a separate string pool.
+
+This file is loaded as a Python source string by the TS layer and exec'd
+in Pyodide. It exposes a `compile_to_ir(source: str) -> dict` function.
+"""
+
+import ast
+import json
+
+
+# IR op names. The TS side replaces these with random numeric tags
+# per build, so the names below never appear in the runtime stub.
+OPS = (
+    'Module', 'Expression',
+    'Assign', 'AugAssign', 'AnnAssign',
+    'Expr', 'Return', 'Raise', 'Pass', 'Break', 'Continue',
+    'If', 'While', 'For', 'AsyncFor', 'With', 'AsyncWith',
+    'Try', 'TryStar', 'ExceptHandler',
+    'FunctionDef', 'AsyncFunctionDef', 'Lambda', 'ClassDef',
+    'Global', 'Nonlocal', 'Delete',
+    'Import', 'ImportFrom', 'alias',
+    'BinOp', 'UnaryOp', 'BoolOp', 'Compare', 'IfExp',
+    'Call', 'Attribute', 'Subscript', 'Slice', 'Starred',
+    'Name', 'Constant',
+    'List', 'Tuple', 'Set', 'Dict',
+    'ListComp', 'SetComp', 'DictComp', 'GeneratorExp', 'comprehension',
+    'JoinedStr', 'FormattedValue',
+    'Yield', 'YieldFrom', 'Await',
+    'NamedExpr',
+    'arguments', 'arg', 'keyword', 'withitem',
+    'MatchValue', 'MatchSingleton', 'MatchSequence', 'MatchStar',
+    'MatchMapping', 'MatchClass', 'MatchAs', 'MatchOr', 'Match',
+    # Operator tags (subset)
+    'Add', 'Sub', 'Mult', 'MatMult', 'Div', 'Mod', 'Pow',
+    'LShift', 'RShift', 'BitOr', 'BitXor', 'BitAnd', 'FloorDiv',
+    'And', 'Or',
+    'Invert', 'Not', 'UAdd', 'USub',
+    'Eq', 'NotEq', 'Lt', 'LtE', 'Gt', 'GtE', 'Is', 'IsNot', 'In', 'NotIn',
+    'Load', 'Store', 'Del',
+)
+
+# Operator class names → OP names
+_OP_BIN = {
+    'Add': 'Add', 'Sub': 'Sub', 'Mult': 'Mult', 'MatMult': 'MatMult',
+    'Div': 'Div', 'Mod': 'Mod', 'Pow': 'Pow',
+    'LShift': 'LShift', 'RShift': 'RShift',
+    'BitOr': 'BitOr', 'BitXor': 'BitXor', 'BitAnd': 'BitAnd',
+    'FloorDiv': 'FloorDiv',
+}
+_OP_UNARY = {'Invert': 'Invert', 'Not': 'Not', 'UAdd': 'UAdd', 'USub': 'USub'}
+_OP_BOOL = {'And': 'And', 'Or': 'Or'}
+_OP_CMP = {
+    'Eq': 'Eq', 'NotEq': 'NotEq', 'Lt': 'Lt', 'LtE': 'LtE',
+    'Gt': 'Gt', 'GtE': 'GtE', 'Is': 'Is', 'IsNot': 'IsNot',
+    'In': 'In', 'NotIn': 'NotIn',
+}
+
+
+class _Lifter:
+    def __init__(self):
+        self.strings = []
+        self.string_idx = {}
+        self.consts = []
+        self.const_idx = {}
+
+    def s(self, value):
+        """Intern a string into the string pool, return its index."""
+        if value is None:
+            return -1
+        if value in self.string_idx:
+            return self.string_idx[value]
+        i = len(self.strings)
+        self.string_idx[value] = i
+        self.strings.append(value)
+        return i
+
+    def c(self, value):
+        """Intern a constant value into the const pool, return its index."""
+        # Use repr+type to disambiguate (1 vs True etc).
+        key = (type(value).__name__, repr(value))
+        if key in self.const_idx:
+            return self.const_idx[key]
+        i = len(self.consts)
+        self.const_idx[key] = i
+        self.consts.append(value)
+        return i
+
+    def op_name(self, node):
+        cls = type(node).__name__
+        if cls in _OP_BIN:
+            return _OP_BIN[cls]
+        if cls in _OP_UNARY:
+            return _OP_UNARY[cls]
+        if cls in _OP_BOOL:
+            return _OP_BOOL[cls]
+        if cls in _OP_CMP:
+            return _OP_CMP[cls]
+        raise ValueError(f"unknown operator: {cls}")
+
+    def lift(self, node):
+        """Recursively lift an AST node to an IR dict."""
+        if node is None:
+            return None
+        if isinstance(node, list):
+            return [self.lift(x) for x in node]
+
+        cls = type(node).__name__
+
+        # ---- Module / top-level ----
+        if cls == 'Module':
+            return {'op': 'Module', 'body': self.lift(node.body)}
+
+        # ---- Statements ----
+        if cls == 'Expr':
+            return {'op': 'Expr', 'value': self.lift(node.value)}
+        if cls == 'Assign':
+            return {
+                'op': 'Assign',
+                'targets': self.lift(node.targets),
+                'value': self.lift(node.value),
+            }
+        if cls == 'AugAssign':
+            return {
+                'op': 'AugAssign',
+                'target': self.lift(node.target),
+                'op2': self.op_name(node.op),
+                'value': self.lift(node.value),
+            }
+        if cls == 'AnnAssign':
+            return {
+                'op': 'AnnAssign',
+                'target': self.lift(node.target),
+                'annotation': self.lift(node.annotation),
+                'value': self.lift(node.value),
+                'simple': node.simple,
+            }
+        if cls == 'Return':
+            return {'op': 'Return', 'value': self.lift(node.value)}
+        if cls == 'Raise':
+            return {'op': 'Raise', 'exc': self.lift(node.exc), 'cause': self.lift(node.cause)}
+        if cls == 'Pass':
+            return {'op': 'Pass'}
+        if cls == 'Break':
+            return {'op': 'Break'}
+        if cls == 'Continue':
+            return {'op': 'Continue'}
+        if cls == 'Delete':
+            return {'op': 'Delete', 'targets': self.lift(node.targets)}
+        if cls == 'Global':
+            return {'op': 'Global', 'names': [self.s(n) for n in node.names]}
+        if cls == 'Nonlocal':
+            return {'op': 'Nonlocal', 'names': [self.s(n) for n in node.names]}
+
+        if cls == 'If':
+            return {
+                'op': 'If',
+                'test': self.lift(node.test),
+                'body': self.lift(node.body),
+                'orelse': self.lift(node.orelse),
+            }
+        if cls == 'While':
+            return {
+                'op': 'While',
+                'test': self.lift(node.test),
+                'body': self.lift(node.body),
+                'orelse': self.lift(node.orelse),
+            }
+        if cls == 'For':
+            return {
+                'op': 'For',
+                'target': self.lift(node.target),
+                'iter': self.lift(node.iter),
+                'body': self.lift(node.body),
+                'orelse': self.lift(node.orelse),
+            }
+        if cls == 'AsyncFor':
+            return {
+                'op': 'AsyncFor',
+                'target': self.lift(node.target),
+                'iter': self.lift(node.iter),
+                'body': self.lift(node.body),
+                'orelse': self.lift(node.orelse),
+            }
+        if cls == 'With':
+            return {
+                'op': 'With',
+                'items': self.lift(node.items),
+                'body': self.lift(node.body),
+            }
+        if cls == 'AsyncWith':
+            return {
+                'op': 'AsyncWith',
+                'items': self.lift(node.items),
+                'body': self.lift(node.body),
+            }
+        if cls == 'withitem':
+            return {
+                'op': 'withitem',
+                'context_expr': self.lift(node.context_expr),
+                'optional_vars': self.lift(node.optional_vars),
+            }
+        if cls == 'Try':
+            return {
+                'op': 'Try',
+                'body': self.lift(node.body),
+                'handlers': self.lift(node.handlers),
+                'orelse': self.lift(node.orelse),
+                'finalbody': self.lift(node.finalbody),
+            }
+        if cls == 'ExceptHandler':
+            return {
+                'op': 'ExceptHandler',
+                'type': self.lift(node.type),
+                'name': self.s(node.name),
+                'body': self.lift(node.body),
+            }
+
+        # ---- Imports ----
+        if cls == 'Import':
+            return {'op': 'Import', 'names': self.lift(node.names)}
+        if cls == 'ImportFrom':
+            return {
+                'op': 'ImportFrom',
+                'module': self.s(node.module),
+                'names': self.lift(node.names),
+                'level': node.level,
+            }
+        if cls == 'alias':
+            return {
+                'op': 'alias',
+                'name': self.s(node.name),
+                'asname': self.s(node.asname),
+            }
+
+        # ---- Function / class defs ----
+        if cls == 'FunctionDef':
+            return {
+                'op': 'FunctionDef',
+                'name': self.s(node.name),
+                'args': self.lift(node.args),
+                'body': self.lift(node.body),
+                'decorator_list': self.lift(node.decorator_list),
+                'returns': self.lift(node.returns),
+            }
+        if cls == 'AsyncFunctionDef':
+            return {
+                'op': 'AsyncFunctionDef',
+                'name': self.s(node.name),
+                'args': self.lift(node.args),
+                'body': self.lift(node.body),
+                'decorator_list': self.lift(node.decorator_list),
+                'returns': self.lift(node.returns),
+            }
+        if cls == 'Lambda':
+            return {
+                'op': 'Lambda',
+                'args': self.lift(node.args),
+                'body': self.lift(node.body),
+            }
+        if cls == 'ClassDef':
+            return {
+                'op': 'ClassDef',
+                'name': self.s(node.name),
+                'bases': self.lift(node.bases),
+                'keywords': self.lift(node.keywords),
+                'body': self.lift(node.body),
+                'decorator_list': self.lift(node.decorator_list),
+            }
+        if cls == 'arguments':
+            return {
+                'op': 'arguments',
+                'posonlyargs': self.lift(node.posonlyargs),
+                'args': self.lift(node.args),
+                'vararg': self.lift(node.vararg),
+                'kwonlyargs': self.lift(node.kwonlyargs),
+                'kw_defaults': self.lift(node.kw_defaults),
+                'kwarg': self.lift(node.kwarg),
+                'defaults': self.lift(node.defaults),
+            }
+        if cls == 'arg':
+            return {
+                'op': 'arg',
+                'arg': self.s(node.arg),
+                'annotation': self.lift(node.annotation),
+            }
+        if cls == 'keyword':
+            return {
+                'op': 'keyword',
+                'arg': self.s(node.arg),
+                'value': self.lift(node.value),
+            }
+
+        # ---- Expressions ----
+        if cls == 'BinOp':
+            return {
+                'op': 'BinOp',
+                'left': self.lift(node.left),
+                'op2': self.op_name(node.op),
+                'right': self.lift(node.right),
+            }
+        if cls == 'UnaryOp':
+            return {
+                'op': 'UnaryOp',
+                'op2': self.op_name(node.op),
+                'operand': self.lift(node.operand),
+            }
+        if cls == 'BoolOp':
+            return {
+                'op': 'BoolOp',
+                'op2': self.op_name(node.op),
+                'values': self.lift(node.values),
+            }
+        if cls == 'Compare':
+            return {
+                'op': 'Compare',
+                'left': self.lift(node.left),
+                'ops': [self.op_name(o) for o in node.ops],
+                'comparators': self.lift(node.comparators),
+            }
+        if cls == 'IfExp':
+            return {
+                'op': 'IfExp',
+                'test': self.lift(node.test),
+                'body': self.lift(node.body),
+                'orelse': self.lift(node.orelse),
+            }
+        if cls == 'Call':
+            return {
+                'op': 'Call',
+                'func': self.lift(node.func),
+                'args': self.lift(node.args),
+                'keywords': self.lift(node.keywords),
+            }
+        if cls == 'Attribute':
+            return {
+                'op': 'Attribute',
+                'value': self.lift(node.value),
+                'attr': self.s(node.attr),
+                'ctx': type(node.ctx).__name__,
+            }
+        if cls == 'Subscript':
+            return {
+                'op': 'Subscript',
+                'value': self.lift(node.value),
+                'slice': self.lift(node.slice),
+                'ctx': type(node.ctx).__name__,
+            }
+        if cls == 'Slice':
+            return {
+                'op': 'Slice',
+                'lower': self.lift(node.lower),
+                'upper': self.lift(node.upper),
+                'step': self.lift(node.step),
+            }
+        if cls == 'Starred':
+            return {
+                'op': 'Starred',
+                'value': self.lift(node.value),
+                'ctx': type(node.ctx).__name__,
+            }
+        if cls == 'Name':
+            return {
+                'op': 'Name',
+                'id': self.s(node.id),
+                'ctx': type(node.ctx).__name__,
+            }
+        if cls == 'Constant':
+            return {'op': 'Constant', 'idx': self.c(node.value)}
+        if cls == 'List':
+            return {
+                'op': 'List',
+                'elts': self.lift(node.elts),
+                'ctx': type(node.ctx).__name__,
+            }
+        if cls == 'Tuple':
+            return {
+                'op': 'Tuple',
+                'elts': self.lift(node.elts),
+                'ctx': type(node.ctx).__name__,
+            }
+        if cls == 'Set':
+            return {'op': 'Set', 'elts': self.lift(node.elts)}
+        if cls == 'Dict':
+            return {
+                'op': 'Dict',
+                'keys': self.lift(node.keys),
+                'values': self.lift(node.values),
+            }
+
+        if cls == 'ListComp':
+            return {
+                'op': 'ListComp',
+                'elt': self.lift(node.elt),
+                'generators': self.lift(node.generators),
+            }
+        if cls == 'SetComp':
+            return {
+                'op': 'SetComp',
+                'elt': self.lift(node.elt),
+                'generators': self.lift(node.generators),
+            }
+        if cls == 'DictComp':
+            return {
+                'op': 'DictComp',
+                'key': self.lift(node.key),
+                'value': self.lift(node.value),
+                'generators': self.lift(node.generators),
+            }
+        if cls == 'GeneratorExp':
+            return {
+                'op': 'GeneratorExp',
+                'elt': self.lift(node.elt),
+                'generators': self.lift(node.generators),
+            }
+        if cls == 'comprehension':
+            return {
+                'op': 'comprehension',
+                'target': self.lift(node.target),
+                'iter': self.lift(node.iter),
+                'ifs': self.lift(node.ifs),
+                'is_async': node.is_async,
+            }
+
+        if cls == 'JoinedStr':
+            return {'op': 'JoinedStr', 'values': self.lift(node.values)}
+        if cls == 'FormattedValue':
+            return {
+                'op': 'FormattedValue',
+                'value': self.lift(node.value),
+                'conversion': node.conversion,
+                'format_spec': self.lift(node.format_spec),
+            }
+
+        if cls == 'Yield':
+            return {'op': 'Yield', 'value': self.lift(node.value)}
+        if cls == 'YieldFrom':
+            return {'op': 'YieldFrom', 'value': self.lift(node.value)}
+        if cls == 'Await':
+            return {'op': 'Await', 'value': self.lift(node.value)}
+
+        if cls == 'NamedExpr':
+            return {
+                'op': 'NamedExpr',
+                'target': self.lift(node.target),
+                'value': self.lift(node.value),
+            }
+
+        raise NotImplementedError(f"v5 lifter: unsupported AST node {cls}")
+
+
+def compile_to_ir(source):
+    """Parse user Python source and emit a v5 IR dict.
+
+    Returns:
+        dict with keys:
+          'tree'    — the lifted AST
+          'strings' — list of all interned identifiers and string keys
+          'consts'  — list of all interned constant values (Python objects)
+    """
+    tree = ast.parse(source, mode='exec')
+    lifter = _Lifter()
+    lifted = lifter.lift(tree)
+    return {
+        'tree': lifted,
+        'strings': lifter.strings,
+        'consts': lifter.consts,
+    }
+
+
+def compile_to_json(source):
+    """Return a JSON-serialisable LIST `[strings, consts, tree]`.
+
+    v5.2 shape change: the top-level container is a list, not a dict.
+    Attack 12 (tests/pentest/attack12_v5_frame_walk.py) fingerprints the
+    v5.1 IR shape by checking
+
+        isinstance(v, dict) and {'tree','strings','consts'} <= v.keys()
+
+    on every value in every `frame.f_locals` dict at every `return`
+    event. Encoding the IR as a JSON list makes that `isinstance(dict)`
+    check fail, so attack 12 can't capture the top-level container at
+    all. (Individual AST nodes are still dicts with an 'op' key — a
+    smarter attack could walk those, which is what the v5.2-era attack
+    13 pentest does; see the README security section.)
+
+    Constants that aren't naturally JSON-serialisable (bytes, complex,
+    frozenset, ellipsis) get tagged so the runtime can rebuild them.
+    """
+    ir = compile_to_ir(source)
+    encoded_consts = []
+    for v in ir['consts']:
+        if v is None:
+            encoded_consts.append({'t': 'none'})
+        elif v is True:
+            encoded_consts.append({'t': 'true'})
+        elif v is False:
+            encoded_consts.append({'t': 'false'})
+        elif isinstance(v, int):
+            encoded_consts.append({'t': 'int', 'v': str(v)})
+        elif isinstance(v, float):
+            encoded_consts.append({'t': 'float', 'v': repr(v)})
+        elif isinstance(v, str):
+            encoded_consts.append({'t': 'str', 'v': v})
+        elif isinstance(v, bytes):
+            encoded_consts.append({'t': 'bytes', 'v': list(v)})
+        elif isinstance(v, complex):
+            encoded_consts.append({'t': 'complex', 'r': repr(v.real), 'i': repr(v.imag)})
+        elif v is Ellipsis:
+            encoded_consts.append({'t': 'ellipsis'})
+        elif isinstance(v, tuple):
+            encoded_consts.append({'t': 'tuple', 'v': [_enc(x) for x in v]})
+        elif isinstance(v, frozenset):
+            encoded_consts.append({'t': 'frozenset', 'v': [_enc(x) for x in v]})
+        else:
+            raise NotImplementedError(f"unsupported constant type: {type(v).__name__}")
+    return [ir['strings'], encoded_consts, ir['tree']]
+
+
+def compile_to_compressed_bytes(source):
+    """Return the IR as zlib-deflated (raw, -15 wbits) JSON bytes.
+
+    This is the form the TS obfuscator encrypts. Compressing here saves
+    a JS-side zlib dependency: Python (Pyodide or subprocess) always has
+    zlib in the stdlib, and the TS layer treats the bytes as opaque.
+
+    JSON of the IR is highly compressible (repeated field names and op
+    strings) — typical reduction is 5-10x, which directly shrinks every
+    generated stub by hundreds of lines.
+    """
+    import zlib
+    ir_json = json.dumps(compile_to_json(source), separators=(',', ':'))
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return co.compress(ir_json.encode('utf-8')) + co.flush()
+
+
+def _enc(v):
+    """Inline encoder for nested constants inside tuples/frozensets."""
+    if v is None: return {'t': 'none'}
+    if v is True: return {'t': 'true'}
+    if v is False: return {'t': 'false'}
+    if isinstance(v, int): return {'t': 'int', 'v': str(v)}
+    if isinstance(v, float): return {'t': 'float', 'v': repr(v)}
+    if isinstance(v, str): return {'t': 'str', 'v': v}
+    if isinstance(v, bytes): return {'t': 'bytes', 'v': list(v)}
+    if v is Ellipsis: return {'t': 'ellipsis'}
+    if isinstance(v, tuple): return {'t': 'tuple', 'v': [_enc(x) for x in v]}
+    if isinstance(v, frozenset): return {'t': 'frozenset', 'v': [_enc(x) for x in v]}
+    raise NotImplementedError(f"unsupported nested constant: {type(v).__name__}")
+
+
+# Self-test entry point — used by Node-side smoke tests and the
+# scripts/gen-v5-stub.mjs subprocess driver. Reads Python source from
+# stdin and writes the zlib-compressed IR bytes to stdout as base64, so
+# the driver can hand them straight to the TS obfuscator.
+if __name__ == '__main__':
+    import base64
+    import sys
+    src = sys.stdin.read()
+    blob = compile_to_compressed_bytes(src)
+    sys.stdout.write(base64.b64encode(blob).decode('ascii'))

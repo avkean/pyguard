@@ -3,10 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "predev": "npm run gen:v5",
+    "prebuild": "npm run gen:v5",
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "gen:interpreter": "node scripts/gen-interpreter-src.mjs",
+    "gen:build-ir": "node scripts/gen-build-ir-src.mjs",
+    "gen:v5": "npm run gen:interpreter && npm run gen:build-ir"
   },
   "dependencies": {
     "@codemirror/lang-python": "^6.2.1",
@@ -50,6 +55,7 @@
     "lucide-react": "^0.471.1",
     "next": "15.1.4",
     "next-themes": "^0.4.6",
+    "pyodide": "^0.29.3",
     "react": "^19.0.0",
     "react-day-picker": "^9.7.0",
     "react-dom": "^19.0.0",
@@ -70,6 +76,7 @@
     "eslint-config-next": "15.1.4",
     "postcss": "^8",
     "tailwindcss": "^3.4.1",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }

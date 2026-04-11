@@ -1,12 +1,35 @@
 import "./globals.css"
 import type { Metadata } from "next"
-import { Inter } from "next/font/google"
+import { JetBrains_Mono, Inter, IBM_Plex_Serif } from "next/font/google"
+import { Toaster } from "@/components/ui/toaster"
 
-const inter = Inter({ subsets: ["latin"] })
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-sans",
+  display: "swap",
+})
+
+const mono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-mono",
+  display: "swap",
+})
+
+// IBM Plex Serif is the engineering-grade serif companion to Plex Sans /
+// Plex Mono. It reads practical and grown-up at display sizes — none of the
+// thin "editorial blog" energy of Instrument Serif — which suits a dev tool.
+const serif = IBM_Plex_Serif({
+  subsets: ["latin"],
+  weight: ["300", "400", "500"],
+  style: ["normal", "italic"],
+  variable: "--font-serif",
+  display: "swap",
+})
 
 export const metadata: Metadata = {
-  title: "PyGuard",
-  description: "Obfuscate your Python code with multi-layer security",
+  title: "PyGuard — Python Obfuscator",
+  description:
+    "Multi-layer Python obfuscation against static analysis, LLM recovery, and runtime introspection. Runs entirely in your browser.",
 }
 
 export default function RootLayout({
@@ -15,36 +38,12 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en">
-      <body className={`${inter.className} bg-gray-100 min-h-screen flex flex-col`}>
-        <div className="flex-1">{children}</div>
-        <footer className="border-grid border-t py-6 md:px-8 md:py-0">
-      <div className="container-wrapper">
-        <div className="container py-4">
-          <div className="text-balance text-center text-sm leading-loose text-muted-foreground">
-            Built by{" "}
-            <a
-              href={"https://github.com/InsanelyAvner"}
-              target="_blank"
-              rel="noreferrer"
-              className="font-medium underline underline-offset-4"
-            >
-              InsanelyAvner
-            </a>
-            . The source code is available on{" "}
-            <a
-              href={"https://github.com/InsanelyAvner/pyguard"}
-              target="_blank"
-              rel="noreferrer"
-              className="font-medium underline underline-offset-4"
-            >
-              GitHub
-            </a>
-            .
-          </div>
-        </div>
-      </div>
-    </footer>
+    <html lang="en" className="dark">
+      <body
+        className={`${inter.variable} ${mono.variable} ${serif.variable} font-sans antialiased bg-[#070708] text-white min-h-[100dvh]`}
+      >
+        {children}
+        <Toaster />
       </body>
     </html>
   )
