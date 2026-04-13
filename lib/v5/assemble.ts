@@ -19,6 +19,7 @@
 
 import type { PolyProfile, ChunkedB64 } from './types';
 import { INTERPRETER_SRC_B64 } from './interpreter_src';
+import type { V5Schema } from './schema';
 
 // v5.2: the IR is built into a compressed byte blob by the Python side
 // (build_ir.py for gen-v5-stub.mjs, Pyodide for the browser) and shipped
@@ -37,6 +38,7 @@ export interface V5IR {
     // zlib-deflated (raw, -15 wbits) JSON bytes. Obfuscate.ts encrypts
     // these as-is and the runtime stage2 decompresses after decryption.
     compressed: Uint8Array;
+    schema: V5Schema;
 }
 
 // Names the assembler needs from the outer obfuscator. Passed in so the
@@ -46,6 +48,7 @@ export interface AssembleNames {
     n_seed: string;     // stage1 injects real decrypted seed here
     n_kd: string;       // stage1 injects _kd function here
     n_dec: string;      // stage1 injects _dec function here
+    n_tchk: string;     // stage1 injects traceback-based trace checker here
 }
 
 // Runtime cipher primitives — must match encrypt() in lib/obfuscate.ts.
@@ -55,21 +58,20 @@ export interface AssembleCipher {
     // the runtime key derivation inside the wrapper; same label is used by
     // the build-side encryptor
     irLabel: Uint8Array;
+    schemaLabel: Uint8Array;
     // pre-built chunked base64 ciphertext of the encrypted+compressed IR
     irChunks: ChunkedB64;
+    schemaChunks: ChunkedB64;
     // internal variable names for the IR decryption snippet inside stage2
     irVarSeed: string;
     irVarP: string;
     irVarCt: string;
     irVarPt: string;
-    // irVarJson holds the decompressed JSON string (transient)
-    irVarJson: string;
-    // irVarLoaded holds the parsed list [strings, consts, tree] (transient)
-    irVarLoaded: string;
-    irVarStrings: string;
-    irVarConsts: string;
-    irVarTree: string;
-    irVarInterp: string;
+    schemaVarSeed: string;
+    schemaVarP: string;
+    schemaVarCt: string;
+    schemaVarPt: string;
+    schemaVarObj: string;
     // helper name for the interpreter unpack function
     interpUnpack: string;
 }
@@ -86,24 +88,23 @@ function bytesArrayLit(b: Uint8Array): string {
 //   3. base64-decodes and decrypts the IR ciphertext
 //   4. zlib.decompress()s the IR bytes (IR was compressed before encryption
 //      on the build side so it benefits from JSON repetition)
-//   5. _pg_parse_json's the plaintext into a LIST [strings, consts, tree]
-//   6. destructures into three locals and immediately deletes the
-//      intermediate list (frame-walk attacker sees only the list briefly)
-//   7. decodes tagged constants and runs the interpreter on `tree`
+//   5. hands the decrypted packed binary IR to run_blob(), which parses
+//      and executes using opaque custom containers instead of plain dict/list
 //
-// Shape change from v5.1: the top-level IR container is a JSON list, not
-// a dict. Attack 12's frame-walk heuristic matches on
-// `isinstance(v, dict) and {'tree','strings','consts'} <= v.keys()`, so
-// it now fails at the isinstance check.
+// v5.3 hardening: the stage2 wrapper no longer binds `strings`, `consts`,
+// or `tree` as ordinary locals, and the JSON parser no longer returns a
+// plain `[list, list, dict]` structure. This breaks the current structural
+// frame-walk heuristics in attack 13.
 export function buildV5Stage2Source(
     names: AssembleNames,
     cipher: AssembleCipher,
 ): string {
-    const { n_seed, n_kd, n_dec } = names;
+    const { n_seed, n_kd, n_dec, n_tchk } = names;
     const {
-        irLabel, irChunks,
-        irVarSeed, irVarP, irVarCt, irVarPt, irVarJson, irVarLoaded,
-        irVarStrings, irVarConsts, irVarTree, irVarInterp, interpUnpack,
+        irLabel, schemaLabel, irChunks, schemaChunks,
+        irVarSeed, irVarP, irVarCt, irVarPt,
+        schemaVarSeed, schemaVarP, schemaVarCt, schemaVarPt, schemaVarObj,
+        interpUnpack,
     } = cipher;
 
     // The interpreter is embedded as a zlib-deflated base64 constant.
@@ -113,26 +114,47 @@ export function buildV5Stage2Source(
     return `# v5.2 stage2: generic AST-walking interpreter + encrypted+compressed IR.
 # No user source is compiled by this program; the interpreter walks an
 # in-memory tree that is decrypted from the embedded ciphertext.
+import sys
 import hashlib
 import base64
 import zlib
+try:
+    sys.settrace(None)
+except Exception:
+    pass
+try:
+    sys.setprofile(None)
+except Exception:
+    pass
+if ${n_tchk}():
+    raise SystemExit(0)
 def ${interpUnpack}():
     exec(zlib.decompress(base64.b64decode(${JSON.stringify(INTERPRETER_SRC_B64)}), -15).decode('utf-8'), globals())
 ${interpUnpack}()
 del ${interpUnpack}
+${schemaChunks.decls}
+${schemaVarCt} = base64.b64decode(${schemaChunks.concat})
+${schemaVarSeed} = hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(schemaLabel)})).digest()
+${schemaVarP} = ${n_kd}(${schemaVarSeed})
+${schemaVarPt} = ${n_dec}(${schemaVarCt}, ${schemaVarP}[0], ${schemaVarP}[1], ${schemaVarP}[2]).decode('utf-8')
+${schemaVarObj} = globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_pg_parse_json'))}).decode()](${schemaVarPt})
+globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_KEYS'))}).decode()] = dict(${schemaVarObj}['keys'].items())
+globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_TAGS'))}).decode()] = dict(${schemaVarObj}['tags'].items())
+globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_RTAGS'))}).decode()] = {
+    v: k for k, v in globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_TAGS'))}).decode()].items()
+}
+globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_MASK'))}).decode()] = bytes(${schemaVarObj}['mask'])
+globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_LAYOUTS'))}).decode()] = {
+    k: {name: i + 1 for i, name in enumerate(v)}
+    for k, v in dict(${schemaVarObj}['layouts'].items()).items()
+}
+del ${schemaVarObj}, ${schemaVarPt}, ${schemaVarCt}
 ${irChunks.decls}
 ${irVarCt} = base64.b64decode(${irChunks.concat})
 ${irVarSeed} = hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(irLabel)})).digest()
 ${irVarP} = ${n_kd}(${irVarSeed})
 ${irVarPt} = zlib.decompress(${n_dec}(${irVarCt}, ${irVarP}[0], ${irVarP}[1], ${irVarP}[2]), -15)
-${irVarJson} = ${irVarPt}.decode('utf-8')
-${irVarLoaded} = _pg_parse_json(${irVarJson})
-${irVarStrings} = ${irVarLoaded}[0]
-${irVarConsts} = [_decode_const(_c) for _c in ${irVarLoaded}[1]]
-${irVarTree} = ${irVarLoaded}[2]
-del ${irVarLoaded}, ${irVarJson}, ${irVarPt}, ${irVarCt}
-${irVarInterp} = Interp(${irVarStrings}, ${irVarConsts})
-${irVarInterp}.run(${irVarTree}, '__main__')
+globals()[bytes(${bytesArrayLit(new TextEncoder().encode('run_blob'))}).decode()](${irVarPt}, '__main__')
 `;
 }
 

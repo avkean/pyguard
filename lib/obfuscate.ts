@@ -599,6 +599,7 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_ftype    = ng.gen(); // type(lambda: 0) — FunctionType without importing types
     const n_rec_mod  = ng.gen(); // recompiled-from-disk module code object
     const n_cod      = ng.gen(); // deep co_code-tree digest helper
+    const n_tchk     = ng.gen(); // traceback-based trace detector
     const n_live_d   = ng.gen(); // deep digest of currently-executing module
     const n_rec_d    = ng.gen(); // deep digest of recompiled-from-disk module
     const n_cod_c    = ng.gen(); // parameter name for _cod helper
@@ -607,6 +608,9 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_cod_x    = ng.gen(); // internal pop var for _cod
     const n_cod_k    = ng.gen(); // internal inner const var for _cod
     const n_gf       = ng.gen(); // getframe alias (hides from Attribute('_getframe') walkers)
+    const n_te       = ng.gen(); // traceback helper exception
+    const n_ttb      = ng.gen(); // traceback helper tb
+    const n_tfr      = ng.gen(); // traceback helper frame
 
     // _kd internal names
     const k_seed     = ng.gen();
@@ -711,12 +715,11 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
         const irVarP       = ng.gen();
         const irVarCt      = ng.gen();
         const irVarPt      = ng.gen();
-        const irVarJson    = ng.gen();
-        const irVarLoaded  = ng.gen();
-        const irVarStrings = ng.gen();
-        const irVarConsts  = ng.gen();
-        const irVarTree    = ng.gen();
-        const irVarInterp  = ng.gen();
+        const schemaVarSeed = ng.gen();
+        const schemaVarP    = ng.gen();
+        const schemaVarCt   = ng.gen();
+        const schemaVarPt   = ng.gen();
+        const schemaVarObj  = ng.gen();
         const interpUnpack = ng.gen();
 
         // Third-stage cipher: derived from the same seed with a fresh label.
@@ -732,15 +735,26 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
         const encIRB64 = bytesToBase64(encIR);
         const irChunks = chunkB64(encIRB64, ng);
 
+        const schemaLabel = randomBytes(6);
+        const schemaSeed4 = sha256(concatBytes(seed, schemaLabel));
+        const pepperedSeed4 = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) pepperedSeed4[i] = schemaSeed4[i] ^ pep[i];
+        const params4 = kdf(pepperedSeed4, prof);
+        const schemaBytes = strToUtf8(JSON.stringify(opts.v5IR.schema));
+        const encSchema = encrypt(schemaBytes, params4, prof);
+        const encSchemaB64 = bytesToBase64(encSchema);
+        const schemaChunks = chunkB64(encSchemaB64, ng);
+
         const stage2Src = buildV5Stage2Source(
-            { n_seed, n_kd, n_dec },
+            { n_seed, n_kd, n_dec, n_tchk },
             {
                 prof,
                 irLabel,
+                schemaLabel,
                 irChunks,
+                schemaChunks,
                 irVarSeed, irVarP, irVarCt, irVarPt,
-                irVarJson, irVarLoaded,
-                irVarStrings, irVarConsts, irVarTree, irVarInterp,
+                schemaVarSeed, schemaVarP, schemaVarCt, schemaVarPt, schemaVarObj,
                 interpUnpack,
             },
         );
@@ -756,6 +770,15 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     //    region has injected: __builtins__, the randomized `_O` tuple,
     //    the randomized seed/kd/dec names, sys, hashlib, base64, __file__.
     const stage1Src = `${s1_b} = ${n_O}[${bi['__import__']}]('builtins')
+try:
+    ${n_O}[${bi['getattr']}](sys, 'settrace')(None)
+except Exception:
+    pass
+try:
+    ${n_O}[${bi['getattr']}](sys, 'setprofile')(None)
+except Exception:
+    pass
+if ${n_tchk}(): ${s1_b}.exit(1)
 if ${n_O}[${bi['getattr']}](sys, 'gettrace')() is not None: ${s1_b}.exit(1)
 if ${n_O}[${bi['getattr']}](sys, 'getprofile')() is not None: ${s1_b}.exit(1)
 if compile is not ${n_O}[${bi['compile']}]: ${s1_b}.exit(1)
@@ -779,7 +802,7 @@ try:
     ${s1_src2} = ${s1_pt2}.decode('utf-8')
 except Exception:
     sys.exit(0)
-${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}` : ''}}
+${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
 try:
     ${s1_co2} = ${n_O}[${bi['compile']}](${s1_src2}, __file__, 'exec')
 except Exception:
@@ -850,6 +873,14 @@ import sys, hashlib, base64
 ${n_ftype} = type(lambda: 0)
 ${n_O} = ${bcap.tupleSource}
 ${n_gf} = ${n_O}[${bi['getattr']}](sys, '_getf' + 'rame')
+try:
+    ${n_O}[${bi['getattr']}](sys, 'settrace')(None)
+except Exception:
+    pass
+try:
+    ${n_O}[${bi['getattr']}](sys, 'setprofile')(None)
+except Exception:
+    pass
 ${pepperBlock}
 def ${n_kd}(${k_seed}):
     ${k_seed} = bytes(a ^ b for a, b in zip(${k_seed}, ${n_pep}))
@@ -916,6 +947,17 @@ def ${n_cod}(${n_cod_c}):
             if type(${n_cod_k}).__name__ == 'code':
                 ${n_cod_s}.append(${n_cod_k})
     return ${n_cod_h}.digest()
+def ${n_tchk}():
+    try:
+        raise Exception()
+    except Exception as ${n_te}:
+        ${n_ttb} = ${n_te}.__traceback__
+    ${n_tfr} = ${n_ttb}.tb_frame if ${n_ttb} is not None else None
+    while ${n_tfr} is not None:
+        if ${n_O}[${bi['getattr']}](${n_tfr}, 'f_trace', None) is not None:
+            return True
+        ${n_tfr} = ${n_tfr}.f_back
+    return False
 def ${n_vfy}(${v_in}):
     try:
         ${k_corr} = bytes(a ^ b for a, b in zip(
@@ -924,6 +966,8 @@ def ${n_vfy}(${v_in}):
         return hashlib.sha256(${v_in} + ${k_corr}).digest()
     except Exception:
         return hashlib.sha256(${v_in} + bytes(32 * [255])).digest()
+if ${n_tchk}():
+    sys.exit(0)
 try:
     ${n_path} = __file__
 except NameError:
@@ -984,7 +1028,7 @@ try:
     ${n_src1} = ${n_pt1}.decode('utf-8')
 except Exception:
     sys.exit(0)
-${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, '__file__': ${n_path}}
+${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, '__file__': ${n_path}}
 try:
     ${n_co} = ${n_O}[${bi['compile']}](${n_src1}, '<s1>', 'exec')
 except Exception:

@@ -33,6 +33,162 @@ class _Continue(BaseException):
 _MISSING = object()
 
 
+def _pg_key(key):
+    return globals().get('_PG_KEYS', {}).get(key, key)
+
+
+def _pg_tag(tag):
+    return globals().get('_PG_RTAGS', {}).get(tag, tag)
+
+
+def _pg_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        mask = bytes(globals().get('_PG_MASK', ()))
+        if not mask:
+            return ''.join(chr(x) for x in value)
+        buf = bytearray(len(value))
+        for i, b in enumerate(value):
+            buf[i] = b ^ mask[i % len(mask)]
+        return bytes(buf).decode('utf-8')
+    return value
+
+
+_NODE_POS = {
+    'Code': {'instrs': 1},
+    'IExpr': {'value': 1},
+    'IAssign': {'targets': 1, 'value': 2},
+    'IAugAssign': {'target': 1, 'op2': 2, 'value': 3},
+    'IAnnAssign': {'target': 1, 'annotation': 2, 'value': 3, 'simple': 4},
+    'IReturn': {'value': 1},
+    'IRaise': {'exc': 1, 'cause': 2},
+    'IPass': {},
+    'IBreak': {},
+    'IContinue': {},
+    'IDelete': {'targets': 1},
+    'IGlobal': {'names': 1},
+    'INonlocal': {'names': 1},
+    'IIf': {'test': 1, 'body': 2, 'orelse': 3},
+    'IWhile': {'test': 1, 'body': 2, 'orelse': 3},
+    'IFor': {'target': 1, 'iter': 2, 'body': 3, 'orelse': 4},
+    'IAsyncFor': {'target': 1, 'iter': 2, 'body': 3, 'orelse': 4},
+    'IWith': {'items': 1, 'body': 2},
+    'IAsyncWith': {'items': 1, 'body': 2},
+    'ITry': {'body': 1, 'handlers': 2, 'orelse': 3, 'finalbody': 4},
+    'IHandler': {'type': 1, 'name': 2, 'body': 3},
+    'IImport': {'names': 1},
+    'IImportFrom': {'module': 1, 'names': 2, 'level': 3},
+    'IFunctionDef': {'name': 1, 'args': 2, 'body': 3, 'decorator_list': 4, 'returns': 5, 'is_async': 6, 'is_gen': 7},
+    'IClassDef': {'name': 1, 'bases': 2, 'keywords': 3, 'body': 4, 'decorator_list': 5},
+    'Module': {'body': 1},
+    'Expr': {'value': 1},
+    'Assign': {'targets': 1, 'value': 2},
+    'AugAssign': {'target': 1, 'op2': 2, 'value': 3},
+    'AnnAssign': {'target': 1, 'annotation': 2, 'value': 3, 'simple': 4},
+    'Return': {'value': 1},
+    'Raise': {'exc': 1, 'cause': 2},
+    'Pass': {},
+    'Break': {},
+    'Continue': {},
+    'Delete': {'targets': 1},
+    'Global': {'names': 1},
+    'Nonlocal': {'names': 1},
+    'If': {'test': 1, 'body': 2, 'orelse': 3},
+    'While': {'test': 1, 'body': 2, 'orelse': 3},
+    'For': {'target': 1, 'iter': 2, 'body': 3, 'orelse': 4},
+    'AsyncFor': {'target': 1, 'iter': 2, 'body': 3, 'orelse': 4},
+    'With': {'items': 1, 'body': 2},
+    'AsyncWith': {'items': 1, 'body': 2},
+    'withitem': {'context_expr': 1, 'optional_vars': 2},
+    'Try': {'body': 1, 'handlers': 2, 'orelse': 3, 'finalbody': 4},
+    'ExceptHandler': {'type': 1, 'name': 2, 'body': 3},
+    'Import': {'names': 1},
+    'ImportFrom': {'module': 1, 'names': 2, 'level': 3},
+    'alias': {'name': 1, 'asname': 2},
+    'FunctionDef': {'name': 1, 'args': 2, 'body': 3, 'decorator_list': 4, 'returns': 5},
+    'AsyncFunctionDef': {'name': 1, 'args': 2, 'body': 3, 'decorator_list': 4, 'returns': 5},
+    'ClassDef': {'name': 1, 'bases': 2, 'keywords': 3, 'body': 4, 'decorator_list': 5},
+    'Lambda': {'args': 1, 'body': 2},
+    'arguments': {'posonlyargs': 1, 'args': 2, 'vararg': 3, 'kwonlyargs': 4, 'kw_defaults': 5, 'kwarg': 6, 'defaults': 7},
+    'arg': {'arg': 1, 'annotation': 2},
+    'keyword': {'arg': 1, 'value': 2},
+    'Name': {'id': 1, 'ctx': 2},
+    'Constant': {'idx': 1},
+    'BinOp': {'left': 1, 'op2': 2, 'right': 3},
+    'UnaryOp': {'op2': 1, 'operand': 2},
+    'BoolOp': {'op2': 1, 'values': 2},
+    'Compare': {'left': 1, 'ops': 2, 'comparators': 3},
+    'IfExp': {'test': 1, 'body': 2, 'orelse': 3},
+    'Call': {'func': 1, 'args': 2, 'keywords': 3},
+    'Attribute': {'value': 1, 'attr': 2, 'ctx': 3},
+    'Subscript': {'value': 1, 'slice': 2, 'ctx': 3},
+    'Slice': {'lower': 1, 'upper': 2, 'step': 3},
+    'Starred': {'value': 1, 'ctx': 2},
+    'List': {'elts': 1, 'ctx': 2},
+    'Tuple': {'elts': 1, 'ctx': 2},
+    'Set': {'elts': 1},
+    'Dict': {'keys': 1, 'values': 2},
+    'ListComp': {'elt': 1, 'generators': 2},
+    'SetComp': {'elt': 1, 'generators': 2},
+    'DictComp': {'key': 1, 'value': 2, 'generators': 3},
+    'GeneratorExp': {'elt': 1, 'generators': 2},
+    'comprehension': {'target': 1, 'iter': 2, 'ifs': 3, 'is_async': 4},
+    'JoinedStr': {'values': 1},
+    'FormattedValue': {'value': 1, 'conversion': 2, 'format_spec': 3},
+    'Yield': {'value': 1},
+    'YieldFrom': {'value': 1},
+    'Await': {'value': 1},
+    'NamedExpr': {'target': 1, 'value': 2},
+}
+
+
+def _nf(node, field, default=_MISSING):
+    if not isinstance(node, tuple) or not node:
+        if default is not _MISSING:
+            return default
+        raise KeyError(field)
+    canon_op = _pg_tag(node[0])
+    pos = globals().get('_PG_LAYOUTS', {}).get(canon_op, {}).get(field, _MISSING)
+    if pos is _MISSING:
+        pos = _NODE_POS.get(canon_op, {}).get(field, _MISSING)
+    if pos is _MISSING:
+        if default is not _MISSING:
+            return default
+        raise KeyError(field)
+    if pos >= len(node):
+        if default is not _MISSING:
+            return default
+        raise KeyError(field)
+    return node[pos]
+
+
+class _PGMap:
+    """Opaque mapping wrapper for parsed IR nodes and tagged constants."""
+
+    __slots__ = ('_k', '_v')
+
+    def __init__(self, items):
+        self._k = tuple(k for k, _ in items)
+        self._v = tuple(v for _, v in items)
+
+    def __contains__(self, key):
+        return _pg_key(key) in self._k
+
+    def __getitem__(self, key):
+        key = _pg_key(key)
+        for i, cur in enumerate(self._k):
+            if cur == key:
+                return self._v[i]
+        raise KeyError(key)
+
+    def items(self):
+        return zip(self._k, self._v)
+
+    def __repr__(self):
+        return "<_PGMap>"
+
+
 # --- operator dispatch tables --------------------------------------------
 
 _BIN_OPS = {
@@ -218,11 +374,16 @@ class Interp:
     def __init__(self, strings, consts):
         self.strings = strings
         self.consts = consts
+        self._str_cache = {}
 
     def s(self, idx):
         if idx is None or idx < 0:
             return None
-        return self.strings[idx]
+        if idx in self._str_cache:
+            return self._str_cache[idx]
+        v = _pg_text(self.strings[idx])
+        self._str_cache[idx] = v
+        return v
 
     def k(self, idx):
         return self.consts[idx]
@@ -247,7 +408,10 @@ class Interp:
         }
         scope = Scope(globals_=glob, is_module=True)
         try:
-            _drive_sync(self.step_block(tree['body'], scope))
+            if isinstance(tree, tuple) and tree and _pg_tag(tree[0]) == 'Code':
+                _drive_sync(self.exec_code(tree, scope))
+            else:
+                _drive_sync(self.step_block(_nf(tree, 'body'), scope))
         except _Return:
             pass
 
@@ -259,31 +423,250 @@ class Interp:
         for stmt in body:
             yield from self.step_stmt(stmt, scope)
 
+    def exec_code(self, code, scope):
+        if False:
+            yield
+        if isinstance(code, tuple) and code and _pg_tag(code[0]) == 'Code':
+            for inst in _nf(code, 'instrs'):
+                yield from self.step_inst(inst, scope)
+            return
+        yield from self.step_block(code, scope)
+
+    def _exec_body(self, body, scope):
+        if False:
+            yield
+        if isinstance(body, tuple) and body and _pg_tag(body[0]) == 'Code':
+            yield from self.exec_code(body, scope)
+            return
+        yield from self.step_block(body, scope)
+
+    def step_inst(self, node, scope):
+        if False:
+            yield
+        op = _pg_tag(node[0])
+
+        if op == 'IPass':
+            return
+
+        if op == 'IExpr':
+            yield from self.step_expr(_nf(node, 'value'), scope)
+            return
+
+        if op == 'IReturn':
+            v = None
+            value = _nf(node, 'value')
+            if value is not None:
+                v = yield from self.step_expr(value, scope)
+            raise _Return(v)
+
+        if op == 'IRaise':
+            exc = None
+            cause = None
+            exc_node = _nf(node, 'exc')
+            cause_node = _nf(node, 'cause')
+            if exc_node is not None:
+                exc = yield from self.step_expr(exc_node, scope)
+            if cause_node is not None:
+                cause = yield from self.step_expr(cause_node, scope)
+            if exc is None:
+                raise
+            if cause is not None:
+                raise exc from cause
+            raise exc
+
+        if op == 'IBreak':
+            raise _Break()
+
+        if op == 'IContinue':
+            raise _Continue()
+
+        if op == 'IDelete':
+            for tgt in _nf(node, 'targets'):
+                yield from self._delete(tgt, scope)
+            return
+
+        if op == 'IGlobal':
+            for n in _nf(node, 'names'):
+                scope.global_names.add(self.s(n))
+            return
+
+        if op == 'INonlocal':
+            for n in _nf(node, 'names'):
+                scope.nonlocal_names.add(self.s(n))
+            return
+
+        if op == 'IAssign':
+            v = yield from self.step_expr(_nf(node, 'value'), scope)
+            for tgt in _nf(node, 'targets'):
+                yield from self._assign(tgt, v, scope)
+            return
+
+        if op == 'IAugAssign':
+            tgt = _nf(node, 'target')
+            cur = yield from self._load_target(tgt, scope)
+            inc = yield from self.step_expr(_nf(node, 'value'), scope)
+            new_v = _BIN_OPS[_pg_tag(_nf(node, 'op2'))](cur, inc)
+            yield from self._assign(tgt, new_v, scope)
+            return
+
+        if op == 'IAnnAssign':
+            ann_v = yield from self.step_expr(_nf(node, 'annotation'), scope)
+            value = _nf(node, 'value')
+            target = _nf(node, 'target')
+            if value is not None:
+                v = yield from self.step_expr(value, scope)
+                yield from self._assign(target, v, scope)
+            if _nf(node, 'simple', False) and _pg_tag(target[0]) == 'Name':
+                name = self.s(_nf(target, 'id'))
+                if '__annotations__' in scope.vars:
+                    scope.vars['__annotations__'][name] = ann_v
+            return
+
+        if op == 'IIf':
+            test = yield from self.step_expr(_nf(node, 'test'), scope)
+            yield from self._exec_body(
+                _nf(node, 'body') if test else _nf(node, 'orelse'), scope)
+            return
+
+        if op == 'IWhile':
+            broke = False
+            while True:
+                test = yield from self.step_expr(_nf(node, 'test'), scope)
+                if not test:
+                    break
+                try:
+                    yield from self._exec_body(_nf(node, 'body'), scope)
+                except _Continue:
+                    continue
+                except _Break:
+                    broke = True
+                    break
+            if not broke:
+                yield from self._exec_body(_nf(node, 'orelse'), scope)
+            return
+
+        if op == 'IFor':
+            iter_val = yield from self.step_expr(_nf(node, 'iter'), scope)
+            broke = False
+            for item in iter_val:
+                yield from self._assign(_nf(node, 'target'), item, scope)
+                try:
+                    yield from self._exec_body(_nf(node, 'body'), scope)
+                except _Continue:
+                    continue
+                except _Break:
+                    broke = True
+                    break
+            if not broke:
+                yield from self._exec_body(_nf(node, 'orelse'), scope)
+            return
+
+        if op == 'IAsyncFor':
+            ait_val = yield from self.step_expr(_nf(node, 'iter'), scope)
+            ait = ait_val.__aiter__()
+            broke = False
+            while True:
+                try:
+                    item = yield ('await', ait.__anext__())
+                except StopAsyncIteration:
+                    break
+                yield from self._assign(_nf(node, 'target'), item, scope)
+                try:
+                    yield from self._exec_body(_nf(node, 'body'), scope)
+                except _Continue:
+                    continue
+                except _Break:
+                    broke = True
+                    break
+            if not broke:
+                yield from self._exec_body(_nf(node, 'orelse'), scope)
+            return
+
+        if op == 'IWith':
+            yield from self._do_with(_nf(node, 'items'), 0, _nf(node, 'body'), scope, False)
+            return
+
+        if op == 'IAsyncWith':
+            yield from self._do_with(_nf(node, 'items'), 0, _nf(node, 'body'), scope, True)
+            return
+
+        if op == 'ITry':
+            yield from self._do_try(node, scope)
+            return
+
+        if op == 'IImport':
+            for alias in _nf(node, 'names'):
+                name = self.s(_nf(alias, 'name'))
+                asname = self.s(_nf(alias, 'asname'))
+                mod = __import__(name, scope.globals, None, (), 0)
+                if asname is not None:
+                    target = mod
+                    for p in name.split('.')[1:]:
+                        target = getattr(target, p)
+                    scope.set(asname, target)
+                else:
+                    scope.set(name.split('.')[0], mod)
+            return
+
+        if op == 'IImportFrom':
+            module = self.s(_nf(node, 'module')) or ''
+            level = _nf(node, 'level')
+            fromlist = tuple(self.s(_nf(a, 'name')) for a in _nf(node, 'names'))
+            mod = __import__(module, scope.globals, None, fromlist, level)
+            for alias in _nf(node, 'names'):
+                name = self.s(_nf(alias, 'name'))
+                asname = self.s(_nf(alias, 'asname'))
+                bind = asname if asname is not None else name
+                if name == '*':
+                    if hasattr(mod, '__all__'):
+                        for k in mod.__all__:
+                            scope.set(k, getattr(mod, k))
+                    else:
+                        for k in dir(mod):
+                            if not k.startswith('_'):
+                                scope.set(k, getattr(mod, k))
+                else:
+                    scope.set(bind, getattr(mod, name))
+            return
+
+        if op == 'IFunctionDef':
+            yield from self._define_function(node, scope, _nf(node, 'is_async', False))
+            return
+
+        if op == 'IClassDef':
+            yield from self._define_class(node, scope)
+            return
+
+        yield from self.step_stmt(node, scope)
+
     def step_stmt(self, node, scope):
         if False:
             yield
-        op = node['op']
+        op = _pg_tag(node[0])
 
         if op == 'Pass':
             return
 
         if op == 'Expr':
-            yield from self.step_expr(node['value'], scope)
+            yield from self.step_expr(_nf(node, 'value'), scope)
             return
 
         if op == 'Return':
             v = None
-            if node['value'] is not None:
-                v = yield from self.step_expr(node['value'], scope)
+            value = _nf(node, 'value')
+            if value is not None:
+                v = yield from self.step_expr(value, scope)
             raise _Return(v)
 
         if op == 'Raise':
             exc = None
             cause = None
-            if node['exc'] is not None:
-                exc = yield from self.step_expr(node['exc'], scope)
-            if node['cause'] is not None:
-                cause = yield from self.step_expr(node['cause'], scope)
+            exc_node = _nf(node, 'exc')
+            cause_node = _nf(node, 'cause')
+            if exc_node is not None:
+                exc = yield from self.step_expr(exc_node, scope)
+            if cause_node is not None:
+                cause = yield from self.step_expr(cause_node, scope)
             if exc is None:
                 raise
             if cause is not None:
@@ -297,86 +680,88 @@ class Interp:
             raise _Continue()
 
         if op == 'Delete':
-            for tgt in node['targets']:
+            for tgt in _nf(node, 'targets'):
                 yield from self._delete(tgt, scope)
             return
 
         if op == 'Global':
-            for n in node['names']:
+            for n in _nf(node, 'names'):
                 scope.global_names.add(self.s(n))
             return
 
         if op == 'Nonlocal':
-            for n in node['names']:
+            for n in _nf(node, 'names'):
                 scope.nonlocal_names.add(self.s(n))
             return
 
         if op == 'Assign':
-            v = yield from self.step_expr(node['value'], scope)
-            for tgt in node['targets']:
+            v = yield from self.step_expr(_nf(node, 'value'), scope)
+            for tgt in _nf(node, 'targets'):
                 yield from self._assign(tgt, v, scope)
             return
 
         if op == 'AugAssign':
-            tgt = node['target']
+            tgt = _nf(node, 'target')
             cur = yield from self._load_target(tgt, scope)
-            inc = yield from self.step_expr(node['value'], scope)
-            new_v = _BIN_OPS[node['op2']](cur, inc)
+            inc = yield from self.step_expr(_nf(node, 'value'), scope)
+            new_v = _BIN_OPS[_pg_tag(_nf(node, 'op2'))](cur, inc)
             yield from self._assign(tgt, new_v, scope)
             return
 
         if op == 'AnnAssign':
-            ann_v = yield from self.step_expr(node['annotation'], scope)
-            if node['value'] is not None:
-                v = yield from self.step_expr(node['value'], scope)
-                yield from self._assign(node['target'], v, scope)
-            if node.get('simple') and node['target']['op'] == 'Name':
-                name = self.s(node['target']['id'])
+            ann_v = yield from self.step_expr(_nf(node, 'annotation'), scope)
+            value = _nf(node, 'value')
+            target = _nf(node, 'target')
+            if value is not None:
+                v = yield from self.step_expr(value, scope)
+                yield from self._assign(target, v, scope)
+            if _nf(node, 'simple', False) and _pg_tag(target[0]) == 'Name':
+                name = self.s(_nf(target, 'id'))
                 if '__annotations__' in scope.vars:
                     scope.vars['__annotations__'][name] = ann_v
             return
 
         if op == 'If':
-            test = yield from self.step_expr(node['test'], scope)
+            test = yield from self.step_expr(_nf(node, 'test'), scope)
             yield from self.step_block(
-                node['body'] if test else node['orelse'], scope)
+                _nf(node, 'body') if test else _nf(node, 'orelse'), scope)
             return
 
         if op == 'While':
             broke = False
             while True:
-                test = yield from self.step_expr(node['test'], scope)
+                test = yield from self.step_expr(_nf(node, 'test'), scope)
                 if not test:
                     break
                 try:
-                    yield from self.step_block(node['body'], scope)
+                    yield from self.step_block(_nf(node, 'body'), scope)
                 except _Continue:
                     continue
                 except _Break:
                     broke = True
                     break
             if not broke:
-                yield from self.step_block(node['orelse'], scope)
+                yield from self.step_block(_nf(node, 'orelse'), scope)
             return
 
         if op == 'For':
-            iter_val = yield from self.step_expr(node['iter'], scope)
+            iter_val = yield from self.step_expr(_nf(node, 'iter'), scope)
             broke = False
             for item in iter_val:
-                yield from self._assign(node['target'], item, scope)
+                yield from self._assign(_nf(node, 'target'), item, scope)
                 try:
-                    yield from self.step_block(node['body'], scope)
+                    yield from self.step_block(_nf(node, 'body'), scope)
                 except _Continue:
                     continue
                 except _Break:
                     broke = True
                     break
             if not broke:
-                yield from self.step_block(node['orelse'], scope)
+                yield from self.step_block(_nf(node, 'orelse'), scope)
             return
 
         if op == 'AsyncFor':
-            ait_val = yield from self.step_expr(node['iter'], scope)
+            ait_val = yield from self.step_expr(_nf(node, 'iter'), scope)
             ait = ait_val.__aiter__()
             broke = False
             while True:
@@ -384,24 +769,24 @@ class Interp:
                     item = yield ('await', ait.__anext__())
                 except StopAsyncIteration:
                     break
-                yield from self._assign(node['target'], item, scope)
+                yield from self._assign(_nf(node, 'target'), item, scope)
                 try:
-                    yield from self.step_block(node['body'], scope)
+                    yield from self.step_block(_nf(node, 'body'), scope)
                 except _Continue:
                     continue
                 except _Break:
                     broke = True
                     break
             if not broke:
-                yield from self.step_block(node['orelse'], scope)
+                yield from self.step_block(_nf(node, 'orelse'), scope)
             return
 
         if op == 'With':
-            yield from self._do_with(node['items'], 0, node['body'], scope, False)
+            yield from self._do_with(_nf(node, 'items'), 0, _nf(node, 'body'), scope, False)
             return
 
         if op == 'AsyncWith':
-            yield from self._do_with(node['items'], 0, node['body'], scope, True)
+            yield from self._do_with(_nf(node, 'items'), 0, _nf(node, 'body'), scope, True)
             return
 
         if op == 'Try':
@@ -409,9 +794,9 @@ class Interp:
             return
 
         if op == 'Import':
-            for alias in node['names']:
-                name = self.s(alias['name'])
-                asname = self.s(alias['asname'])
+            for alias in _nf(node, 'names'):
+                name = self.s(_nf(alias, 'name'))
+                asname = self.s(_nf(alias, 'asname'))
                 mod = __import__(name, scope.globals, None, (), 0)
                 if asname is not None:
                     # for "import a.b as c", bind c=a.b
@@ -424,13 +809,13 @@ class Interp:
             return
 
         if op == 'ImportFrom':
-            module = self.s(node['module']) or ''
-            level = node['level']
-            fromlist = tuple(self.s(a['name']) for a in node['names'])
+            module = self.s(_nf(node, 'module')) or ''
+            level = _nf(node, 'level')
+            fromlist = tuple(self.s(_nf(a, 'name')) for a in _nf(node, 'names'))
             mod = __import__(module, scope.globals, None, fromlist, level)
-            for alias in node['names']:
-                name = self.s(alias['name'])
-                asname = self.s(alias['asname'])
+            for alias in _nf(node, 'names'):
+                name = self.s(_nf(alias, 'name'))
+                asname = self.s(_nf(alias, 'asname'))
                 bind = asname if asname is not None else name
                 if name == '*':
                     if hasattr(mod, '__all__'):
@@ -459,92 +844,92 @@ class Interp:
     def step_expr(self, node, scope):
         if False:
             yield
-        op = node['op']
+        op = _pg_tag(node[0])
 
         if op == 'Constant':
-            return self.k(node['idx'])
+            return self.k(_nf(node, 'idx'))
 
         if op == 'Name':
-            return scope.get(self.s(node['id']))
+            return scope.get(self.s(_nf(node, 'id')))
 
         if op == 'BinOp':
-            l = yield from self.step_expr(node['left'], scope)
-            r = yield from self.step_expr(node['right'], scope)
-            return _BIN_OPS[node['op2']](l, r)
+            l = yield from self.step_expr(_nf(node, 'left'), scope)
+            r = yield from self.step_expr(_nf(node, 'right'), scope)
+            return _BIN_OPS[_pg_tag(_nf(node, 'op2'))](l, r)
 
         if op == 'UnaryOp':
-            v = yield from self.step_expr(node['operand'], scope)
-            return _UNARY_OPS[node['op2']](v)
+            v = yield from self.step_expr(_nf(node, 'operand'), scope)
+            return _UNARY_OPS[_pg_tag(_nf(node, 'op2'))](v)
 
         if op == 'BoolOp':
-            if node['op2'] == 'And':
+            if _pg_tag(_nf(node, 'op2')) == 'And':
                 last = True
-                for vn in node['values']:
+                for vn in _nf(node, 'values'):
                     last = yield from self.step_expr(vn, scope)
                     if not last:
                         return last
                 return last
             else:
                 last = False
-                for vn in node['values']:
+                for vn in _nf(node, 'values'):
                     last = yield from self.step_expr(vn, scope)
                     if last:
                         return last
                 return last
 
         if op == 'Compare':
-            left = yield from self.step_expr(node['left'], scope)
-            for cmp_op, cn in zip(node['ops'], node['comparators']):
+            left = yield from self.step_expr(_nf(node, 'left'), scope)
+            for cmp_op, cn in zip(_nf(node, 'ops'), _nf(node, 'comparators')):
                 right = yield from self.step_expr(cn, scope)
-                if not _CMP_OPS[cmp_op](left, right):
+                if not _CMP_OPS[_pg_tag(cmp_op)](left, right):
                     return False
                 left = right
             return True
 
         if op == 'IfExp':
-            test = yield from self.step_expr(node['test'], scope)
+            test = yield from self.step_expr(_nf(node, 'test'), scope)
             if test:
-                v = yield from self.step_expr(node['body'], scope)
+                v = yield from self.step_expr(_nf(node, 'body'), scope)
             else:
-                v = yield from self.step_expr(node['orelse'], scope)
+                v = yield from self.step_expr(_nf(node, 'orelse'), scope)
             return v
 
         if op == 'Call':
-            func = yield from self.step_expr(node['func'], scope)
+            func = yield from self.step_expr(_nf(node, 'func'), scope)
             # Intercept zero-arg super() so it works without the magic cell.
             if (func is builtins.super
-                    and not node['args'] and not node['keywords']):
+                    and not _nf(node, 'args') and not _nf(node, 'keywords')):
                 cls_v = self._lookup_magic(scope, '__pyguard_class__')
                 self_v = self._lookup_magic(scope, '__pyguard_self__')
                 if cls_v is not None and self_v is not None:
                     return builtins.super(cls_v, self_v)
                 return builtins.super()
             args = []
-            for a in node['args']:
-                if a['op'] == 'Starred':
-                    sv = yield from self.step_expr(a['value'], scope)
+            for a in _nf(node, 'args'):
+                if _pg_tag(a[0]) == 'Starred':
+                    sv = yield from self.step_expr(_nf(a, 'value'), scope)
                     args.extend(sv)
                 else:
                     av = yield from self.step_expr(a, scope)
                     args.append(av)
             kwargs = {}
-            for kw in node['keywords']:
-                arg_idx = kw['arg']
+            for kw in _nf(node, 'keywords'):
+                arg_idx = _nf(kw, 'arg')
                 if arg_idx is None or arg_idx < 0:
-                    kv = yield from self.step_expr(kw['value'], scope)
+                    kv = yield from self.step_expr(_nf(kw, 'value'), scope)
                     kwargs.update(kv)
                 else:
-                    kv = yield from self.step_expr(kw['value'], scope)
+                    kv = yield from self.step_expr(_nf(kw, 'value'), scope)
                     kwargs[self.s(arg_idx)] = kv
             return func(*args, **kwargs)
 
         if op == 'Attribute':
-            v = yield from self.step_expr(node['value'], scope)
-            return getattr(v, self.s(node['attr']))
+            v = yield from self.step_expr(_nf(node, 'value'), scope)
+            return getattr(v, self.s(_nf(node, 'attr')))
 
         if op == 'Subscript':
-            v = yield from self.step_expr(node['value'], scope)
-            sl = yield from self._eval_slice(node['slice'], scope)
+            v = yield from self.step_expr(_nf(node, 'value'), scope)
+            sl = yield from self._eval_slice(_nf(node, 'slice'), scope)
             return v[sl]
 
         if op == 'Slice':
@@ -552,9 +937,9 @@ class Interp:
 
         if op == 'List':
             elts = []
-            for e in node['elts']:
-                if e['op'] == 'Starred':
-                    sv = yield from self.step_expr(e['value'], scope)
+            for e in _nf(node, 'elts'):
+                if _pg_tag(e[0]) == 'Starred':
+                    sv = yield from self.step_expr(_nf(e, 'value'), scope)
                     elts.extend(sv)
                 else:
                     ev = yield from self.step_expr(e, scope)
@@ -563,9 +948,9 @@ class Interp:
 
         if op == 'Tuple':
             elts = []
-            for e in node['elts']:
-                if e['op'] == 'Starred':
-                    sv = yield from self.step_expr(e['value'], scope)
+            for e in _nf(node, 'elts'):
+                if _pg_tag(e[0]) == 'Starred':
+                    sv = yield from self.step_expr(_nf(e, 'value'), scope)
                     elts.extend(sv)
                 else:
                     ev = yield from self.step_expr(e, scope)
@@ -574,9 +959,9 @@ class Interp:
 
         if op == 'Set':
             out = set()
-            for e in node['elts']:
-                if e['op'] == 'Starred':
-                    sv = yield from self.step_expr(e['value'], scope)
+            for e in _nf(node, 'elts'):
+                if _pg_tag(e[0]) == 'Starred':
+                    sv = yield from self.step_expr(_nf(e, 'value'), scope)
                     out.update(sv)
                 else:
                     ev = yield from self.step_expr(e, scope)
@@ -585,7 +970,7 @@ class Interp:
 
         if op == 'Dict':
             d = {}
-            for kn, vn in zip(node['keys'], node['values']):
+            for kn, vn in zip(_nf(node, 'keys'), _nf(node, 'values')):
                 if kn is None:
                     vv = yield from self.step_expr(vn, scope)
                     d.update(vv)
@@ -597,20 +982,20 @@ class Interp:
 
         if op == 'Lambda':
             # Pre-evaluate defaults
-            args_def = node['args']
+            args_def = _nf(node, 'args')
             defaults = []
-            for d in args_def['defaults']:
+            for d in _nf(args_def, 'defaults'):
                 dv = yield from self.step_expr(d, scope)
                 defaults.append(dv)
             kw_defaults = []
-            for kd in args_def['kw_defaults']:
+            for kd in _nf(args_def, 'kw_defaults'):
                 if kd is None:
                     kw_defaults.append(_MISSING)
                 else:
                     kdv = yield from self.step_expr(kd, scope)
                     kw_defaults.append(kdv)
             # Wrap body as Return statement so the function path works
-            wrapped = [{'op': 'Return', 'value': node['body']}]
+            wrapped = (('Return', _nf(node, 'body')),)
             return _UFunction(self, '<lambda>', args_def, wrapped,
                               scope, False, False, defaults, kw_defaults)
 
@@ -625,14 +1010,14 @@ class Interp:
 
         if op == 'JoinedStr':
             parts = []
-            for vn in node['values']:
+            for vn in _nf(node, 'values'):
                 v = yield from self.step_expr(vn, scope)
                 parts.append(v if isinstance(v, str) else str(v))
             return ''.join(parts)
 
         if op == 'FormattedValue':
-            v = yield from self.step_expr(node['value'], scope)
-            conv = node['conversion']
+            v = yield from self.step_expr(_nf(node, 'value'), scope)
+            conv = _nf(node, 'conversion')
             if conv == 115:
                 v = str(v)
             elif conv == 114:
@@ -640,19 +1025,19 @@ class Interp:
             elif conv == 97:
                 v = ascii(v)
             spec = ''
-            if node['format_spec'] is not None:
-                spec = yield from self.step_expr(node['format_spec'], scope)
+            if _nf(node, 'format_spec') is not None:
+                spec = yield from self.step_expr(_nf(node, 'format_spec'), scope)
             return format(v, spec)
 
         if op == 'Yield':
             v = None
-            if node['value'] is not None:
-                v = yield from self.step_expr(node['value'], scope)
+            if _nf(node, 'value') is not None:
+                v = yield from self.step_expr(_nf(node, 'value'), scope)
             sent = yield ('yield', v)
             return sent
 
         if op == 'YieldFrom':
-            v = yield from self.step_expr(node['value'], scope)
+            v = yield from self.step_expr(_nf(node, 'value'), scope)
             it = iter(v)
             result = None
             while True:
@@ -665,17 +1050,17 @@ class Interp:
             return result
 
         if op == 'Await':
-            v = yield from self.step_expr(node['value'], scope)
+            v = yield from self.step_expr(_nf(node, 'value'), scope)
             r = yield ('await', v)
             return r
 
         if op == 'NamedExpr':
-            v = yield from self.step_expr(node['value'], scope)
-            yield from self._assign(node['target'], v, scope)
+            v = yield from self.step_expr(_nf(node, 'value'), scope)
+            yield from self._assign(_nf(node, 'target'), v, scope)
             return v
 
         if op == 'Starred':
-            return (yield from self.step_expr(node['value'], scope))
+            return (yield from self.step_expr(_nf(node, 'value'), scope))
 
         raise NotImplementedError("step_expr: " + op)
 
@@ -684,15 +1069,15 @@ class Interp:
     def _assign(self, target, value, scope):
         if False:
             yield
-        op = target['op']
+        op = _pg_tag(target[0])
         if op == 'Name':
-            scope.set(self.s(target['id']), value)
+            scope.set(self.s(_nf(target, 'id')), value)
             return
         if op == 'Tuple' or op == 'List':
-            elts = target['elts']
+            elts = _nf(target, 'elts')
             star_idx = None
             for i, e in enumerate(elts):
-                if e['op'] == 'Starred':
+                if _pg_tag(e[0]) == 'Starred':
                     star_idx = i
                     break
             if star_idx is None:
@@ -713,7 +1098,7 @@ class Interp:
                     yield from self._assign(elts[i], vlist[i], scope)
                 star_count = len(vlist) - n_before - n_after
                 yield from self._assign(
-                    elts[star_idx]['value'],
+                    _nf(elts[star_idx], 'value'),
                     vlist[n_before:n_before + star_count],
                     scope)
                 for j in range(n_after):
@@ -723,37 +1108,37 @@ class Interp:
                         scope)
             return
         if op == 'Attribute':
-            obj = yield from self.step_expr(target['value'], scope)
-            setattr(obj, self.s(target['attr']), value)
+            obj = yield from self.step_expr(_nf(target, 'value'), scope)
+            setattr(obj, self.s(_nf(target, 'attr')), value)
             return
         if op == 'Subscript':
-            obj = yield from self.step_expr(target['value'], scope)
-            sl = yield from self._eval_slice(target['slice'], scope)
+            obj = yield from self.step_expr(_nf(target, 'value'), scope)
+            sl = yield from self._eval_slice(_nf(target, 'slice'), scope)
             obj[sl] = value
             return
         if op == 'Starred':
-            yield from self._assign(target['value'], value, scope)
+            yield from self._assign(_nf(target, 'value'), value, scope)
             return
         raise NotImplementedError("_assign: " + op)
 
     def _delete(self, target, scope):
         if False:
             yield
-        op = target['op']
+        op = _pg_tag(target[0])
         if op == 'Name':
-            scope.delete(self.s(target['id']))
+            scope.delete(self.s(_nf(target, 'id')))
             return
         if op == 'Attribute':
-            obj = yield from self.step_expr(target['value'], scope)
-            delattr(obj, self.s(target['attr']))
+            obj = yield from self.step_expr(_nf(target, 'value'), scope)
+            delattr(obj, self.s(_nf(target, 'attr')))
             return
         if op == 'Subscript':
-            obj = yield from self.step_expr(target['value'], scope)
-            sl = yield from self._eval_slice(target['slice'], scope)
+            obj = yield from self.step_expr(_nf(target, 'value'), scope)
+            sl = yield from self._eval_slice(_nf(target, 'slice'), scope)
             del obj[sl]
             return
         if op == 'Tuple' or op == 'List':
-            for e in target['elts']:
+            for e in _nf(target, 'elts'):
                 yield from self._delete(e, scope)
             return
         raise NotImplementedError("_delete: " + op)
@@ -761,36 +1146,36 @@ class Interp:
     def _load_target(self, target, scope):
         if False:
             yield
-        op = target['op']
+        op = _pg_tag(target[0])
         if op == 'Name':
-            return scope.get(self.s(target['id']))
+            return scope.get(self.s(_nf(target, 'id')))
         if op == 'Attribute':
-            obj = yield from self.step_expr(target['value'], scope)
-            return getattr(obj, self.s(target['attr']))
+            obj = yield from self.step_expr(_nf(target, 'value'), scope)
+            return getattr(obj, self.s(_nf(target, 'attr')))
         if op == 'Subscript':
-            obj = yield from self.step_expr(target['value'], scope)
-            sl = yield from self._eval_slice(target['slice'], scope)
+            obj = yield from self.step_expr(_nf(target, 'value'), scope)
+            sl = yield from self._eval_slice(_nf(target, 'slice'), scope)
             return obj[sl]
         raise NotImplementedError("_load_target: " + op)
 
     def _eval_slice(self, node, scope):
         if False:
             yield
-        if node['op'] == 'Slice':
+        if _pg_tag(node[0]) == 'Slice':
             l = None
             u = None
             s = None
-            if node['lower'] is not None:
-                l = yield from self.step_expr(node['lower'], scope)
-            if node['upper'] is not None:
-                u = yield from self.step_expr(node['upper'], scope)
-            if node['step'] is not None:
-                s = yield from self.step_expr(node['step'], scope)
+            if _nf(node, 'lower') is not None:
+                l = yield from self.step_expr(_nf(node, 'lower'), scope)
+            if _nf(node, 'upper') is not None:
+                u = yield from self.step_expr(_nf(node, 'upper'), scope)
+            if _nf(node, 'step') is not None:
+                s = yield from self.step_expr(_nf(node, 'step'), scope)
             return slice(l, u, s)
-        if node['op'] == 'Tuple':
+        if _pg_tag(node[0]) == 'Tuple':
             elts = []
-            for e in node['elts']:
-                if e['op'] == 'Slice':
+            for e in _nf(node, 'elts'):
+                if _pg_tag(e[0]) == 'Slice':
                     elts.append((yield from self._eval_slice(e, scope)))
                 else:
                     elts.append((yield from self.step_expr(e, scope)))
@@ -802,63 +1187,69 @@ class Interp:
     def _define_function(self, node, scope, is_async):
         if False:
             yield
-        is_gen = self._contains_yield(node['body'])
+        if is_async is None:
+            is_async = _nf(node, 'is_async', False)
+        is_gen = _nf(node, 'is_gen', None)
+        if is_gen is None:
+            is_gen = self._contains_yield(_nf(node, 'body'))
         # Async generators (PEP 525) are not supported in this version.
         if is_async:
             is_gen = False  # treat any yield in async def as syntax-irrelevant
-        args_def = node['args']
+        args_def = _nf(node, 'args')
         defaults = []
-        for d in args_def['defaults']:
+        for d in _nf(args_def, 'defaults'):
             dv = yield from self.step_expr(d, scope)
             defaults.append(dv)
         kw_defaults = []
-        for kd in args_def['kw_defaults']:
+        for kd in _nf(args_def, 'kw_defaults'):
             if kd is None:
                 kw_defaults.append(_MISSING)
             else:
                 kdv = yield from self.step_expr(kd, scope)
                 kw_defaults.append(kdv)
         func = _UFunction(
-            self, self.s(node['name']), args_def, node['body'],
+            self, self.s(_nf(node, 'name')), args_def, _nf(node, 'body'),
             scope, is_gen, is_async, defaults, kw_defaults)
         # Evaluate annotations
         ann = {}
-        for a in (args_def['posonlyargs'] + args_def['args']
-                  + args_def['kwonlyargs']):
-            if a['annotation'] is not None:
-                ann[self.s(a['arg'])] = (
-                    yield from self.step_expr(a['annotation'], scope))
-        if args_def['vararg'] is not None and args_def['vararg']['annotation'] is not None:
-            ann[self.s(args_def['vararg']['arg'])] = (
-                yield from self.step_expr(args_def['vararg']['annotation'], scope))
-        if args_def['kwarg'] is not None and args_def['kwarg']['annotation'] is not None:
-            ann[self.s(args_def['kwarg']['arg'])] = (
-                yield from self.step_expr(args_def['kwarg']['annotation'], scope))
-        if node['returns'] is not None:
-            ann['return'] = yield from self.step_expr(node['returns'], scope)
+        for a in (_nf(args_def, 'posonlyargs') + _nf(args_def, 'args')
+                  + _nf(args_def, 'kwonlyargs')):
+            if _nf(a, 'annotation') is not None:
+                ann[self.s(_nf(a, 'arg'))] = (
+                    yield from self.step_expr(_nf(a, 'annotation'), scope))
+        vararg = _nf(args_def, 'vararg')
+        if vararg is not None and _nf(vararg, 'annotation') is not None:
+            ann[self.s(_nf(vararg, 'arg'))] = (
+                yield from self.step_expr(_nf(vararg, 'annotation'), scope))
+        kwarg = _nf(args_def, 'kwarg')
+        if kwarg is not None and _nf(kwarg, 'annotation') is not None:
+            ann[self.s(_nf(kwarg, 'arg'))] = (
+                yield from self.step_expr(_nf(kwarg, 'annotation'), scope))
+        if _nf(node, 'returns') is not None:
+            ann['return'] = yield from self.step_expr(_nf(node, 'returns'), scope)
         func.__annotations__ = ann
         # Decorators
         decos = []
-        for d in node['decorator_list']:
+        for d in _nf(node, 'decorator_list'):
             dv = yield from self.step_expr(d, scope)
             decos.append(dv)
         decorated = func
         for d in reversed(decos):
             decorated = d(decorated)
-        scope.set(self.s(node['name']), decorated)
+        scope.set(self.s(_nf(node, 'name')), decorated)
 
     def _define_class(self, node, scope):
         if False:
             yield
-        name = self.s(node['name'])
+        name = self.s(_nf(node, 'name'))
         bases = []
-        for b in node['bases']:
+        for b in _nf(node, 'bases'):
             bv = yield from self.step_expr(b, scope)
             bases.append(bv)
         kw = {}
-        for k in node['keywords']:
-            kv = yield from self.step_expr(k['value'], scope)
-            arg_idx = k['arg']
+        for k in _nf(node, 'keywords'):
+            kv = yield from self.step_expr(_nf(k, 'value'), scope)
+            arg_idx = _nf(k, 'arg')
             if arg_idx is None or arg_idx < 0:
                 kw.update(kv)
             else:
@@ -872,7 +1263,7 @@ class Interp:
         cls_scope.vars['__name__'] = name
         cls_scope.vars['__qualname__'] = name
         cls_scope.vars['__module__'] = scope.globals.get('__name__', '__main__')
-        yield from self.step_block(node['body'], cls_scope)
+        yield from self._exec_body(_nf(node, 'body'), cls_scope)
         ns = dict(cls_scope.vars)
         cls = metaclass(name, tuple(bases), ns, **kw)
         # Patch defining_class onto user functions for super()
@@ -885,7 +1276,7 @@ class Interp:
                     inner.defining_class = cls
         # Decorators
         decos = []
-        for d in node['decorator_list']:
+        for d in _nf(node, 'decorator_list'):
             dv = yield from self.step_expr(d, scope)
             decos.append(dv)
         for d in reversed(decos):
@@ -906,18 +1297,18 @@ class Interp:
         if func.is_async:
             return self._make_host_coroutine(func, local)
         try:
-            _drive_sync(self.step_block(func.body, local))
+            _drive_sync(self._exec_body(func.body, local))
         except _Return as r:
             return r.value
         return None
 
     def _bind_args(self, func, args, kwargs, local):
         a = func.args_def
-        posonly = a['posonlyargs']
-        pos = a['args']
-        kwonly = a['kwonlyargs']
-        vararg = a['vararg']
-        kwarg = a['kwarg']
+        posonly = _nf(a, 'posonlyargs')
+        pos = _nf(a, 'args')
+        kwonly = _nf(a, 'kwonlyargs')
+        vararg = _nf(a, 'vararg')
+        kwarg = _nf(a, 'kwarg')
 
         all_pos = posonly + pos
         n_pos = len(all_pos)
@@ -930,22 +1321,22 @@ class Interp:
 
         # 1. positional → posonly+pos
         for i in range(min(n_args, n_pos)):
-            bound[self.s(all_pos[i]['arg'])] = args[i]
+            bound[self.s(_nf(all_pos[i], 'arg'))] = args[i]
 
         # 2. extra positional → vararg (or error)
         if n_args > n_pos:
             if vararg is not None:
-                bound[self.s(vararg['arg'])] = tuple(args[n_pos:])
+                bound[self.s(_nf(vararg, 'arg'))] = tuple(args[n_pos:])
             else:
                 raise TypeError(
                     "{}() takes {} positional arguments but {} were given".format(
                         func.__name__, n_pos, n_args))
         elif vararg is not None:
-            bound[self.s(vararg['arg'])] = ()
+            bound[self.s(_nf(vararg, 'arg'))] = ()
 
         # 3. keyword → pos (excluding posonly) and kwonly
-        pos_names = {self.s(p['arg']) for p in pos}
-        kwonly_names = [self.s(p['arg']) for p in kwonly]
+        pos_names = {self.s(_nf(p, 'arg')) for p in pos}
+        kwonly_names = [self.s(_nf(p, 'arg')) for p in kwonly]
         for k in list(kwargs):
             if k in pos_names:
                 if k in bound:
@@ -958,7 +1349,7 @@ class Interp:
 
         # 4. defaults for unfilled positional
         for i, p in enumerate(all_pos):
-            name = self.s(p['arg'])
+            name = self.s(_nf(p, 'arg'))
             if name in bound:
                 continue
             di = i - (n_pos - n_defaults)
@@ -983,7 +1374,7 @@ class Interp:
 
         # 6. leftover keyword → **kwarg
         if kwarg is not None:
-            bound[self.s(kwarg['arg'])] = dict(kwargs)
+            bound[self.s(_nf(kwarg, 'arg'))] = dict(kwargs)
         elif kwargs:
             raise TypeError(
                 "{}() got unexpected keyword arguments: {}".format(
@@ -994,7 +1385,7 @@ class Interp:
     # ---- generator / coroutine host wrappers ----
 
     def _make_host_generator(self, func, local):
-        inner = self.step_block(func.body, local)
+        inner = self._exec_body(func.body, local)
         def host():
             sent = None
             try:
@@ -1017,7 +1408,7 @@ class Interp:
         return host()
 
     def _make_host_coroutine(self, func, local):
-        inner = self.step_block(func.body, local)
+        inner = self._exec_body(func.body, local)
         async def host():
             sent = None
             try:
@@ -1045,14 +1436,14 @@ class Interp:
         if False:
             yield
         if idx >= len(items):
-            yield from self.step_block(body, scope)
+            yield from self._exec_body(body, scope)
             return
         item = items[idx]
-        ctx = yield from self.step_expr(item['context_expr'], scope)
+        ctx = yield from self.step_expr(_nf(item, 'context_expr'), scope)
         if is_async:
             entered = yield ('await', ctx.__aenter__())
-            if item['optional_vars'] is not None:
-                yield from self._assign(item['optional_vars'], entered, scope)
+            if _nf(item, 'optional_vars') is not None:
+                yield from self._assign(_nf(item, 'optional_vars'), entered, scope)
             try:
                 yield from self._do_with(items, idx + 1, body, scope, is_async)
             except BaseException:
@@ -1065,8 +1456,8 @@ class Interp:
                 yield ('await', ctx.__aexit__(None, None, None))
         else:
             entered = ctx.__enter__()
-            if item['optional_vars'] is not None:
-                yield from self._assign(item['optional_vars'], entered, scope)
+            if _nf(item, 'optional_vars') is not None:
+                yield from self._assign(_nf(item, 'optional_vars'), entered, scope)
             try:
                 yield from self._do_with(items, idx + 1, body, scope, is_async)
             except BaseException:
@@ -1086,26 +1477,26 @@ class Interp:
         pending_ctrl = None
         try:
             try:
-                yield from self.step_block(node['body'], scope)
+                yield from self._exec_body(_nf(node, 'body'), scope)
             except (_Return, _Break, _Continue) as ctrl:
                 pending_ctrl = ctrl
             except BaseException as e:
                 handled = False
-                for handler in node['handlers']:
+                for handler in _nf(node, 'handlers'):
                     htype = None
-                    if handler['type'] is not None:
+                    if _nf(handler, 'type') is not None:
                         htype = yield from self.step_expr(
-                            handler['type'], scope)
+                            _nf(handler, 'type'), scope)
                     if htype is None or isinstance(e, htype):
                         handled = True
-                        name_idx = handler['name']
+                        name_idx = _nf(handler, 'name')
                         name = self.s(name_idx) if name_idx is not None and name_idx >= 0 else None
                         if name is not None:
                             scope.set(name, e)
                         try:
                             try:
-                                yield from self.step_block(
-                                    handler['body'], scope)
+                                yield from self._exec_body(
+                                    _nf(handler, 'body'), scope)
                             except (_Return, _Break, _Continue) as ctrl:
                                 pending_ctrl = ctrl
                             except BaseException as e2:
@@ -1118,14 +1509,14 @@ class Interp:
                     pending_exc = e
             else:
                 try:
-                    yield from self.step_block(node['orelse'], scope)
+                    yield from self._exec_body(_nf(node, 'orelse'), scope)
                 except (_Return, _Break, _Continue) as ctrl:
                     pending_ctrl = ctrl
                 except BaseException as e:
                     pending_exc = e
         finally:
             try:
-                yield from self.step_block(node['finalbody'], scope)
+                yield from self._exec_body(_nf(node, 'finalbody'), scope)
             except (_Return, _Break, _Continue) as ctrl:
                 pending_ctrl = ctrl
                 pending_exc = None
@@ -1149,7 +1540,7 @@ class Interp:
         else:
             result = {}
         first_iter = yield from self.step_expr(
-            node['generators'][0]['iter'], scope)
+            _nf(_nf(node, 'generators')[0], 'iter'), scope)
         comp_scope = Scope(parent=scope)
         yield from self._comp_loop(node, 0, comp_scope, kind, result, first_iter)
         return result
@@ -1157,34 +1548,35 @@ class Interp:
     def _comp_loop(self, node, gi, comp_scope, kind, result, first_iter):
         if False:
             yield
-        gen = node['generators'][gi]
+        generators = _nf(node, 'generators')
+        gen = generators[gi]
         if gi == 0:
             iter_val = first_iter
         else:
-            iter_val = yield from self.step_expr(gen['iter'], comp_scope)
+            iter_val = yield from self.step_expr(_nf(gen, 'iter'), comp_scope)
         for item in iter_val:
-            yield from self._assign(gen['target'], item, comp_scope)
+            yield from self._assign(_nf(gen, 'target'), item, comp_scope)
             skip = False
-            for cond in gen['ifs']:
+            for cond in _nf(gen, 'ifs'):
                 cv = yield from self.step_expr(cond, comp_scope)
                 if not cv:
                     skip = True
                     break
             if skip:
                 continue
-            if gi + 1 < len(node['generators']):
+            if gi + 1 < len(generators):
                 yield from self._comp_loop(
                     node, gi + 1, comp_scope, kind, result, None)
             else:
                 if kind == 'list':
-                    v = yield from self.step_expr(node['elt'], comp_scope)
+                    v = yield from self.step_expr(_nf(node, 'elt'), comp_scope)
                     result.append(v)
                 elif kind == 'set':
-                    v = yield from self.step_expr(node['elt'], comp_scope)
+                    v = yield from self.step_expr(_nf(node, 'elt'), comp_scope)
                     result.add(v)
                 else:
-                    kv = yield from self.step_expr(node['key'], comp_scope)
-                    vv = yield from self.step_expr(node['value'], comp_scope)
+                    kv = yield from self.step_expr(_nf(node, 'key'), comp_scope)
+                    vv = yield from self.step_expr(_nf(node, 'value'), comp_scope)
                     result[kv] = vv
 
     def _eval_genexp(self, node, scope):
@@ -1193,7 +1585,7 @@ class Interp:
         # Eager (build a list, return iter). Adequate for our test surface.
         result = []
         first_iter = yield from self.step_expr(
-            node['generators'][0]['iter'], scope)
+            _nf(_nf(node, 'generators')[0], 'iter'), scope)
         comp_scope = Scope(parent=scope)
         yield from self._comp_loop(node, 0, comp_scope, 'list', result, first_iter)
         return iter(result)
@@ -1212,21 +1604,24 @@ class Interp:
         return self._walk_for_yield(body)
 
     def _walk_for_yield(self, node):
-        if isinstance(node, list):
+        if isinstance(node, tuple) and node and _pg_tag(node[0]) in _NODE_POS:
+            op = _pg_tag(node[0])
+            if op in ('FunctionDef', 'AsyncFunctionDef', 'Lambda', 'ClassDef', 'IFunctionDef', 'IClassDef'):
+                return False
+            if op in ('Yield', 'YieldFrom'):
+                return True
+            for v in node[1:]:
+                if self._walk_for_yield(v):
+                    return True
+            return False
+        if isinstance(node, (list, tuple)):
             for x in node:
                 if self._walk_for_yield(x):
                     return True
             return False
-        if not isinstance(node, dict):
+        if not isinstance(node, _PGMap):
             return False
-        op = node.get('op')
-        if op in ('FunctionDef', 'AsyncFunctionDef', 'Lambda', 'ClassDef'):
-            return False
-        if op in ('Yield', 'YieldFrom'):
-            return True
-        for k, v in node.items():
-            if k == 'op':
-                continue
+        for _, v in node.items():
             if self._walk_for_yield(v):
                 return True
         return False
@@ -1236,13 +1631,13 @@ class Interp:
 
 def _decode_const(c):
     """Decode a JSON-encoded constant from build_ir.compile_to_json."""
-    t = c['t']
+    t = _pg_tag(c['t'])
     if t == 'none':     return None
     if t == 'true':     return True
     if t == 'false':    return False
     if t == 'int':      return int(c['v'])
     if t == 'float':    return float(c['v'])
-    if t == 'str':      return c['v']
+    if t == 'str':      return _pg_text(c['v'])
     if t == 'bytes':    return bytes(c['v'])
     if t == 'complex':  return complex(float(c['r']), float(c['i']))
     if t == 'ellipsis': return Ellipsis
@@ -1262,6 +1657,24 @@ def run_json_ir(jir, module_name='__main__'):
     consts = [_decode_const(c) for c in jir['consts']]
     interp = Interp(jir['strings'], consts)
     interp.run(jir['tree'], module_name)
+
+
+def run_json_blob(src, module_name='__main__'):
+    """Parse packed JSON IR and execute it without exposing plain dict IR."""
+    loaded = _pg_parse_json(src)
+    interp = Interp(loaded[0], tuple(_decode_const(c) for c in loaded[1]))
+    tree = loaded[2]
+    del loaded, src
+    interp.run(tree, module_name)
+
+
+def run_blob(blob, module_name='__main__'):
+    """Parse packed binary IR and execute it."""
+    loaded = _pg_parse_bin(blob)
+    interp = Interp(loaded[0], tuple(_decode_const(c) for c in loaded[1]))
+    tree = loaded[2]
+    del loaded, blob
+    interp.run(tree, module_name)
 
 
 # --- inline JSON parser -------------------------------------------------
@@ -1285,7 +1698,7 @@ def run_json_ir(jir, module_name='__main__'):
 # string-pool events an attacker could listen to.
 
 def _pg_parse_json(src):
-    """Parse a JSON string into Python dict/list/str/int/float/None.
+    """Parse a JSON string into opaque mapping wrappers / tuples / scalars.
 
     Same subset of JSON that compile_to_json emits in build_ir.py.
     Runs in O(n), single-pass, no regex, no stdlib json import.
@@ -1378,11 +1791,11 @@ def _pg_parse_json(src):
         c = src[i]
         if c == '{':
             idx[0] = i + 1
-            d = {}
+            items = []
             _skip_ws()
             if idx[0] < n and src[idx[0]] == '}':
                 idx[0] += 1
-                return d
+                return _PGMap(())
             while True:
                 _skip_ws()
                 k = _parse_string()
@@ -1391,7 +1804,7 @@ def _pg_parse_json(src):
                     raise ValueError("expected ':'")
                 idx[0] += 1
                 v = _parse_value()
-                d[k] = v
+                items.append((k, v))
                 _skip_ws()
                 if idx[0] >= n:
                     raise ValueError("unterminated object")
@@ -1400,7 +1813,7 @@ def _pg_parse_json(src):
                     continue
                 if src[idx[0]] == '}':
                     idx[0] += 1
-                    return d
+                    return _PGMap(items)
                 raise ValueError("expected ',' or '}'")
         if c == '[':
             idx[0] = i + 1
@@ -1408,7 +1821,7 @@ def _pg_parse_json(src):
             _skip_ws()
             if idx[0] < n and src[idx[0]] == ']':
                 idx[0] += 1
-                return lst
+                return ()
             while True:
                 lst.append(_parse_value())
                 _skip_ws()
@@ -1419,7 +1832,7 @@ def _pg_parse_json(src):
                     continue
                 if src[idx[0]] == ']':
                     idx[0] += 1
-                    return lst
+                    return tuple(lst)
                 raise ValueError("expected ',' or ']'")
         if c == '"':
             return _parse_string()
@@ -1449,13 +1862,68 @@ def _pg_parse_json(src):
     return result
 
 
+def _pg_parse_bin(blob):
+    idx = [0]
+    n = len(blob)
+
+    def _u32():
+        i = idx[0]
+        if i + 4 > n:
+            raise ValueError("short u32")
+        idx[0] = i + 4
+        return blob[i] | (blob[i + 1] << 8) | (blob[i + 2] << 16) | (blob[i + 3] << 24)
+
+    def _take(m):
+        i = idx[0]
+        if i + m > n:
+            raise ValueError("short read")
+        idx[0] = i + m
+        return blob[i:i + m]
+
+    def _parse():
+        tag = _take(1)
+        if tag == b'n':
+            return None
+        if tag == b't':
+            return True
+        if tag == b'f':
+            return False
+        if tag == b'i':
+            return int(_take(_u32()).decode('utf-8'))
+        if tag == b'r':
+            return float(_take(_u32()).decode('utf-8'))
+        if tag == b's':
+            return _take(_u32()).decode('utf-8')
+        if tag == b'l':
+            out = []
+            for _ in range(_u32()):
+                out.append(_parse())
+            return tuple(out)
+        if tag == b'm':
+            items = []
+            for _ in range(_u32()):
+                k = _take(_u32()).decode('utf-8')
+                items.append((k, _parse()))
+            return _PGMap(items)
+        raise ValueError("bad tag: " + repr(tag))
+
+    out = _parse()
+    if idx[0] != n:
+        raise ValueError("trailing packed data")
+    return out
+
+
 # --- self-test entry point ----------------------------------------------
 if __name__ == '__main__':
     import json
     import os
     import io
 
-    # Smoke test: read source from argv[1], compile via build_ir, run.
+    # Smoke test: read source from argv[1], compile via the real packed
+    # binary path (compile_to_compressed_bytes + run_blob) so this exercises
+    # the same code that production stubs use.
+    import zlib
+
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
         sys.path.insert(0, here)
@@ -1466,5 +1934,18 @@ if __name__ == '__main__':
         sys.exit(2)
     with open(sys.argv[1]) as f:
         src = f.read()
-    ir = _bi.compile_to_ir(src)
-    run_ir(ir)
+    schema_json = os.environ.get('PYGUARD_V5_SCHEMA')
+    compressed = _bi.compile_to_compressed_bytes(src, schema_json)
+    blob = zlib.decompress(compressed, -15)
+    if schema_json:
+        schema = json.loads(schema_json)
+        globals()['_PG_KEYS'] = dict(schema.get('keys', {}).items())
+        tags = dict(schema.get('tags', {}).items())
+        globals()['_PG_TAGS'] = tags
+        globals()['_PG_RTAGS'] = {v: k for k, v in tags.items()}
+        globals()['_PG_MASK'] = bytes(schema.get('mask', []))
+        globals()['_PG_LAYOUTS'] = {
+            k: {name: i + 1 for i, name in enumerate(v)}
+            for k, v in dict(schema.get('layouts', {}).items()).items()
+        }
+    run_blob(blob)

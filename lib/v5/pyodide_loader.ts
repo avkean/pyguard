@@ -16,6 +16,7 @@
 
 import { BUILD_IR_SRC } from './build_ir_src';
 import type { V5IR } from './assemble';
+import { makeV5Schema } from './schema';
 
 // Keep the Pyodide type surface minimal so we don't need @types/pyodide.
 interface PyodideInstance {
@@ -108,6 +109,7 @@ function cleanPyodideError(raw: string): { kind: 'syntax' | 'python'; message: s
 }
 
 export async function buildV5IR(source: string): Promise<V5IR> {
+    const schema = makeV5Schema();
     let py: PyodideInstance;
     try {
         py = await getPyodide();
@@ -119,10 +121,11 @@ export async function buildV5IR(source: string): Promise<V5IR> {
     }
     try {
         py.globals.set('_pg_user_src', source);
+        py.globals.set('_pg_schema_json', JSON.stringify(schema));
         py.runPython(
             `import base64 as _pg_b64\n` +
             `_pg_ir_b64 = _pg_b64.b64encode(` +
-            `compile_to_compressed_bytes(_pg_user_src)` +
+            `compile_to_compressed_bytes(_pg_user_src, _pg_schema_json)` +
             `).decode('ascii')\n`,
         );
     } catch (e) {
@@ -141,5 +144,5 @@ export async function buildV5IR(source: string): Promise<V5IR> {
     const bin = atob(b64);
     const out = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return { compressed: out };
+    return { compressed: out, schema };
 }

@@ -15,6 +15,7 @@ in Pyodide. It exposes a `compile_to_ir(source: str) -> dict` function.
 
 import ast
 import json
+import os
 
 
 # IR op names. The TS side replaces these with random numeric tags
@@ -496,6 +497,7 @@ def compile_to_json(source):
     frozenset, ellipsis) get tagged so the runtime can rebuild them.
     """
     ir = compile_to_ir(source)
+    lowered_tree = _lower_to_code(ir['tree'])
     encoded_consts = []
     for v in ir['consts']:
         if v is None:
@@ -522,24 +524,400 @@ def compile_to_json(source):
             encoded_consts.append({'t': 'frozenset', 'v': [_enc(x) for x in v]})
         else:
             raise NotImplementedError(f"unsupported constant type: {type(v).__name__}")
-    return [ir['strings'], encoded_consts, ir['tree']]
+    return [ir['strings'], encoded_consts, lowered_tree]
 
 
-def compile_to_compressed_bytes(source):
+def _lower_to_code(module_node):
+    if not isinstance(module_node, dict) or module_node.get('op') != 'Module':
+        raise ValueError('expected Module root')
+    return {'op': 'Code', 'instrs': [_lower_stmt(s) for s in module_node['body']]}
+
+
+def _lower_stmt(node):
+    op = node['op']
+    if op == 'Expr':
+        return {'op': 'IExpr', 'value': node['value']}
+    if op == 'Assign':
+        return {'op': 'IAssign', 'targets': node['targets'], 'value': node['value']}
+    if op == 'AugAssign':
+        return {'op': 'IAugAssign', 'target': node['target'], 'op2': node['op2'], 'value': node['value']}
+    if op == 'AnnAssign':
+        return {
+            'op': 'IAnnAssign',
+            'target': node['target'],
+            'annotation': node['annotation'],
+            'value': node['value'],
+            'simple': node['simple'],
+        }
+    if op == 'Return':
+        return {'op': 'IReturn', 'value': node['value']}
+    if op == 'Raise':
+        return {'op': 'IRaise', 'exc': node['exc'], 'cause': node['cause']}
+    if op == 'Pass':
+        return {'op': 'IPass'}
+    if op == 'Break':
+        return {'op': 'IBreak'}
+    if op == 'Continue':
+        return {'op': 'IContinue'}
+    if op == 'Delete':
+        return {'op': 'IDelete', 'targets': node['targets']}
+    if op == 'Global':
+        return {'op': 'IGlobal', 'names': node['names']}
+    if op == 'Nonlocal':
+        return {'op': 'INonlocal', 'names': node['names']}
+    if op == 'If':
+        return {
+            'op': 'IIf',
+            'test': node['test'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
+        }
+    if op == 'While':
+        return {
+            'op': 'IWhile',
+            'test': node['test'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
+        }
+    if op == 'For':
+        return {
+            'op': 'IFor',
+            'target': node['target'],
+            'iter': node['iter'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
+        }
+    if op == 'AsyncFor':
+        return {
+            'op': 'IAsyncFor',
+            'target': node['target'],
+            'iter': node['iter'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
+        }
+    if op == 'With':
+        return {
+            'op': 'IWith',
+            'items': node['items'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+        }
+    if op == 'AsyncWith':
+        return {
+            'op': 'IAsyncWith',
+            'items': node['items'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+        }
+    if op == 'Try':
+        return {
+            'op': 'ITry',
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'handlers': [_lower_handler(h) for h in node['handlers']],
+            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
+            'finalbody': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['finalbody']]},
+        }
+    if op == 'Import':
+        return {'op': 'IImport', 'names': node['names']}
+    if op == 'ImportFrom':
+        return {
+            'op': 'IImportFrom',
+            'module': node['module'],
+            'names': node['names'],
+            'level': node['level'],
+        }
+    if op == 'FunctionDef':
+        return {
+            'op': 'IFunctionDef',
+            'name': node['name'],
+            'args': node['args'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'decorator_list': node['decorator_list'],
+            'returns': node['returns'],
+            'is_async': False,
+            'is_gen': _contains_yield_tree(node['body']),
+        }
+    if op == 'AsyncFunctionDef':
+        return {
+            'op': 'IFunctionDef',
+            'name': node['name'],
+            'args': node['args'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'decorator_list': node['decorator_list'],
+            'returns': node['returns'],
+            'is_async': True,
+            'is_gen': False,
+        }
+    if op == 'ClassDef':
+        return {
+            'op': 'IClassDef',
+            'name': node['name'],
+            'bases': node['bases'],
+            'keywords': node['keywords'],
+            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'decorator_list': node['decorator_list'],
+        }
+    raise NotImplementedError(f"statement lowering unsupported: {op}")
+
+
+def _lower_handler(node):
+    return {
+        'op': 'IHandler',
+        'type': node['type'],
+        'name': node['name'],
+        'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+    }
+
+
+def _contains_yield_tree(node):
+    if isinstance(node, list):
+        for x in node:
+            if _contains_yield_tree(x):
+                return True
+        return False
+    if not isinstance(node, dict):
+        return False
+    op = node.get('op')
+    if op in ('FunctionDef', 'AsyncFunctionDef', 'Lambda', 'ClassDef', 'IFunctionDef', 'IClassDef'):
+        return False
+    if op in ('Yield', 'YieldFrom'):
+        return True
+    for k, v in node.items():
+        if k == 'op':
+            continue
+        if _contains_yield_tree(v):
+            return True
+    return False
+
+
+def _apply_schema(obj, key_map, tag_map):
+    if isinstance(obj, list):
+        return [_apply_schema(x, key_map, tag_map) for x in obj]
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            nk = key_map.get(k, k)
+            nv = _apply_schema(v, key_map, tag_map)
+            if k in ('op', 'op2', 'ctx', 't') and isinstance(nv, str):
+                nv = tag_map.get(nv, nv)
+            out[nk] = nv
+        return out
+    return obj
+
+
+def _schema_parts(schema_json):
+    if not schema_json:
+        return {}, {}, None, {}
+    if isinstance(schema_json, str):
+        schema = json.loads(schema_json)
+    else:
+        schema = schema_json
+    return (
+        dict(schema.get('keys', {})),
+        dict(schema.get('tags', {})),
+        schema.get('mask'),
+        dict(schema.get('layouts', {})),
+    )
+
+
+def _mask_text(s, mask):
+    if not mask:
+        return s
+    b = s.encode('utf-8')
+    return [(x ^ mask[i % len(mask)]) for i, x in enumerate(b)]
+
+
+def _mask_payload(payload, mask):
+    if not mask:
+        return payload
+    strings, consts, tree = payload
+
+    def _mask_const(c):
+        if isinstance(c, list):
+            return [_mask_const(x) for x in c]
+        if isinstance(c, dict):
+            out = {}
+            for k, v in c.items():
+                if k == 'v' and c.get('t') == 'str' and isinstance(v, str):
+                    out[k] = _mask_text(v, mask)
+                else:
+                    out[k] = _mask_const(v)
+            return out
+        return c
+
+    return [[_mask_text(s, mask) for s in strings], [_mask_const(c) for c in consts], tree]
+
+
+def _pack_u32(n):
+    return bytes((
+        n & 0xFF,
+        (n >> 8) & 0xFF,
+        (n >> 16) & 0xFF,
+        (n >> 24) & 0xFF,
+    ))
+
+
+def _pack_obj(obj):
+    if obj is None:
+        return b'n'
+    if obj is True:
+        return b't'
+    if obj is False:
+        return b'f'
+    if isinstance(obj, int):
+        b = str(obj).encode('utf-8')
+        return b'i' + _pack_u32(len(b)) + b
+    if isinstance(obj, float):
+        b = repr(obj).encode('utf-8')
+        return b'r' + _pack_u32(len(b)) + b
+    if isinstance(obj, str):
+        b = obj.encode('utf-8')
+        return b's' + _pack_u32(len(b)) + b
+    if isinstance(obj, (list, tuple)):
+        parts = [b'l', _pack_u32(len(obj))]
+        for x in obj:
+            parts.append(_pack_obj(x))
+        return b''.join(parts)
+    if isinstance(obj, dict):
+        parts = [b'm', _pack_u32(len(obj))]
+        for k, v in obj.items():
+            kb = k.encode('utf-8')
+            parts.append(_pack_u32(len(kb)))
+            parts.append(kb)
+            parts.append(_pack_obj(v))
+        return b''.join(parts)
+    raise NotImplementedError(f"unsupported packed type: {type(obj).__name__}")
+
+
+_NODE_LAYOUTS = {
+    'Code': ('instrs',),
+    'IExpr': ('value',),
+    'IAssign': ('targets', 'value'),
+    'IAugAssign': ('target', 'op2', 'value'),
+    'IAnnAssign': ('target', 'annotation', 'value', 'simple'),
+    'IReturn': ('value',),
+    'IRaise': ('exc', 'cause'),
+    'IPass': (),
+    'IBreak': (),
+    'IContinue': (),
+    'IDelete': ('targets',),
+    'IGlobal': ('names',),
+    'INonlocal': ('names',),
+    'IIf': ('test', 'body', 'orelse'),
+    'IWhile': ('test', 'body', 'orelse'),
+    'IFor': ('target', 'iter', 'body', 'orelse'),
+    'IAsyncFor': ('target', 'iter', 'body', 'orelse'),
+    'IWith': ('items', 'body'),
+    'IAsyncWith': ('items', 'body'),
+    'ITry': ('body', 'handlers', 'orelse', 'finalbody'),
+    'IHandler': ('type', 'name', 'body'),
+    'IImport': ('names',),
+    'IImportFrom': ('module', 'names', 'level'),
+    'IFunctionDef': ('name', 'args', 'body', 'decorator_list', 'returns', 'is_async', 'is_gen'),
+    'IClassDef': ('name', 'bases', 'keywords', 'body', 'decorator_list'),
+    'Module': ('body',),
+    'Expr': ('value',),
+    'Assign': ('targets', 'value'),
+    'AugAssign': ('target', 'op2', 'value'),
+    'AnnAssign': ('target', 'annotation', 'value', 'simple'),
+    'Return': ('value',),
+    'Raise': ('exc', 'cause'),
+    'Pass': (),
+    'Break': (),
+    'Continue': (),
+    'Delete': ('targets',),
+    'Global': ('names',),
+    'Nonlocal': ('names',),
+    'If': ('test', 'body', 'orelse'),
+    'While': ('test', 'body', 'orelse'),
+    'For': ('target', 'iter', 'body', 'orelse'),
+    'AsyncFor': ('target', 'iter', 'body', 'orelse'),
+    'With': ('items', 'body'),
+    'AsyncWith': ('items', 'body'),
+    'withitem': ('context_expr', 'optional_vars'),
+    'Try': ('body', 'handlers', 'orelse', 'finalbody'),
+    'ExceptHandler': ('type', 'name', 'body'),
+    'Import': ('names',),
+    'ImportFrom': ('module', 'names', 'level'),
+    'alias': ('name', 'asname'),
+    'FunctionDef': ('name', 'args', 'body', 'decorator_list', 'returns'),
+    'AsyncFunctionDef': ('name', 'args', 'body', 'decorator_list', 'returns'),
+    'ClassDef': ('name', 'bases', 'keywords', 'body', 'decorator_list'),
+    'Lambda': ('args', 'body'),
+    'arguments': ('posonlyargs', 'args', 'vararg', 'kwonlyargs', 'kw_defaults', 'kwarg', 'defaults'),
+    'arg': ('arg', 'annotation'),
+    'keyword': ('arg', 'value'),
+    'Name': ('id', 'ctx'),
+    'Constant': ('idx',),
+    'BinOp': ('left', 'op2', 'right'),
+    'UnaryOp': ('op2', 'operand'),
+    'BoolOp': ('op2', 'values'),
+    'Compare': ('left', 'ops', 'comparators'),
+    'IfExp': ('test', 'body', 'orelse'),
+    'Call': ('func', 'args', 'keywords'),
+    'Attribute': ('value', 'attr', 'ctx'),
+    'Subscript': ('value', 'slice', 'ctx'),
+    'Slice': ('lower', 'upper', 'step'),
+    'Starred': ('value', 'ctx'),
+    'List': ('elts', 'ctx'),
+    'Tuple': ('elts', 'ctx'),
+    'Set': ('elts',),
+    'Dict': ('keys', 'values'),
+    'ListComp': ('elt', 'generators'),
+    'SetComp': ('elt', 'generators'),
+    'DictComp': ('key', 'value', 'generators'),
+    'GeneratorExp': ('elt', 'generators'),
+    'comprehension': ('target', 'iter', 'ifs', 'is_async'),
+    'JoinedStr': ('values',),
+    'FormattedValue': ('value', 'conversion', 'format_spec'),
+    'Yield': ('value',),
+    'YieldFrom': ('value',),
+    'Await': ('value',),
+    'NamedExpr': ('target', 'value'),
+}
+
+
+def _to_positional(obj, key_map, rev_tag_map, layouts=None):
+    layouts = layouts or {}
+    if isinstance(obj, list):
+        return [_to_positional(x, key_map, rev_tag_map, layouts) for x in obj]
+    if isinstance(obj, dict):
+        op_key = key_map.get('op', 'op')
+        if op_key in obj:
+            op_val = obj[op_key]
+            canon_op = rev_tag_map.get(op_val, op_val)
+            layout = tuple(layouts.get(canon_op, _NODE_LAYOUTS.get(canon_op, ())))
+            if layout is not None:
+                return tuple([op_val] + [
+                    _to_positional(obj[key_map.get(field, field)], key_map, rev_tag_map, layouts)
+                    for field in layout
+                ])
+        return {
+            k: _to_positional(v, key_map, rev_tag_map, layouts)
+            for k, v in obj.items()
+        }
+    return obj
+
+
+def compile_to_compressed_bytes(source, schema_json=None):
     """Return the IR as zlib-deflated (raw, -15 wbits) JSON bytes.
 
     This is the form the TS obfuscator encrypts. Compressing here saves
     a JS-side zlib dependency: Python (Pyodide or subprocess) always has
     zlib in the stdlib, and the TS layer treats the bytes as opaque.
 
-    JSON of the IR is highly compressible (repeated field names and op
-    strings) — typical reduction is 5-10x, which directly shrinks every
-    generated stub by hundreds of lines.
+    The encoded IR uses a small custom binary container rather than JSON.
+    That removes readable structure from the decrypted payload and avoids
+    handing attackers a plaintext AST-ish blob if they intercept it.
     """
     import zlib
-    ir_json = json.dumps(compile_to_json(source), separators=(',', ':'))
+    payload = compile_to_json(source)
+    key_map, tag_map, mask, layouts = _schema_parts(schema_json)
+    payload = _mask_payload(payload, mask)
+    if key_map or tag_map:
+        payload = _apply_schema(payload, key_map, tag_map)
+    payload = _to_positional(payload, key_map, {v: k for k, v in tag_map.items()}, layouts)
+    packed = _pack_obj(payload)
     co = zlib.compressobj(9, zlib.DEFLATED, -15)
-    return co.compress(ir_json.encode('utf-8')) + co.flush()
+    return co.compress(packed) + co.flush()
 
 
 def _enc(v):
@@ -565,5 +943,5 @@ if __name__ == '__main__':
     import base64
     import sys
     src = sys.stdin.read()
-    blob = compile_to_compressed_bytes(src)
+    blob = compile_to_compressed_bytes(src, os.environ.get('PYGUARD_V5_SCHEMA'))
     sys.stdout.write(base64.b64encode(blob).decode('ascii'))
