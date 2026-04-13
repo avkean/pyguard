@@ -5,12 +5,12 @@ export default function Footer() {
         <span className="font-sans">
           &copy; {new Date().getFullYear()}{" "}
           <a
-            href="https://github.com/InsanelyAvner"
+            href="https://github.com/avkean"
             target="_blank"
             rel="noreferrer"
             className="hover:text-ink-muted transition-colors"
           >
-            Avner Yeoh
+            avkean
           </a>
         </span>
         <span className="hidden sm:inline text-ink-dim">
