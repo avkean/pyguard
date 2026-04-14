@@ -515,30 +515,36 @@ def compile_to_json(source):
     """
     ir = compile_to_ir(source)
     lowered_tree = _lower_to_code(ir['tree'])
+    # v8: consts now emitted positionally as lists, not dicts. Previous
+    # `{'t': type, 'v': value}` shape gave attackers a stable structural
+    # fingerprint they could match on every const wrapper. Positional
+    # `[type, value]` collides with the shape of every other list in the
+    # IR (AST-node argument lists, expression-tuple elements, etc.) so
+    # there's nothing distinguishable at parse time.
     encoded_consts = []
     for v in ir['consts']:
         if v is None:
-            encoded_consts.append({'t': 'none'})
+            encoded_consts.append(['none'])
         elif v is True:
-            encoded_consts.append({'t': 'true'})
+            encoded_consts.append(['true'])
         elif v is False:
-            encoded_consts.append({'t': 'false'})
+            encoded_consts.append(['false'])
         elif isinstance(v, int):
-            encoded_consts.append({'t': 'int', 'v': str(v)})
+            encoded_consts.append(['int', str(v)])
         elif isinstance(v, float):
-            encoded_consts.append({'t': 'float', 'v': repr(v)})
+            encoded_consts.append(['float', repr(v)])
         elif isinstance(v, str):
-            encoded_consts.append({'t': 'str', 'v': v})
+            encoded_consts.append(['str', v])
         elif isinstance(v, bytes):
-            encoded_consts.append({'t': 'bytes', 'v': list(v)})
+            encoded_consts.append(['bytes', list(v)])
         elif isinstance(v, complex):
-            encoded_consts.append({'t': 'complex', 'r': repr(v.real), 'i': repr(v.imag)})
+            encoded_consts.append(['complex', repr(v.real), repr(v.imag)])
         elif v is Ellipsis:
-            encoded_consts.append({'t': 'ellipsis'})
+            encoded_consts.append(['ellipsis'])
         elif isinstance(v, tuple):
-            encoded_consts.append({'t': 'tuple', 'v': [_enc(x) for x in v]})
+            encoded_consts.append(['tuple', [_enc(x) for x in v]])
         elif isinstance(v, frozenset):
-            encoded_consts.append({'t': 'frozenset', 'v': [_enc(x) for x in v]})
+            encoded_consts.append(['frozenset', [_enc(x) for x in v]])
         else:
             raise NotImplementedError(f"unsupported constant type: {type(v).__name__}")
     return [ir['strings'], encoded_consts, lowered_tree]
@@ -705,15 +711,29 @@ def _contains_yield_tree(node):
     return False
 
 
+_CONST_TAGS = frozenset((
+    'none', 'true', 'false', 'int', 'float', 'str',
+    'bytes', 'complex', 'ellipsis', 'tuple', 'frozenset',
+))
+
+
 def _apply_schema(obj, key_map, tag_map):
     if isinstance(obj, list):
+        # v8: const wrappers are now positional lists `[tag, *values]` (was
+        # dicts with 't' key). Tag-map the leading element when it looks
+        # like a const tag. The check `obj[0] in _CONST_TAGS` is safe — no
+        # other list at this build stage starts with one of those strings
+        # (AST nodes are still dicts; the IR is _to_positional'd later).
+        if obj and isinstance(obj[0], str) and obj[0] in _CONST_TAGS:
+            new_tag = tag_map.get(obj[0], obj[0])
+            return [new_tag] + [_apply_schema(x, key_map, tag_map) for x in obj[1:]]
         return [_apply_schema(x, key_map, tag_map) for x in obj]
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
             nk = key_map.get(k, k)
             nv = _apply_schema(v, key_map, tag_map)
-            if k in ('op', 'op2', 'ctx', 't') and isinstance(nv, str):
+            if k in ('op', 'op2', 'ctx') and isinstance(nv, str):
                 nv = tag_map.get(nv, nv)
             out[nk] = nv
         return out
@@ -766,16 +786,13 @@ def _mask_payload(payload, mask):
     strings, consts, tree = payload
 
     def _mask_const(c):
+        # v8: consts are positional lists `[tag, *values]`. When tag == 'str',
+        # the value at index 1 is a Python str — mask its bytes. Otherwise
+        # recurse into nested const lists (tuple/frozenset wrappers).
         if isinstance(c, list):
+            if c and c[0] == 'str' and len(c) >= 2 and isinstance(c[1], str):
+                return [c[0], _mask_text(c[1], mask)] + [_mask_const(x) for x in c[2:]]
             return [_mask_const(x) for x in c]
-        if isinstance(c, dict):
-            out = {}
-            for k, v in c.items():
-                if k == 'v' and c.get('t') == 'str' and isinstance(v, str):
-                    out[k] = _mask_text(v, mask)
-                else:
-                    out[k] = _mask_const(v)
-            return out
         return c
 
     return [[_mask_text(s, mask) for s in strings], [_mask_const(c) for c in consts], tree]
@@ -1002,27 +1019,51 @@ def compile_to_compressed_bytes(source, schema_json=None):
 
 
 def _enc(v):
-    """Inline encoder for nested constants inside tuples/frozensets."""
-    if v is None: return {'t': 'none'}
-    if v is True: return {'t': 'true'}
-    if v is False: return {'t': 'false'}
-    if isinstance(v, int): return {'t': 'int', 'v': str(v)}
-    if isinstance(v, float): return {'t': 'float', 'v': repr(v)}
-    if isinstance(v, str): return {'t': 'str', 'v': v}
-    if isinstance(v, bytes): return {'t': 'bytes', 'v': list(v)}
-    if v is Ellipsis: return {'t': 'ellipsis'}
-    if isinstance(v, tuple): return {'t': 'tuple', 'v': [_enc(x) for x in v]}
-    if isinstance(v, frozenset): return {'t': 'frozenset', 'v': [_enc(x) for x in v]}
+    """Inline encoder for nested constants inside tuples/frozensets.
+
+    v8: positional list form (matches outer encoder in compile_to_json).
+    """
+    if v is None: return ['none']
+    if v is True: return ['true']
+    if v is False: return ['false']
+    if isinstance(v, int): return ['int', str(v)]
+    if isinstance(v, float): return ['float', repr(v)]
+    if isinstance(v, str): return ['str', v]
+    if isinstance(v, bytes): return ['bytes', list(v)]
+    if v is Ellipsis: return ['ellipsis']
+    if isinstance(v, tuple): return ['tuple', [_enc(x) for x in v]]
+    if isinstance(v, frozenset): return ['frozenset', [_enc(x) for x in v]]
     raise NotImplementedError(f"unsupported nested constant: {type(v).__name__}")
+
+
+# v7: compile Python source to bytecode at build time and serialize via
+# marshal. The stub then does `marshal.loads(bytes)` + `FunctionType(code, ns)()`
+# at runtime — this eliminates the `compile()` audit events that used to
+# dump stage1/stage2/interpreter sources verbatim via PEP 578. The attacker
+# now only gets marshaled bytecode (version-locked to the build Python),
+# which requires a decompiler pass before anything resembling source
+# appears. The caller is responsible for compressing + encrypting the
+# bytes for transport.
+def compile_and_marshal(source, filename='<pg>'):
+    import marshal
+    code = compile(source, filename, 'exec')
+    return marshal.dumps(code)
 
 
 # Self-test entry point — used by Node-side smoke tests and the
 # scripts/gen-v5-stub.mjs subprocess driver. Reads Python source from
 # stdin and writes the zlib-compressed IR bytes to stdout as base64, so
 # the driver can hand them straight to the TS obfuscator.
+#
+# v7: PYGUARD_MODE=marshal switches to compile_and_marshal() for the
+# marshaled-code-object pipeline. Default remains the IR compile path.
 if __name__ == '__main__':
     import base64
     import sys
     src = sys.stdin.read()
-    blob = compile_to_compressed_bytes(src, os.environ.get('PYGUARD_V5_SCHEMA'))
+    mode = os.environ.get('PYGUARD_MODE', 'ir')
+    if mode == 'marshal':
+        blob = compile_and_marshal(src, os.environ.get('PYGUARD_FILENAME', '<pg>'))
+    else:
+        blob = compile_to_compressed_bytes(src, os.environ.get('PYGUARD_V5_SCHEMA'))
     sys.stdout.write(base64.b64encode(blob).decode('ascii'))

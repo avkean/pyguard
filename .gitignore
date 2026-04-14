@@ -12,6 +12,13 @@
 
 # testing
 /coverage
+/tests/out
+/tests/out_v5
+
+# python
+__pycache__/
+*.pyc
+*.pyo
 
 # next.js
 /.next/

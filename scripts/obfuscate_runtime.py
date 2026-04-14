@@ -44,14 +44,31 @@ else:
 # Only l, I, 1, O, 0 — no underscore to avoid __ name mangling issues.
 _CONFUSE_CHARS = 'lI1O0'
 
-# Names that stage2 (assemble.ts) references by name. We will rename them
-# internally but register globals()[encoded_original] aliases so the outside
-# contract is preserved.
-API_SURFACE_NAMES = {
-    'run_blob', 'run_json_blob', '_pg_parse_json', '_pg_parse_bin',
-    'Interp', '_PGMap', '_decode_const', '_pg_text', '_pg_key', '_pg_tag',
-    '_nf', '_NODE_POS', '_MISSING', 'Scope', 'run_ir', 'run_json_ir',
-}
+# v9: DRASTICALLY SHRUNK.
+#
+# Prior rounds registered 16 API names (run_blob, _pg_parse_bin, Interp,
+# _decode_const, _pg_text, _pg_tag, _nf, _MISSING, Scope, …) as
+# globals()[original] = obfuscated aliases so stage2 + downstream could
+# find them by their original names. That set was the foundation of the
+# v8 attack: red-team hooked `_pg_parse_bin`, `_decode_const`, `_pg_text`,
+# `_pg_tag`, `_nf`, `Interp` by their original names and walked the IR.
+#
+# Those aliases only existed as a build-time convenience: with one
+# exception (`_pg_boot`, which stage2's source literally calls), NONE of
+# them are referenced from outside the interpreter module. All internal
+# LOAD_GLOBALs resolve against the obfuscated names within the same
+# module, which are consistent because the rename pass is atomic.
+#
+# v9: only `_pg_boot` remains, and even that is registered under a
+# RANDOMIZED BYTES KEY (not the literal string "_pg_boot"). An attacker
+# who hooks `types.FunctionType` to grab the interpreter's globals now
+# finds only obfuscated tokens plus one anonymous bytes-keyed slot.
+API_SURFACE_NAMES = {'_pg_boot'}
+
+# v9: the randomized boot export key. Generated fresh every obfuscation
+# run. Stage2 needs the same bytes so we emit them on stderr for the
+# caller (gen-interpreter-src.mjs) to capture and re-export.
+BOOT_EXPORT_KEY = bytes(random.randint(0, 255) for _ in range(12))
 
 # Dunder / magic names that Python calls by protocol -- never rename.
 DUNDER_NAMES = {
@@ -128,37 +145,32 @@ CUT_MARKER = "# --- self-test entry point"
 # ---------------------------------------------------------------------------
 
 class NameGenerator:
-    """Generate confusable identifier names from lI1O0_ alphabet."""
+    """Generate short obfuscated identifier names.
+
+    v11: shortened from 7-char `_lI1O0Il` (confusable alphabet) to 3-5
+    chars from a 52-letter mixed-case pool. Confusability was a weak
+    anti-reading property; the security guarantee is that names carry
+    NO SEMANTIC INFORMATION, which holds regardless of length. Stubs
+    reference each name many times, so every byte shaved off a name
+    cascades into ~O(refs) bytes off the stub.
+
+    Entropy: interpreter has ~800 renameable identifiers. 52^2 = 2704
+    two-char bodies, 52^3 = 140k — ample for unique allocation.
+    """
 
     def __init__(self):
-        self._counter = 0
         self._used = set()
 
     def next_name(self):
-        """Generate a unique confusable name like _lI1O0Il1_."""
-        while True:
-            self._counter += 1
-            name = self._make(self._counter)
-            if name not in self._used:
-                self._used.add(name)
-                return name
-
-    def _make(self, n):
-        # Always start with _ to be a valid Python identifier.
-        # Use only non-underscore confusable chars (lI1O0) in the body
-        # to avoid __ sequences that trigger Python name mangling or
-        # __slots__ / attribute lookup issues.
-        body_chars = 'lI1O0'
-        base = len(body_chars)
-        parts = []
-        while n > 0:
-            parts.append(body_chars[n % base])
-            n //= base
-        # Pad to at least 6 chars for extra confusion
-        while len(parts) < 6:
-            parts.append(body_chars[random.randint(0, base - 1)])
-        random.shuffle(parts)
-        return '_' + ''.join(parts)
+        body_chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        for _ in range(4096):
+            n = 2 + random.randint(0, 2)  # 2..4 body chars
+            s = '_' + ''.join(random.choice(body_chars) for _ in range(n))
+            if s not in self._used:
+                self._used.add(s)
+                return s
+        # Fallback: extremely unlikely with 140k+ 3-char bodies
+        raise RuntimeError("NameGenerator: exhausted attempts")
 
 
 _namegen = NameGenerator()
@@ -327,11 +339,26 @@ class IdentifierRenamer(ast.NodeTransformer):
         return node
 
     def visit_Import(self, node):
-        # Don't rename import module names
+        # Don't rename module names (they're runtime-looked-up) but DO
+        # rename the `asname` — `import hashlib as _h` binds `_h` in the
+        # enclosing scope, and usages of `_h` elsewhere are renamed, so
+        # the alias itself must be renamed in lockstep. Otherwise every
+        # call to hashlib turns into a NameError on the renamed alias.
+        for alias in node.names:
+            if alias.asname and alias.asname in self.rename_map:
+                alias.asname = self.rename_map[alias.asname]
         return node
 
     def visit_ImportFrom(self, node):
-        # Don't rename import module names
+        # Same treatment as Import: preserve the imported module/member
+        # name but rename the alias if one is present. For bare
+        # `from mod import foo` (no asname), `alias.name` becomes the
+        # binding in the enclosing scope, but rewriting it would break
+        # the import itself — so those are left untouched and the
+        # collect/rename pass excludes them already by pattern.
+        for alias in node.names:
+            if alias.asname and alias.asname in self.rename_map:
+                alias.asname = self.rename_map[alias.asname]
         return node
 
     def generic_visit(self, node):
@@ -349,19 +376,33 @@ _BODY_CHARS = 'lI1O0'
 _XOR_DECODE_FUNC_NAME = '_' + ''.join(random.choices(_BODY_CHARS, k=8))
 
 
-def _make_xor_decode_func():
+def _make_xor_decode_func(used_names=None):
     """Return AST nodes for the shared XOR decode helper with caching.
 
     Generates a cache dict and a decode function that memoizes results
     to avoid repeated computation and reduce call stack depth in deep
     recursion scenarios.
+
+    `used_names`: set of identifiers already consumed by the rename pass —
+    we avoid regenerating any of those to prevent the cache dict name
+    from colliding with a renamed class or function. (Previously this
+    was a silent statistical bug: when a collision hit, the cache dict
+    got rebound to a class object and `in`-tests raised TypeError.)
     """
-    # Use confusable names for all identifiers
-    pd = '_' + ''.join(random.choices(_BODY_CHARS, k=5))
-    pk = '_' + ''.join(random.choices(_BODY_CHARS, k=5))
-    pi = '_' + ''.join(random.choices(_BODY_CHARS, k=5))
-    pc = '_' + ''.join(random.choices(_BODY_CHARS, k=6))  # cache dict name
-    pkey = '_' + ''.join(random.choices(_BODY_CHARS, k=5))
+    used_names = used_names if used_names is not None else set()
+
+    def fresh(width):
+        while True:
+            cand = '_' + ''.join(random.choices(_BODY_CHARS, k=width))
+            if cand not in used_names:
+                used_names.add(cand)
+                return cand
+
+    pd = fresh(5)
+    pk = fresh(5)
+    pi = fresh(5)
+    pc = fresh(6)      # cache dict name
+    pkey = fresh(5)
 
     func_src = f'''
 {pc} = {{}}
@@ -792,31 +833,85 @@ def insert_dead_code(tree, n_funcs=12, n_methods_per_class=3):
 # ---------------------------------------------------------------------------
 
 def make_globals_registration(rename_map):
-    """Generate statements like:
-       globals()[bytes([...]).decode('utf-8')] = renamed_thing
-    for each API surface name that was renamed."""
+    """v10: read pre-seeded boot args from globals and call _pg_boot inline.
+
+    Prior rounds exported _pg_boot by writing
+        globals()[BOOT_KEY] = _pg_boot
+    at module-body end, then stage2 called that handle externally. The v9
+    red team defeated that by either (a) iterating globals for any bytes
+    key, or (b) scanning for a function with co_argcount==10.
+
+    v10 flips the direction: stage2 PRE-SEEDS `globals()[BOOT_KEY] = args`
+    BEFORE running the module body. The module body's last statement
+    reads the args tuple and calls `_pg_boot(*args)` inline. Then
+    `del globals()[BOOT_KEY]` scrubs the evidence.
+
+    After `FunctionType(code, ns)()` returns:
+      - the bytes-key slot is gone (deleted)
+      - user code has already run (synchronously inside _pg_boot)
+      - schema locals were scrubbed by _pg_boot before `interp.run`
+      - so an attacker reading `ns` post-call sees only obfuscated
+        class/function defs, not the transient args tuple
+    """
     stmts = []
-    for orig_name in sorted(API_SURFACE_NAMES):
-        if orig_name in rename_map:
-            obf_name = rename_map[orig_name]
-            # globals()[encoded_original] = obfuscated_name
-            encoded_key = _xor_encode_string(orig_name)
-            stmt = ast.Assign(
-                targets=[
-                    ast.Subscript(
-                        value=ast.Call(
-                            func=ast.Name(id='globals', ctx=ast.Load()),
-                            args=[],
-                            keywords=[],
-                        ),
-                        slice=encoded_key,
-                        ctx=ast.Store(),
-                    ),
-                ],
-                value=ast.Name(id=obf_name, ctx=ast.Load()),
-                lineno=0,
-            )
-            stmts.append(stmt)
+    if '_pg_boot' not in rename_map:
+        return stmts
+    obf_name = rename_map['_pg_boot']
+    # bytes([b0, b1, ..., b11]) → literal bytes object used as the key
+    byte_elts = [ast.Constant(value=b) for b in BOOT_EXPORT_KEY]
+    key_expr = ast.Call(
+        func=ast.Name(id='bytes', ctx=ast.Load()),
+        args=[ast.List(elts=byte_elts, ctx=ast.Load())],
+        keywords=[],
+    )
+    # _boot_args = globals()[bytes([...])]
+    # del globals()[bytes([...])]
+    # _pg_boot_renamed(*_boot_args)
+    args_var = '_pg_boot_args_'  # will be xor-encoded by rename/string pass
+    # Since we emit AST *after* the rename pass, this name is a literal
+    # identifier in the output. To avoid it looking distinctive, we'll
+    # also pick a fresh token.
+    import random as _random_local
+    tok_chars = 'lI1O0'
+    args_var = '_' + ''.join(_random_local.choice(tok_chars) for _ in range(6))
+
+    # args_var = globals()[bytes([...])]
+    stmts.append(ast.Assign(
+        targets=[ast.Name(id=args_var, ctx=ast.Store())],
+        value=ast.Subscript(
+            value=ast.Call(
+                func=ast.Name(id='globals', ctx=ast.Load()),
+                args=[], keywords=[],
+            ),
+            slice=key_expr,
+            ctx=ast.Load(),
+        ),
+        lineno=0,
+    ))
+    # del globals()[bytes([...])]   — eliminate the slot before running user code
+    stmts.append(ast.Delete(
+        targets=[ast.Subscript(
+            value=ast.Call(
+                func=ast.Name(id='globals', ctx=ast.Load()),
+                args=[], keywords=[],
+            ),
+            slice=key_expr,
+            ctx=ast.Del(),
+        )],
+        lineno=0,
+    ))
+    # <renamed_pg_boot>(*args_var)
+    stmts.append(ast.Expr(
+        value=ast.Call(
+            func=ast.Name(id=obf_name, ctx=ast.Load()),
+            args=[ast.Starred(
+                value=ast.Name(id=args_var, ctx=ast.Load()),
+                ctx=ast.Load(),
+            )],
+            keywords=[],
+        ),
+        lineno=0,
+    ))
     return stmts
 
 
@@ -880,8 +975,11 @@ def obfuscate(src):
     encoder = StringEncoder()
     tree = encoder.visit(tree)
 
-    # 3.5. Insert the shared XOR decode helper (cache + function) right after imports
-    decode_nodes = _make_xor_decode_func()
+    # 3.5. Insert the shared XOR decode helper (cache + function) right after imports.
+    # Pass the set of names already consumed by the rename pass so the cache dict
+    # name cannot collide with a renamed class or function — a collision would
+    # rebind the cache dict to a class object mid-exec and break `in`-tests.
+    decode_nodes = _make_xor_decode_func(used_names=set(rename_map.values()))
     # Find the position after the last import statement
     insert_pos = 0
     for i, stmt in enumerate(tree.body):
@@ -913,6 +1011,11 @@ def main():
     result = obfuscate(src)
     sys.stdout.write(result)
     sys.stdout.write('\n')
+    # v9: emit the boot export key to stderr as a hex line so
+    # gen-interpreter-src.mjs can capture it and export it alongside
+    # INTERPRETER_SRC_B64 for stage2 to use.
+    sys.stderr.write('PYG_BOOT_KEY_HEX=' + BOOT_EXPORT_KEY.hex() + '\n')
+    sys.stderr.flush()
 
 
 if __name__ == '__main__':

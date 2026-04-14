@@ -170,30 +170,18 @@ def _nf(node, field, default=_MISSING):
     return node[pos]
 
 
-class _PGMap:
-    """Opaque mapping wrapper for parsed IR nodes and tagged constants."""
-
-    __slots__ = ('_k', '_v')
-
-    def __init__(self, items):
-        self._k = tuple(k for k, _ in items)
-        self._v = tuple(v for _, v in items)
-
-    def __contains__(self, key):
-        return _pg_key(key) in self._k
-
-    def __getitem__(self, key):
-        key = _pg_key(key)
-        for i, cur in enumerate(self._k):
-            if cur == key:
-                return self._v[i]
-        raise KeyError(key)
-
-    def items(self):
-        return zip(self._k, self._v)
-
-    def __repr__(self):
-        return "<_PGMap>"
+# v8: _PGMap class deleted. Previously, parsed IR map-nodes and the
+# decoded schema were wrapped in a class with __slots__ == ('_k', '_v').
+# That structural invariant was a single fingerprint by which an attacker
+# could find the wrapper class in the interpreter namespace and patch its
+# __init__ to dump every materialized map (schema, layouts, IR map-nodes,
+# const wrappers, …). v8 removes the class and uses plain dict / tuple,
+# which have no unique-to-pyguard structural shape an attacker can target.
+# All remaining call sites construct dict(items) inline; the const wire
+# format is now positional (t, v) tuples (see _decode_const), so the only
+# dict that exists at parse time is the transient schema map, and even
+# that is replaced in step D by a positional binary schema parser inside
+# _pg_boot's frame (no dict ever materializes).
 
 
 # --- operator dispatch tables --------------------------------------------
@@ -378,9 +366,35 @@ def _drive_sync(gen):
 # --- interpreter ---------------------------------------------------------
 
 class Interp:
-    def __init__(self, strings, consts):
-        self.strings = strings
-        self.consts = consts
+    """v8: holds an opaque accessor closure instead of plain strings/consts
+    tuples. Previously `Interp(strings, consts)` exposed both tables as
+    constructor arguments AND as `self.strings` / `self.consts`. Anyone who
+    found the Interp class (e.g. by 3-arg `__init__` signature, or by
+    walking interp_ns post-init) could snapshot both tables in one shot.
+
+    v8 changes the contract: callers build `(_a)` where `_a(kind, idx)` is
+    a closure holding the encrypted/masked tables. The strings/consts never
+    live as instance attributes — only inside the closure cells of `_a`,
+    which are not addressable without first locating `_a` itself (and `_a`
+    is a vanilla function with no stable name across builds). The decoy
+    arguments break any signature-based heuristic search.
+    """
+
+    def __init__(self, *_args):
+        # v10: vararg. Previously `__init__(self, _a, _decoy_a=None,
+        # _decoy_b=None, _decoy_c=None)` — `co_argcount == 5`, which the
+        # v9 red team used to structurally locate the Interp class
+        # regardless of name obfuscation. Under varargs, argcount is 1
+        # (self) and cannot be distinguished from dozens of other
+        # methods on other classes.
+        #
+        # `_args[0]` MUST be the accessor closure `_a`. Remaining entries
+        # are decoys (ignored).
+        if not _args:
+            raise TypeError("Interp: missing accessor")
+        # `_a(0, idx)` returns raw (possibly mask-encoded) strings table entry.
+        # `_a(1, idx)` returns the decoded const table entry.
+        self._a = _args[0]
         self._str_cache = {}
 
     def s(self, idx):
@@ -388,12 +402,12 @@ class Interp:
             return None
         if idx in self._str_cache:
             return self._str_cache[idx]
-        v = _pg_text(self.strings[idx])
+        v = _pg_text(self._a(0, idx))
         self._str_cache[idx] = v
         return v
 
     def k(self, idx):
-        return self.consts[idx]
+        return self._a(1, idx)
 
     # ---- entry point ----
 
@@ -1626,7 +1640,7 @@ class Interp:
                 if self._walk_for_yield(x):
                     return True
             return False
-        if not isinstance(node, _PGMap):
+        if not isinstance(node, dict):
             return False
         for _, v in node.items():
             if self._walk_for_yield(v):
@@ -1637,41 +1651,72 @@ class Interp:
 # --- entry points --------------------------------------------------------
 
 def _decode_const(c):
-    """Decode a JSON-encoded constant from build_ir.compile_to_json."""
-    t = _pg_tag(c['t'])
+    """Decode a positional const wrapper produced by build_ir.compile_to_json.
+
+    v8: const wire format is a positional list/tuple `(tag, *values)`. The
+    previous `{'t': tag, 'v': value, ...}` dict shape was a unique structural
+    fingerprint by which an attacker could find every const wrapper materialized
+    during parse — replaced here with positional access so const wrappers
+    look indistinguishable from any other tuple in the IR stream.
+    """
+    t = _pg_tag(c[0])
     if t == 'none':     return None
     if t == 'true':     return True
     if t == 'false':    return False
-    if t == 'int':      return int(c['v'])
-    if t == 'float':    return float(c['v'])
-    if t == 'str':      return _pg_text(c['v'])
-    if t == 'bytes':    return bytes(c['v'])
-    if t == 'complex':  return complex(float(c['r']), float(c['i']))
+    if t == 'int':      return int(c[1])
+    if t == 'float':    return float(c[1])
+    if t == 'str':      return _pg_text(c[1])
+    if t == 'bytes':    return bytes(c[1])
+    if t == 'complex':  return complex(float(c[1]), float(c[2]))
     if t == 'ellipsis': return Ellipsis
-    if t == 'tuple':    return tuple(_decode_const(x) for x in c['v'])
-    if t == 'frozenset': return frozenset(_decode_const(x) for x in c['v'])
+    if t == 'tuple':    return tuple(_decode_const(x) for x in c[1])
+    if t == 'frozenset': return frozenset(_decode_const(x) for x in c[1])
     raise ValueError("unknown const tag: " + t)
+
+
+def _build_accessor(strings, consts):
+    """Construct the opaque (kind, idx) -> entry accessor passed to Interp.
+
+    `strings` is the raw strings tuple (entries may be plain str or mask-
+    encoded byte lists; Interp.s() applies _pg_text on each access).
+    `consts` is the already-decoded consts tuple of Python objects.
+
+    Both are captured in this function's closure cells. They are never
+    exposed as attributes on Interp; the only handle on them is the
+    returned closure, which has no stable name across builds.
+    """
+    def _a(kind, idx):
+        if kind == 0:
+            return strings[idx]
+        if kind == 1:
+            return consts[idx]
+        # Unknown kind probe — return a sentinel that doesn't leak data
+        # but isn't None (a hooked _a returning None on probe is a tamper
+        # signal a future hardening round can verify).
+        raise LookupError(kind)
+    return _a
 
 
 def run_ir(ir, module_name='__main__'):
     """Run a v5 IR dict (already-decoded form: consts are Python objects)."""
-    interp = Interp(ir['strings'], ir['consts'])
+    interp = Interp(_build_accessor(ir['strings'], ir['consts']))
     interp.run(ir['tree'], module_name)
 
 
 def run_json_ir(jir, module_name='__main__'):
-    """Run a JSON-form IR dict (consts are tagged dicts)."""
-    consts = [_decode_const(c) for c in jir['consts']]
-    interp = Interp(jir['strings'], consts)
+    """Run a JSON-form IR dict (consts are positional list/tuple wrappers)."""
+    consts = tuple(_decode_const(c) for c in jir['consts'])
+    interp = Interp(_build_accessor(jir['strings'], consts))
     interp.run(jir['tree'], module_name)
 
 
 def run_json_blob(src, module_name='__main__'):
     """Parse packed JSON IR and execute it without exposing plain dict IR."""
     loaded = _pg_parse_json(src)
-    interp = Interp(loaded[0], tuple(_decode_const(c) for c in loaded[1]))
+    consts = tuple(_decode_const(c) for c in loaded[1])
+    interp = Interp(_build_accessor(loaded[0], consts))
     tree = loaded[2]
-    del loaded, src
+    del loaded, src, consts
     interp.run(tree, module_name)
 
 
@@ -1700,9 +1745,146 @@ def run_blob(blob, module_name='__main__'):
     del _ns, _bk
     # ------------------------------------------------
     loaded = _pg_parse_bin(blob)
-    interp = Interp(loaded[0], tuple(_decode_const(c) for c in loaded[1]))
+    consts = tuple(_decode_const(c) for c in loaded[1])
+    interp = Interp(_build_accessor(loaded[0], consts))
     tree = loaded[2]
-    del loaded, blob
+    del loaded, blob, consts
+    interp.run(tree, module_name)
+
+
+def _pg_boot(*_a):
+    """PyGuard interpreter entry point.
+
+    v11 signature (9 or 10 inert-bytes positional args, no callables):
+      schema_ct, schema_label, ir_ct, ir_label, seed,
+      interp_hash, env_hash, pep, profile[, module_name='__main__']
+
+    Architectural shift from v10 to v11: the `kd` and `dec` closures that
+    stage2 previously injected as Python callables have been replaced by
+    (a) the 32-byte `pep` pepper, and (b) the 15-byte `profile` struct
+    (rounds, rot_mod, sbx_nudge, rk_label[4], rot_label[4], sbx_label[4]).
+    The cipher algorithm itself is implemented inline here via the
+    renamed _k_derive / _c_dec helpers defined above. An attacker
+    hooking `types.FunctionType` now finds only inert bytes in the
+    boot-args tuple — no callable to replace with a logging wrapper
+    (which was the `v10_attack_boot_args_sniff` vector).
+
+    v10 vararg rationale preserved: `co_argcount == 0` defeats any
+    structural fingerprint keyed on argument count.
+    """
+    if len(_a) == 9:
+        (schema_ct, schema_label, ir_ct, ir_label, seed,
+         interp_hash, env_hash, pep, profile) = _a
+        module_name = '__main__'
+    elif len(_a) == 10:
+        (schema_ct, schema_label, ir_ct, ir_label, seed,
+         interp_hash, env_hash, pep, profile, module_name) = _a
+    else:
+        raise TypeError("_pg_boot: expected 9 or 10 args, got " + str(len(_a)))
+    del _a
+
+    # Unpack the 15-byte profile struct (layout must match TS emission
+    # in lib/obfuscate.ts / lib/v5/assemble.ts).
+    _rounds = profile[0]
+    _rot_mod = profile[1]
+    _sbx_nudge = profile[2]
+    _rk_label = bytes(profile[3:7])
+    _rot_label = bytes(profile[7:11])
+    _sbx_label = bytes(profile[11:15])
+
+    global _S_K, _S_RT, _S_M, _S_L
+    import hashlib as _h
+    import zlib as _z
+
+    # --- decrypt schema (v8: positional binary, not JSON) ---
+    _schema_seed_pre = _h.sha256(seed + schema_label).digest()
+    _schema_seed = bytes(a ^ b ^ c for a, b, c in zip(
+        _schema_seed_pre, interp_hash, env_hash))
+    _schema_p = _k_derive(_schema_seed, pep, _rounds, _rk_label,
+                          _rot_label, _sbx_label, _rot_mod, _sbx_nudge)
+    _sb = _c_dec(schema_ct, _schema_p[0], _schema_p[1], _schema_p[2])
+    del _schema_seed, _schema_seed_pre, _schema_p
+
+    _o = 0
+    # mask
+    _ml = _sb[_o]; _o += 1
+    _S_M = bytes(_sb[_o:_o + _ml]); _o += _ml
+    # bin_key
+    _bk_lo = _sb[_o] | (_sb[_o+1] << 8) | (_sb[_o+2] << 16) | (_sb[_o+3] << 24); _o += 4
+    _bk_hi = _sb[_o] | (_sb[_o+1] << 8) | (_sb[_o+2] << 16) | (_sb[_o+3] << 24); _o += 4
+    _bin_key = _bk_lo | (_bk_hi << 32)
+    # noise schedule
+    _nc = _sb[_o]; _o += 1
+    _noise = []
+    for _ in range(_nc):
+        _pos = _sb[_o] | (_sb[_o+1] << 8); _o += 2
+        _ln = _sb[_o]; _o += 1
+        _noise.append((_pos, _ln))
+    # keys
+    _kc = _sb[_o] | (_sb[_o+1] << 8); _o += 2
+    _S_K = {}
+    for _ in range(_kc):
+        _kl = _sb[_o]; _o += 1
+        _k = _sb[_o:_o + _kl].decode('utf-8'); _o += _kl
+        _vl = _sb[_o]; _o += 1
+        _v = _sb[_o:_o + _vl].decode('utf-8'); _o += _vl
+        _S_K[_k] = _v
+    # tags (read straight into reverse-tag map; forward map never exists)
+    _tc = _sb[_o] | (_sb[_o+1] << 8); _o += 2
+    _S_RT = {}
+    for _ in range(_tc):
+        _kl = _sb[_o]; _o += 1
+        _k = _sb[_o:_o + _kl].decode('utf-8'); _o += _kl
+        _vl = _sb[_o]; _o += 1
+        _v = _sb[_o:_o + _vl].decode('utf-8'); _o += _vl
+        _S_RT[_v] = _k
+    # layouts (name → {field: index+1})
+    _lc = _sb[_o] | (_sb[_o+1] << 8); _o += 2
+    _S_L = {}
+    for _ in range(_lc):
+        _tl = _sb[_o]; _o += 1
+        _tag = _sb[_o:_o + _tl].decode('utf-8'); _o += _tl
+        _fc = _sb[_o]; _o += 1
+        _fmap = {}
+        for _j in range(_fc):
+            _fl = _sb[_o]; _o += 1
+            _fn = _sb[_o:_o + _fl].decode('utf-8'); _o += _fl
+            _fmap[_fn] = _j + 1
+        _S_L[_tag] = _fmap
+    del _sb, _o, _ml, _bk_lo, _bk_hi, _nc
+    try:
+        del _pos, _ln, _kc, _kl, _k, _vl, _v, _tc, _lc, _tl, _tag, _fc, _fmap, _fl, _fn, _j
+    except NameError:
+        pass
+
+    # --- decrypt IR bytes ---
+    _ir_seed_pre = _h.sha256(seed + ir_label).digest()
+    _ir_seed = bytes(a ^ b ^ c for a, b, c in zip(
+        _ir_seed_pre, interp_hash, env_hash))
+    _ir_p = _k_derive(_ir_seed, pep, _rounds, _rk_label,
+                      _rot_label, _sbx_label, _rot_mod, _sbx_nudge)
+    blob = _z.decompress(_c_dec(ir_ct, _ir_p[0], _ir_p[1], _ir_p[2]), -15)
+    del _ir_seed, _ir_seed_pre, _ir_p, schema_ct, ir_ct, seed, pep, profile
+    del _rounds, _rot_mod, _sbx_nudge, _rk_label, _rot_label, _sbx_label
+
+    # --- strip noise + rolling XOR (was in v6 run_blob) ---
+    if _noise:
+        blob = _strip_noise(blob, _noise)
+    if _bin_key is not None:
+        blob = _rolling_xor(blob, _bin_key)
+    del _noise, _bin_key
+
+    # --- parse + run ---
+    loaded = _pg_parse_bin(blob)
+    _consts = tuple(_decode_const(c) for c in loaded[1])
+    # v8: build accessor closure here. The strings tuple (loaded[0]) and
+    # the decoded consts are captured in `_a`'s closure cells. They are
+    # not stored as Interp instance attributes, so a class-init hook on
+    # Interp captures only `_a` (an opaque function), not the underlying
+    # tables.
+    interp = Interp(_build_accessor(loaded[0], _consts))
+    tree = loaded[2]
+    del loaded, blob, _consts
     interp.run(tree, module_name)
 
 
@@ -1824,7 +2006,7 @@ def _pg_parse_json(src):
             _skip_ws()
             if idx[0] < n and src[idx[0]] == '}':
                 idx[0] += 1
-                return _PGMap(())
+                return {}
             while True:
                 _skip_ws()
                 k = _parse_string()
@@ -1842,7 +2024,7 @@ def _pg_parse_json(src):
                     continue
                 if src[idx[0]] == '}':
                     idx[0] += 1
-                    return _PGMap(items)
+                    return dict(items)
                 raise ValueError("expected ',' or '}'")
         if c == '[':
             idx[0] = i + 1
@@ -1889,6 +2071,68 @@ def _pg_parse_json(src):
     if idx[0] != n:
         raise ValueError("trailing data at " + str(idx[0]))
     return result
+
+
+def _k_derive(input_seed, pep, rounds, rk_label, rot_label, sbx_label, rot_mod, sbx_nudge):
+    """v11 inline key-derivation — mirror of stage1's _kd.
+
+    Previously stage1 passed its _kd CLOSURE (along with _dec) into _pg_boot
+    as a positional argument. The red team's `v10_attack_boot_args_sniff`
+    wrapped that closure in a logger, let the stub run, and captured every
+    plaintext byte as it flowed through decrypt.
+
+    v11 moves derivation INSIDE the interpreter. The profile parameters
+    (rounds, labels, rot_mod, sbx_nudge) travel as inert bytes in the
+    boot-args tuple; there is no Python callable to wrap. An attacker
+    who captures the args now has only raw bytes and must reimplement
+    this derivation offline to make use of them.
+
+    Algorithm must match lib/obfuscate.ts `kdf()` exactly — the stage1
+    encryption side used the same math and any drift breaks compat.
+    """
+    import hashlib as _h2
+    peppered = bytes(a ^ b for a, b in zip(input_seed, pep))
+    rks = []
+    h = peppered
+    for _ in range(rounds):
+        h = _h2.sha256(h + rk_label).digest()
+        rks.append(h)
+    rot_seed = _h2.sha256(peppered + rot_label).digest()
+    rotk = [(rot_seed[i] % rot_mod) + 1 for i in range(rounds)]
+    sbx_seed = _h2.sha256(peppered + sbx_label).digest()
+    sbox = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + sbox[i] + sbx_seed[i % 32] + sbx_nudge) % 256
+        sbox[i], sbox[j] = sbox[j], sbox[i]
+    inv = [0] * 256
+    for i in range(256):
+        inv[sbox[i]] = i
+    return rks, rotk, inv
+
+
+def _c_dec(ct, rks, rotk, inv):
+    """v11 inline cipher decrypt — canonical (unflattened) version of
+    the state machine stage1 generates as source. Equivalent semantics,
+    ~20x less code. Stage1's flattened version is retained for its own
+    use (where extraction resistance matters); the interpreter's copy
+    runs after FunctionType has already latched the code object, so
+    flattening buys no additional protection here.
+    """
+    N = len(rks)
+    out = bytearray(len(ct))
+    prev = 0
+    for i in range(len(ct)):
+        b = ct[i]
+        for r in range(N - 1, -1, -1):
+            k = rotk[r]
+            b = ((b >> k) | (b << (8 - k))) & 0xFF
+            b = inv[b]
+            b ^= rks[r][i % 32]
+        b ^= prev
+        out[i] = b
+        prev = ct[i]
+    return bytes(out)
 
 
 def _rolling_xor(data, seed):
@@ -1964,11 +2208,16 @@ def _pg_parse_bin(blob):
                 out.append(_parse())
             return tuple(out)
         if tag == b'm':
+            # v8: legacy `m` (map) tag retained only so old packed blobs
+            # parse — current build_ir.py emits const wrappers as positional
+            # tuples (`l` tag) per step B, so the only `m` payloads in v8
+            # streams are absent. Returning a plain dict keeps backward-compat
+            # without re-introducing a unique-class fingerprint.
             items = []
             for _ in range(_u32()):
                 k = _take(_u32()).decode('utf-8')
                 items.append((k, _parse()))
-            return _PGMap(items)
+            return dict(items)
         raise ValueError("bad tag: " + repr(tag))
 
     out = _parse()

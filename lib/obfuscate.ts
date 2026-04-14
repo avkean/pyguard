@@ -1,11 +1,12 @@
 // lib/obfuscate.ts
 //
-// PyGuard v4/v5 — hardened Python obfuscator.
+// PyGuard — hardened Python obfuscator (current generation: v11).
 //
-// v5 adds an AST-walking interpreter path: when caller provides a pre-built
-// IR dict (from lib/v5/build_ir.py, run in Pyodide or a subprocess), the
-// user source is replaced with a generic interpreter + encrypted IR blob,
-// so the final compile() call never sees user Python source.
+// Caller provides a pre-built IR (from lib/v5/build_ir.py, run in Pyodide
+// or a subprocess) and a marshaled, compressed interpreter code object.
+// The user source is replaced with a stub that wraps the encrypted IR and
+// loads the interpreter via marshal.loads (no compile() of user source at
+// runtime). See lib/v5/assemble.ts for the stage2 architecture.
 //
 // ============================================================================
 // Threat model: motivated humans AND adversarial LLMs.
@@ -36,11 +37,11 @@
 //       anti-debug poison masks are all randomized per stub. A generic
 //       unpacker that hardcodes any of them fails on the next stub.
 //
-//   3.  RANDOMIZED CONFUSABLE IDENTIFIERS. Every top-level variable,
+//   3.  RANDOMIZED MEANINGLESS IDENTIFIERS. Every top-level variable,
 //       helper function, loop counter, and intermediate value in the
-//       canonical region is named with a fresh identifier drawn from
-//       {_, l, I, O, 0, 1}. Distinct names look nearly identical under
-//       fast scanning and carry zero semantic information to an LLM.
+//       canonical region is named with a fresh short alphanumeric
+//       identifier. Names carry zero semantic information to an LLM and
+//       a reverser cannot grep for "the key variable".
 //
 //   4.  RANDOMLY PERMUTED CAPTURED-BUILTIN TUPLE. The tuple
 //       `(compile, getattr, type, __import__, open, exec)` is shuffled
@@ -52,13 +53,12 @@
 //       state variable whose values are random bytes with no mnemonic.
 //       Nested-loop pattern matching fails.
 //
-//   6.  CIPHERTEXT SPLITTING WITH DECOY CHUNKS. The base64 ciphertexts
-//       for Stage 1 and the user payload are split into random-sized
-//       fragments. Decoys of the same form (random base64) are
-//       interleaved and shuffled into the source. The final concat
-//       expression names only the real fragments, in order. A reverser
-//       must visually trace the exact concat list to reconstruct the
-//       ciphertext.
+//   6.  CIPHERTEXT SPLITTING. The base64 ciphertexts for stage1, stage2,
+//       the interpreter, the schema, the IR, and the user payload are
+//       split into random-sized 2KB..4KB fragments with shuffled
+//       declaration order. The concat expression names the fragments
+//       in their original order. A reverser must visually trace the
+//       concat list to reconstruct the ciphertext.
 //
 //   7.  DECOY KEY-LIKE BYTE ARRAYS. Multiple 32-byte arrays that look
 //       identical to the real stored-XOR key are emitted above the
@@ -385,23 +385,36 @@ interface NameGen {
     gen(): string;
 }
 
-// Random-identifier generator. Emits names of the form `_<letters>` where
-// every character is drawn uniformly from the 52-letter mixed-case Latin
-// alphabet. Names carry zero semantic value — the anti-LLM defence is the
-// absence of meaning, not visual confusability. A wider alphabet also
-// makes the output readable enough to debug without diluting the core
-// property that identifiers tell a reader nothing about what they hold.
+// Random-identifier generator. v11: emits short names `_<2-4 alphanum>`
+// where the body is drawn from the 62-char mixed-case alphanumeric pool.
+//
+// Length rationale: 62^2 = 3844 distinct 2-char bodies, 62^3 = 238k. A
+// typical stub consumes ~500 names (chunk vars + state-machine vars +
+// API surface) so 3-char bodies suffice with ample collision headroom.
+// Previously we emitted 8..12 char names; that's ~3x longer per ref and
+// stubs reference each name many times.
+//
+// Security: name length and visual shape are independent. A reader
+// trying to reverse cares about what a name REFERS TO, not how long it
+// is. Confusability and meaning-absence are preserved; the size cost of
+// padding every identifier with ~6 extra bytes is not.
 function makeNameGen(): NameGen {
     const used = new Set<string>();
     const pool =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const poolNoDigit =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     return {
         gen(): string {
-            for (let attempts = 0; attempts < 256; attempts++) {
-                const r = randomBytes(16);
-                const len = 8 + (r[0] % 5); // 8..12
-                let s = "_" + pool[r[1] % pool.length];
-                for (let i = 2; i < len; i++) {
+            for (let attempts = 0; attempts < 512; attempts++) {
+                const r = randomBytes(8);
+                // Length: 2..4 body chars. First char must be non-digit
+                // because identifiers can't start with a digit after the
+                // leading underscore would otherwise allow it (`_9abc`
+                // is legal, but keep things uniform).
+                const len = 2 + (r[0] % 3); // 2..4
+                let s = "_" + poolNoDigit[r[1] % poolNoDigit.length];
+                for (let i = 2; i < len + 1; i++) {
                     s += pool[r[i] % pool.length];
                 }
                 if (!used.has(s) && !PY_RESERVED.has(s)) {
@@ -435,15 +448,6 @@ function captureBuiltins(): BuiltinCapture {
     return { tupleSource: `(${perm.join(", ")})`, idx };
 }
 
-function makeRandomB64Chunk(len: number): string {
-    const chars =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const r = randomBytes(len);
-    let s = "";
-    for (let i = 0; i < len; i++) s += chars[r[i] % 64];
-    return s;
-}
-
 function shuffleArr<T>(a: T[]): void {
     const r = randomBytes(Math.max(1, a.length + 1));
     for (let i = a.length - 1; i > 0; i--) {
@@ -457,39 +461,29 @@ interface ChunkedB64 {
     concat: string;  // Python concat expression of ONLY the real chunks
 }
 
-// Split a base64 ciphertext into random-sized fragments, interleave decoy
-// fragments of the same form, shuffle the declarations, and return:
+// Split a base64 ciphertext into random-sized fragments and return:
 //
-//   - decls:  one "<random_name> = \"<chunk>\"" line per real AND decoy
-//             fragment, in shuffled order.
-//   - concat: Python expression "<real_name_0> + <real_name_1> + ..."
-//             concatenating ONLY the real fragments in their original
-//             order, by name.
+//   - decls:  one "<random_name> = \"<chunk>\"" line per fragment, in
+//             shuffled order.
+//   - concat: Python expression "<name_0> + <name_1> + ..." concatenating
+//             the fragments in their original order, by name.
 //
-// A reverser must visually trace the concat expression to locate the real
-// fragments among the decoys, then reconstruct the ciphertext. An LLM that
-// skims the declarations and picks out "large base64 strings" gets a
-// random superset of real + decoy bytes that does not decrypt.
+// A reverser must visually trace the concat expression to locate the
+// fragments in the right order to reconstruct the ciphertext. The
+// fragments themselves are large base64 blobs that no static analyzer
+// can decrypt without recovering the runtime key.
 function chunkB64(b64: string, ng: NameGen): ChunkedB64 {
-    // Chunk-size selection is a direct size/analysis tradeoff.
-    //
-    // Smaller chunks -> more `_name = "..."` lines -> more decoy budget per
-    // unit of real data, more visual noise in the declaration block, but
-    // also dramatically more lines in the final stub and a longer concat
-    // expression at runtime.
-    //
-    // The v5 stage2 payload embeds a ~50KB interpreter source plus the
-    // encrypted IR, so at chunk size 24..63 we previously emitted ~13k
-    // decl lines per stub — 98% of the file. Bumping to 320..640 cuts
-    // that to ~200-400 decl lines with no measurable security change:
-    // the reverser still has to trace the concat expression to pick
-    // real chunks out of decoys, and one 512-char base64 fragment is
-    // no easier to reason about than ten 48-char fragments.
+    // Chunk size 2KB..4KB. Earlier versions used 24..63 char chunks with
+    // interleaved decoys, which inflated the stub by ~50× without adding
+    // any defense against an attacker who follows the `concat` expression.
+    // Larger chunks shrink the per-chunk overhead (`_NAME = "..." + \n +
+    // concat `+`) and reduce startup-time string concat count from ~500
+    // to ~75 across all five ciphertexts.
     const pieces: string[] = [];
     let i = 0;
     while (i < b64.length) {
-        const r = randomBytes(1);
-        const sz = 320 + (r[0] % 321); // 320..640
+        const r = randomBytes(2);
+        const sz = 2048 + ((r[0] | (r[1] << 8)) % 2049); // 2048..4096
         pieces.push(b64.slice(i, i + sz));
         i += sz;
     }
@@ -499,15 +493,6 @@ function chunkB64(b64: string, ng: NameGen): ChunkedB64 {
     const all: Entry[] = [];
     for (let k = 0; k < pieces.length; k++) {
         all.push({ name: realNames[k], value: pieces[k] });
-        const r = randomBytes(1);
-        // 0..1 decoys per real chunk (was 0..2). With larger chunk sizes,
-        // a ~50% decoy rate still doubles the declaration block visually
-        // but costs only half as many lines as the previous 0..2 range.
-        const decoys = r[0] % 2;
-        for (let d = 0; d < decoys; d++) {
-            const decoyLen = 320 + (randomBytes(1)[0] % 321);
-            all.push({ name: ng.gen(), value: makeRandomB64Chunk(decoyLen) });
-        }
     }
     shuffleArr(all);
     const decls = all.map(e => `${e.name} = "${e.value}"`).join("\n");
@@ -559,11 +544,98 @@ const END_MARKER = "#PYG4E";
 const BEGIN_MARKER_BYTES_LIT = "[35, 80, 89, 71, 52, 83]"; // '#PYG4S'
 const END_MARKER_BYTES_LIT = "[35, 80, 89, 71, 52, 69]";   // '#PYG4E'
 
+// v8: binary schema serializer.
+//
+// Previously the schema was shipped as JSON (`{"keys":{...},"tags":{...},
+// "mask":[...],"layouts":{...},"binKey":[lo,hi],"noiseSchedule":[...]}`).
+// Those dict-keys are a stable structural fingerprint: any attacker who
+// hooks the stub's JSON parser (or `dict.__init__`, or `_pg_parse_json`'s
+// return value) and filters for an object containing `keys`+`tags`+`mask`
+// recovers the schema regardless of how we rename build-time symbols.
+//
+// The binary format has NO named fields. The parser inside _pg_boot reads
+// positional sections directly into local vars (_S_K, _S_RT, _S_M, _S_L,
+// _bin_key, _noise) without ever materializing a dict that carries those
+// names as keys. A frame-walk attack on _pg_boot sees only opaque ints
+// and byte slices until the locals are already in their final consumed
+// form, and the locals are deleted before Interp.run begins.
+//
+// All ASCII strings — tokens are 7-char `_XXXXXX`, keys/tags max ~20
+// chars — so u8 length prefixes are sufficient everywhere. Counts are
+// u16 LE (keys+tags+layouts can each exceed 255 entries).
+//
+// Layout:
+//   [u8 mask_len][mask bytes]
+//   [u32 LE bin_key_lo][u32 LE bin_key_hi]
+//   [u8 noise_count] [(u16 LE pos, u8 len) * noise_count]
+//   [u16 LE keys_count]    [(u8 klen, k, u8 vlen, v) * keys_count]
+//   [u16 LE tags_count]    [(u8 klen, k, u8 vlen, v) * tags_count]
+//   [u16 LE layouts_count] [(u8 tag_len, tag, u8 field_count,
+//                            (u8 flen, f) * field_count) * layouts_count]
+function serializeSchemaBinary(schema: {
+    keys: Record<string, string>;
+    tags: Record<string, string>;
+    mask: number[];
+    layouts: Record<string, string[]>;
+    binKey: [number, number];
+    noiseSchedule: [number, number][];
+}): Uint8Array {
+    const parts: Uint8Array[] = [];
+    const enc = (s: string) => strToUtf8(s);
+    const u8 = (n: number) => new Uint8Array([n & 0xff]);
+    const u16 = (n: number) => new Uint8Array([n & 0xff, (n >>> 8) & 0xff]);
+    const u32 = (n: number) => new Uint8Array([
+        n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff,
+    ]);
+    const writeStr = (s: string) => {
+        const b = enc(s);
+        if (b.length > 255) throw new Error("schema string > 255 bytes");
+        parts.push(u8(b.length), b);
+    };
+
+    // mask
+    if (schema.mask.length > 255) throw new Error("mask > 255 bytes");
+    parts.push(u8(schema.mask.length), new Uint8Array(schema.mask));
+
+    // bin_key (two u32 LE)
+    parts.push(u32(schema.binKey[0] >>> 0), u32(schema.binKey[1] >>> 0));
+
+    // noise schedule
+    if (schema.noiseSchedule.length > 255) throw new Error("noise > 255 entries");
+    parts.push(u8(schema.noiseSchedule.length));
+    for (const [pos, len] of schema.noiseSchedule) {
+        if (len > 255) throw new Error("noise len > 255");
+        parts.push(u16(pos & 0xffff), u8(len));
+    }
+
+    // keys
+    const keyEntries = Object.entries(schema.keys);
+    parts.push(u16(keyEntries.length));
+    for (const [k, v] of keyEntries) { writeStr(k); writeStr(v); }
+
+    // tags
+    const tagEntries = Object.entries(schema.tags);
+    parts.push(u16(tagEntries.length));
+    for (const [k, v] of tagEntries) { writeStr(k); writeStr(v); }
+
+    // layouts
+    const layoutEntries = Object.entries(schema.layouts);
+    parts.push(u16(layoutEntries.length));
+    for (const [tag, fields] of layoutEntries) {
+        writeStr(tag);
+        if (fields.length > 255) throw new Error("layout fields > 255");
+        parts.push(u8(fields.length));
+        for (const f of fields) writeStr(f);
+    }
+
+    return concatBytes(...parts);
+}
+
 // v5 imports — kept inline so non-v5 code paths don't pull in the
 // interpreter source string.
 import { buildV5Stage2Source, serializeIR } from './v5/assemble';
 import type { V5IR } from './v5/assemble';
-import { INTERPRETER_SRC_B64 } from './v5/interpreter_src';
+import { INTERPRETER_SRC_B64, BOOT_KEY_BYTES } from './v5/interpreter_src';
 
 export interface ObfuscateOpts {
     // When provided, uses the v5 AST-walking interpreter path:
@@ -572,6 +644,18 @@ export interface ObfuscateOpts {
     // never sees user source. Build the IR with lib/v5/build_ir.py
     // (in Pyodide for browser, or via subprocess for Node testing).
     v5IR?: V5IR;
+    // v7: compile Python source → bytecode → marshal.dumps bytes. Used
+    // for stage1 and stage2 (which remain small enough not to need
+    // compression). The Node driver shells out to python3; the browser
+    // driver uses Pyodide. Required when v5IR is present.
+    compileAndMarshal?: (source: string, filename?: string) => Uint8Array;
+    // v7: zlib-raw-deflated (-15 wbits) marshal.dumps bytes for the
+    // interpreter module. The caller prepares this by decompressing
+    // INTERPRETER_SRC_B64, compiling with the Python version the stub
+    // will run against, marshaling, and re-compressing. Required when
+    // v5IR is present. Pushed to caller so obfuscate.ts stays
+    // browser-bundle-friendly (no node:zlib import).
+    interpreterMarshalCompressed?: Uint8Array;
 }
 
 export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string {
@@ -730,45 +814,102 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     for (let i = 0; i < 32; i++) pepperedSeed2[i] = seed2[i] ^ pep[i];
     const params2 = kdf(pepperedSeed2, prof);
 
-    // In v5 mode, replace the user Python source with a stage2 wrapper
-    // containing the AST-walking interpreter and an encrypted IR blob.
-    // The IR is encrypted with a separate third-stage key derived from
-    // the same runtime-recovered `_seed`, so there is never a moment at
-    // which user Python source appears as a compile() argument.
+    // In v5/v6 this block built a stage2 *source* string, encrypted it, and
+    // let stage1 call compile() on the decrypted text. v7 replaces the
+    // source-round-trip with marshaled code objects so no `compile()` audit
+    // event ever sees the text of stage2 or the interpreter:
+    //
+    //   1. Decompress the interpreter source once, compile+marshal it on the
+    //      build machine via `opts.compileAndMarshal`, zlib-compress the
+    //      marshaled bytes, encrypt+base64+chunk that as `interpChunks`.
+    //   2. Build the stage2 *source* as before (only so we can compile+marshal
+    //      it ourselves) — then throw away the source; only the marshaled
+    //      bytecode is embedded.
+    //   3. Stage1 (see below) is likewise compiled+marshaled and the
+    //      canonical region does `marshal.loads` on it instead of `compile`.
+    //
+    // The attacker who installs an audit hook no longer sees stage1/stage2/
+    // interpreter source at any point — only marshaled bytecode, which
+    // requires a Python-version-specific decompiler pass to approach source
+    // fidelity.
     let payloadBytes: Uint8Array;
     if (opts && opts.v5IR) {
-        // Fresh names for the IR decryption snippet inside stage2.
-        const irVarSeed    = ng.gen();
-        const irVarP       = ng.gen();
-        const irVarCt      = ng.gen();
-        const irVarPt      = ng.gen();
-        const schemaVarSeed = ng.gen();
-        const schemaVarP    = ng.gen();
-        const schemaVarCt   = ng.gen();
-        const schemaVarPt   = ng.gen();
-        const schemaVarObj  = ng.gen();
-        const interpUnpack = ng.gen();
-        const interpRawVar = ng.gen();  // holds compressed interpreter bytes
-        const interpHashVar = ng.gen(); // holds sha256 of compressed bytes
-        const envCheckVar = ng.gen();   // holds environment integrity check hash
+        if (!opts.compileAndMarshal) {
+            throw new Error(
+                'v7 obfuscation requires opts.compileAndMarshal. ' +
+                'The Node driver (gen-v5-stub.mjs) and the browser driver ' +
+                '(pyodide_loader.ts) each supply one; callers that embed ' +
+                'the library directly must provide a callback that returns ' +
+                '`marshal.dumps(compile(source, filename, "exec"))` bytes.',
+            );
+        }
+        if (!opts.interpreterMarshalCompressed) {
+            throw new Error(
+                'v7 obfuscation requires opts.interpreterMarshalCompressed — ' +
+                'zlib-deflated (raw, -15) marshal.dumps bytes for the ' +
+                'interpreter. Callers prepare this by decompressing ' +
+                'INTERPRETER_SRC_B64, compile+marshal+deflate in the target ' +
+                "Python. See build_ir.py's compile_and_marshal helper.",
+            );
+        }
+        // Fresh names used inside stage2's Python source.
+        const envCheckVar        = ng.gen();
+        const interpCtVar        = ng.gen();
+        const interpHashVar      = ng.gen();
+        const interpSeedVar      = ng.gen();
+        const interpPVar         = ng.gen();
+        const interpMarshalVar   = ng.gen();
+        const interpCodeVar      = ng.gen();
+        const interpNsVar        = ng.gen();
+        const schemaCtVar        = ng.gen();
+        const irCtVar            = ng.gen();
 
-        // Cryptographic binding: the interpreter source hash is mixed into
-        // the seed for schema/IR key derivation. This means modifying the
-        // interpreter source (e.g., to add dump statements) changes the key
-        // and silently breaks schema/IR decryption. No check to bypass.
-        const interpCompressed = Buffer.from(INTERPRETER_SRC_B64, 'base64');
-        const interpHash = sha256(new Uint8Array(interpCompressed));
+        // v9: boot entry point indexed by a RANDOMIZED BYTES KEY, not by
+        // the literal string "_pg_boot". The bytes come from
+        // interpreter_src.ts (generated by gen-interpreter-src.mjs,
+        // which captures them from obfuscate_runtime.py). No original
+        // API name exists in interp_ns; stage2 looks up
+        // `interp_ns[bytes([...random...])]`.
+        const bootKeyBytes = BOOT_KEY_BYTES;
 
-        // Environment integrity binding: at runtime, we hash a check string
-        // built from thread count + zlib.decompress type + print type + getattr type.
-        // If any is wrong (extra threads, monkey-patched functions), the hash
-        // differs and decryption silently produces garbage.
-        // Expected: '1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method'
+        // Environment integrity binding. The runtime hash is
+        //   sha256("1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method")
+        // — one thread, three builtins of the expected type. The build side
+        // precomputes the SAME hash and XORs it into schema / IR key
+        // derivation. Wrong env → wrong keys → garbage plaintext.
         const envCheckExpected = sha256(
             new TextEncoder().encode('1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method')
         );
 
-        // Third-stage cipher: derived from seed + irLabel + interpHash + envCheck.
+        // ---- 1. Encrypt the pre-marshaled interpreter --------------------
+        // The caller has already decompressed INTERPRETER_SRC_B64, compiled
+        // the interpreter in the target Python, marshaled, and re-compressed.
+        // We just encrypt + chunk. (Zlib work is pushed to the caller so
+        // obfuscate.ts doesn't need node:zlib in the browser bundle.)
+        const interpMarshalCompressed = opts.interpreterMarshalCompressed;
+
+        // Interpreter cipher: derived from seed + interpLabel + envCheck.
+        // NOT XOR'd with interpHash because interpHash IS the hash of the
+        // interpreter ciphertext (known at stage2 runtime only after decode).
+        const interpLabel = randomBytes(6);
+        const interpSeedPre = sha256(concatBytes(seed, interpLabel));
+        const interpSeed = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) interpSeed[i] = interpSeedPre[i] ^ envCheckExpected[i];
+        const pepperedInterpSeed = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) pepperedInterpSeed[i] = interpSeed[i] ^ pep[i];
+        const paramsInterp = kdf(pepperedInterpSeed, prof);
+        const encInterp = encrypt(interpMarshalCompressed, paramsInterp, prof);
+        const encInterpB64 = bytesToBase64(encInterp);
+        const interpChunks = chunkB64(encInterpB64, ng);
+
+        // ---- 2. Interp-hash binding for schema + IR ----------------------
+        // The schema and IR keys XOR in the hash of the *encrypted*
+        // interpreter blob. Any tampering (e.g. attacker swaps interpreter
+        // ciphertext for a debug version) changes this hash and silently
+        // corrupts schema+IR decryption.
+        const interpHash = sha256(encInterp);
+
+        // Third-stage cipher: IR. Seed = sha256(seed || irLabel) ^ interpHash ^ envCheck.
         const irLabel = randomBytes(6);
         const irSeed3Pre = sha256(concatBytes(seed, irLabel));
         const irSeed3 = new Uint8Array(32);
@@ -776,14 +917,12 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
         const pepperedSeed3 = new Uint8Array(32);
         for (let i = 0; i < 32; i++) pepperedSeed3[i] = irSeed3[i] ^ pep[i];
         const params3 = kdf(pepperedSeed3, prof);
-
-        // Encrypt the (already compressed) IR bytes with the v4 cipher.
         const irJsonBytes = serializeIR(opts.v5IR);
         const encIR = encrypt(irJsonBytes, params3, prof);
         const encIRB64 = bytesToBase64(encIR);
         const irChunks = chunkB64(encIRB64, ng);
 
-        // Schema cipher: also bound to interpreter hash + env check.
+        // Schema cipher: same pattern.
         const schemaLabel = randomBytes(6);
         const schemaSeed4Pre = sha256(concatBytes(seed, schemaLabel));
         const schemaSeed4 = new Uint8Array(32);
@@ -791,33 +930,47 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
         const pepperedSeed4 = new Uint8Array(32);
         for (let i = 0; i < 32; i++) pepperedSeed4[i] = schemaSeed4[i] ^ pep[i];
         const params4 = kdf(pepperedSeed4, prof);
-        const schemaBytes = strToUtf8(JSON.stringify(opts.v5IR.schema));
+        const schemaBytes = serializeSchemaBinary(opts.v5IR.schema);
         const encSchema = encrypt(schemaBytes, params4, prof);
         const encSchemaB64 = bytesToBase64(encSchema);
         const schemaChunks = chunkB64(encSchemaB64, ng);
 
-        // Chunk the interpreter base64 into fragments with decoys so there is
-        // no single extractable constant containing the full interpreter source.
-        const interpChunks = chunkB64(INTERPRETER_SRC_B64, ng);
-
+        // ---- 3. Build + marshal stage2 -----------------------------------
+        // v11: pack PolyProfile into 15 bytes for inline _k_derive inside
+        // the interpreter. Layout must match the `_pg_boot` unpack in
+        // lib/v5/runtime_interp.py:
+        //   [0] rounds, [1] rotMod, [2] sbxNudge,
+        //   [3..7] rkLabel, [7..11] rotLabel, [11..15] sbxLabel.
+        const profileBytes = new Uint8Array(15);
+        profileBytes[0] = prof.rounds;
+        profileBytes[1] = prof.rotMod;
+        profileBytes[2] = prof.sbxNudge;
+        profileBytes.set(prof.rkLabel, 3);
+        profileBytes.set(prof.rotLabel, 7);
+        profileBytes.set(prof.sbxLabel, 11);
+        // `pep` is already the 32-byte sha256 chain result computed at the
+        // top of this function. Re-expose it here for stage2 consumption.
+        const pepBytes = pep;
         const stage2Src = buildV5Stage2Source(
             { n_seed, n_kd, n_dec, n_tchk },
             {
                 prof,
-                irLabel,
-                schemaLabel,
-                irChunks,
-                schemaChunks,
-                irVarSeed, irVarP, irVarCt, irVarPt,
-                schemaVarSeed, schemaVarP, schemaVarCt, schemaVarPt, schemaVarObj,
-                interpUnpack,
-                interpChunks,
-                interpRawVar,
-                interpHashVar,
+                interpLabel, irLabel, schemaLabel,
+                interpChunks, irChunks, schemaChunks,
                 envCheckVar,
+                interpCtVar, interpHashVar,
+                interpSeedVar, interpPVar, interpMarshalVar,
+                interpCodeVar, interpNsVar,
+                schemaCtVar, irCtVar,
+                bootKeyBytes,
+                pepBytes, profileBytes,
             },
         );
-        payloadBytes = strToUtf8(stage2Src);
+        // Marshal stage2 to bytecode. The bytes we embed (and that stage1
+        // will `marshal.loads`) are version-locked to the Python that ran
+        // `opts.compileAndMarshal`, i.e. the same Python the end user will
+        // use to run the stub. No `compile()` call happens at stub runtime.
+        payloadBytes = opts.compileAndMarshal(stage2Src, '<pg_s2>');
     } else {
         payloadBytes = strToUtf8(input);
     }
@@ -887,23 +1040,24 @@ ${userChunks.decls}
 ${s1_S2} = base64.b64decode(${userChunks.concat})
 ${s1_pt2} = ${n_dec}(${s1_S2}, ${s1_p2}[0], ${s1_p2}[1], ${s1_p2}[2])
 try:
-    ${s1_src2} = ${s1_pt2}.decode('utf-8')
-except Exception:
-    sys.exit(0)
-try:
     if ${s1_tstart} > 0 and ${n_O}[${bi['__import__']}]('time').monotonic() - ${s1_tstart} > 2.0:
-        ${s1_src2} = ${s1_src2}[::-1]
+        ${s1_pt2} = ${s1_pt2}[::-1]
 except Exception:
     pass
-${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
+${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None, 'marshal': marshal${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
 try:
-    ${s1_co2} = ${n_O}[${bi['compile']}](${s1_src2}, __file__, 'exec')
+    ${s1_co2} = marshal.loads(${s1_pt2})
 except Exception:
     sys.exit(0)
 ${n_ftype}(${s1_co2}, ${s1_uns})()
 `;
 
-    const stage1Bytes = strToUtf8(stage1Src);
+    // v7: stage1 itself is marshaled (compile+marshal.dumps) so that the
+    // outer canonical region's `marshal.loads` consumes bytecode directly.
+    // No `compile()` audit event fires for stage1 source at runtime.
+    const stage1Bytes = opts && opts.v5IR && opts.compileAndMarshal
+        ? opts.compileAndMarshal(stage1Src, '<pg_s1>')
+        : strToUtf8(stage1Src);
     const encStage1 = encrypt(stage1Bytes, params1, prof);
     const encStage1B64 = bytesToBase64(encStage1);
     const stage1Chunks = chunkB64(encStage1B64, ng);
@@ -915,23 +1069,8 @@ ${n_ftype}(${s1_co2}, ${s1_uns})()
     // pepper used by `_kd`, interleaved with decoys of identical shape.
     // The real chain is `pepSeed -> pepA -> pepB -> pepC -> pep`, and
     // `_kd` references only `${n_pep}`. Extracting just `_kd` in
-    // isolation NameErrors on `${n_pep}`.
-    const pepLines: string[] = [];
-    pepLines.push(`${n_pepSeed} = bytes(${bytesArrayLit(pepSeedBytes)})`);
-    pepLines.push(`${n_pepA} = hashlib.sha256(${n_pepSeed}).digest()`);
-    pepLines.push(`${n_pepB} = hashlib.sha256(${n_pepA} + ${n_pepSeed}).digest()`);
-    pepLines.push(`${n_pepC} = hashlib.sha256(${n_pepB} + ${n_pepA}).digest()`);
-    pepLines.push(`${n_pep} = ${n_pepC}`);
-    // Decoy pepper computations with the same visual shape.
-    pepLines.push(`${n_pepDecoy1} = hashlib.sha256(bytes(${bytesArrayLit(randomBytes(32))})).digest()`);
-    pepLines.push(`${n_pepDecoy2} = hashlib.sha256(${n_pepDecoy1} + bytes(${bytesArrayLit(randomBytes(16))})).digest()`);
-    pepLines.push(`${n_pepDecoy3} = hashlib.sha256(${n_pepDecoy2} + ${n_pepDecoy1}).digest()`);
-    shuffleArr(pepLines);
-    // But the first line MUST define pepSeed and the sha256 chain must run
-    // in dependency order. Easier: just keep a topological order, skip the
-    // full shuffle, and only shuffle the three decoys relative to the real
-    // chain. Simplest: emit real chain in order, then append decoys, then
-    // interleave a handful of reads-that-do-nothing.
+    // isolation NameErrors on `${n_pep}`. The real chain is emitted in
+    // dependency order; decoys are randomly woven in between.
     const realChain = [
         `${n_pepSeed} = bytes(${bytesArrayLit(pepSeedBytes)})`,
         `${n_pepA} = hashlib.sha256(${n_pepSeed}).digest()`,
@@ -962,7 +1101,7 @@ ${n_ftype}(${s1_co2}, ${s1_uns})()
 
     const canonicalRegion =
 `${BEGIN_MARKER}
-import sys, hashlib, base64
+import sys, hashlib, base64, marshal
 ${n_ftype} = type(lambda: 0)
 ${n_O} = ${bcap.tupleSource}
 ${n_gf} = ${n_O}[${bi['getattr']}](sys, '_getf' + 'rame')
@@ -1189,13 +1328,9 @@ ${n_p1} = ${n_kd}(${n_vfy}(${n_seed}))
 ${stage1Chunks.decls}
 ${n_S1} = base64.b64decode(${stage1Chunks.concat})
 ${n_pt1} = ${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2])
+${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, '__file__': ${n_path}}
 try:
-    ${n_src1} = ${n_pt1}.decode('utf-8')
-except Exception:
-    sys.exit(0)
-${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, '__file__': ${n_path}}
-try:
-    ${n_co} = ${n_O}[${bi['compile']}](${n_src1}, '<s1>', 'exec')
+    ${n_co} = marshal.loads(${n_pt1})
 except Exception:
     sys.exit(0)
 ${n_ftype}(${n_co}, ${n_ns})()

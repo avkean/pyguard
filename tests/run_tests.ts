@@ -14,9 +14,11 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import * as zlib from "zlib";
 import { execFileSync } from "child_process";
 import { obfuscatePythonCode } from "../lib/obfuscate";
 import { makeV5Schema } from "../lib/v5/schema";
+import { INTERPRETER_SRC_B64 } from "../lib/v5/interpreter_src";
 
 const ROOT = path.resolve(__dirname, "..");
 const CASES_DIR = path.join(ROOT, "tests", "cases");
@@ -56,8 +58,37 @@ function buildV5IR(source: string, schema: object): Uint8Array {
     return Uint8Array.from(Buffer.from(out, "base64"));
 }
 
+// v7: stage1/stage2/interpreter are shipped as marshaled code objects,
+// so the harness shells out to python3 to do compile+marshal.dumps and
+// pre-computes the interpreter's marshaled+zlib blob once per run.
+function compileAndMarshal(source: string, filename?: string): Uint8Array {
+    const out = execFileSync("python3", [path.join(ROOT, "lib", "v5", "build_ir.py")], {
+        input: source,
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+        maxBuffer: 64 * 1024 * 1024,
+        env: {
+            ...process.env,
+            PYGUARD_MODE: "marshal",
+            PYGUARD_FILENAME: filename ?? "<pg>",
+        },
+    }).trim();
+    return Uint8Array.from(Buffer.from(out, "base64"));
+}
+
+function prepareInterpreterMarshalCompressed(): Uint8Array {
+    const src = zlib.inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, "base64")).toString("utf-8");
+    const marshaled = compileAndMarshal(src, "<pg_interp>");
+    return Uint8Array.from(zlib.deflateRawSync(Buffer.from(marshaled)));
+}
+
 function main() {
     if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
+
+    // One-shot: marshal the interpreter for this run. The bytes are
+    // identical across every test case, so we pay the subprocess cost
+    // once rather than per test.
+    const interpreterMarshalCompressed = prepareInterpreterMarshalCompressed();
 
     const cases = fs
         .readdirSync(CASES_DIR)
@@ -73,7 +104,11 @@ function main() {
         const src = fs.readFileSync(srcPath, "utf8");
         const schema = makeV5Schema();
 
-        const obf = obfuscatePythonCode(src, { v5IR: { compressed: buildV5IR(src, schema), schema } });
+        const obf = obfuscatePythonCode(src, {
+            v5IR: { compressed: buildV5IR(src, schema), schema },
+            compileAndMarshal,
+            interpreterMarshalCompressed,
+        });
         const outPath = path.join(OUT_DIR, name);
         fs.writeFileSync(outPath, obf);
 

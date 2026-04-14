@@ -234,12 +234,52 @@ const irCompressedB64 = py.stdout.trim();
 // Note: static imports of .ts files break under Node 24's native type
 // stripping (the re-export graph ends up empty). Dynamic import via tsx
 // works correctly, so we use that instead.
+//
+// v7: the driver pre-computes `interpreterMarshalCompressed` (decompress
+// the bundled interpreter source, shell out to python3 to compile+marshal
+// it, then raw-deflate the marshal.dumps bytes) and exposes a synchronous
+// `compileAndMarshal` callback (another python3 spawnSync) so that
+// obfuscate.ts can marshal stage1 and stage2 at build time. No compile()
+// happens at stub runtime — only marshal.loads on pre-compiled bytecode.
+const buildIrPath = path.join(root, 'lib/v5/build_ir.py').replace(/\\/g, '\\\\');
 const driver = `
+import zlib from 'node:zlib';
+import { spawnSync } from 'node:child_process';
 const { obfuscatePythonCode } = await import('./lib/obfuscate.ts');
+const { INTERPRETER_SRC_B64 } = await import('./lib/v5/interpreter_src.ts');
 const fs = await import('node:fs');
+
+function compileAndMarshal(source, filename) {
+    const r = spawnSync('python3', [${JSON.stringify(buildIrPath)}], {
+        input: source,
+        encoding: 'utf-8',
+        env: {
+            ...process.env,
+            PYGUARD_MODE: 'marshal',
+            PYGUARD_FILENAME: filename || '<pg>',
+        },
+        maxBuffer: 64 * 1024 * 1024,
+    });
+    if (r.status !== 0) {
+        throw new Error('compile_and_marshal subprocess failed: ' + r.stderr);
+    }
+    // build_ir.py __main__ writes base64(marshal.dumps(...)) to stdout.
+    return Uint8Array.from(Buffer.from(r.stdout.trim(), 'base64'));
+}
+
+// Pre-compute interpreterMarshalCompressed.
+const interpSrcBytes = zlib.inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, 'base64'));
+const interpSrc = interpSrcBytes.toString('utf-8');
+const interpMarshalRaw = compileAndMarshal(interpSrc, '<pg_interp>');
+const interpMarshalCompressed = Uint8Array.from(zlib.deflateRawSync(Buffer.from(interpMarshalRaw)));
+
 const userSource = fs.readFileSync(${JSON.stringify(args.src)}, 'utf-8');
 const compressed = Uint8Array.from(Buffer.from(${JSON.stringify(irCompressedB64)}, 'base64'));
-const stub = obfuscatePythonCode(userSource, { v5IR: { compressed, schema: ${JSON.stringify(schema)} } });
+const stub = obfuscatePythonCode(userSource, {
+    v5IR: { compressed, schema: ${JSON.stringify(schema)} },
+    compileAndMarshal,
+    interpreterMarshalCompressed: interpMarshalCompressed,
+});
 process.stdout.write(stub);
 `;
 
