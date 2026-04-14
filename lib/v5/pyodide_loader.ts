@@ -17,6 +17,8 @@
 import { BUILD_IR_SRC } from './build_ir_src';
 import type { V5IR } from './assemble';
 import { makeV5Schema } from './schema';
+import { obfuscatePythonCode } from '../obfuscate';
+import { INTERPRETER_SRC_B64 } from './interpreter_src';
 
 // Keep the Pyodide type surface minimal so we don't need @types/pyodide.
 interface PyodideInstance {
@@ -71,6 +73,19 @@ export async function getPyodide(): Promise<PyodideInstance> {
         // Pipe build_ir.py into Pyodide's main namespace once so subsequent
         // calls only need to invoke compile_to_json(src).
         py.runPython(BUILD_IR_SRC);
+        // v7+: install the compile_and_marshal helper so the browser side
+        // can produce marshaled code-object bytes (same primitive the Node
+        // driver shells out to python3 for). Pyodide ships marshal/zlib in
+        // its stdlib, so this is a one-line definition with no extras.
+        py.runPython(
+            `import marshal as _pg_marshal, zlib as _pg_zlib, base64 as _pg_b64\n` +
+            `def _pg_compile_marshal_b64(src, filename):\n` +
+            `    return _pg_b64.b64encode(_pg_marshal.dumps(compile(src, filename, 'exec'))).decode('ascii')\n` +
+            `def _pg_raw_deflate_b64(blob_b64):\n` +
+            `    raw = _pg_b64.b64decode(blob_b64)\n` +
+            `    co = _pg_zlib.compressobj(9, _pg_zlib.DEFLATED, -15)\n` +
+            `    return _pg_b64.b64encode(co.compress(raw) + co.flush()).decode('ascii')\n`,
+        );
         return py;
     })();
     return pyodidePromise;
@@ -106,6 +121,88 @@ function cleanPyodideError(raw: string): { kind: 'syntax' | 'python'; message: s
     last = last.replace(/\(<unknown>,\s*/, '(').replace(/\(<exec>,\s*/, '(');
     const isSyntax = /^\s*(SyntaxError|IndentationError|TabError)\b/.test(last);
     return { kind: isSyntax ? 'syntax' : 'python', message: last };
+}
+
+// base64 → Uint8Array (browser-safe; no Buffer dep).
+function b64ToBytes(b64: string): Uint8Array {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+// v7+: synchronous compile-and-marshal via the already-loaded Pyodide.
+// Caller MUST have awaited getPyodide() once first; otherwise the helper
+// throws because Pyodide's runPython is itself sync but loading is async.
+function compileAndMarshalViaPyodide(
+    py: PyodideInstance,
+    source: string,
+    filename?: string,
+): Uint8Array {
+    py.globals.set('_pg_cm_src', source);
+    py.globals.set('_pg_cm_fn', filename || '<pg>');
+    py.runPython(`_pg_cm_out = _pg_compile_marshal_b64(_pg_cm_src, _pg_cm_fn)\n`);
+    const b64 = py.globals.get('_pg_cm_out') as string;
+    return b64ToBytes(b64);
+}
+
+// v7+: pre-compute interpreterMarshalCompressed once per session.
+// The interpreter source is the same across user inputs, so we cache
+// the marshal+raw-deflate result. ~50 ms first call, free thereafter.
+let interpMarshalCompressedCache: Uint8Array | null = null;
+async function getInterpreterMarshalCompressed(
+    py: PyodideInstance,
+): Promise<Uint8Array> {
+    if (interpMarshalCompressedCache) return interpMarshalCompressedCache;
+    // Decompress the embedded interpreter source (raw-deflate base64).
+    py.globals.set('_pg_iSrcB64', INTERPRETER_SRC_B64);
+    py.runPython(
+        `_pg_iSrc = _pg_zlib.decompress(_pg_b64.b64decode(_pg_iSrcB64), -15).decode('utf-8')\n` +
+        `_pg_iMarshalRawB64 = _pg_b64.b64encode(_pg_marshal.dumps(compile(_pg_iSrc, '<pg_interp>', 'exec'))).decode('ascii')\n` +
+        `_pg_iMarshalCompressedB64 = _pg_raw_deflate_b64(_pg_iMarshalRawB64)\n`,
+    );
+    const compressedB64 = py.globals.get('_pg_iMarshalCompressedB64') as string;
+    interpMarshalCompressedCache = b64ToBytes(compressedB64);
+    return interpMarshalCompressedCache;
+}
+
+// v7+: full browser-side obfuscation pipeline. The UI calls only this;
+// it hides the Pyodide bootstrapping and wires the v7+ contract that
+// obfuscatePythonCode() expects (compileAndMarshal + interpreterMarshal-
+// Compressed). Throws BuildIRError on user-facing failures.
+export async function obfuscatePythonInBrowser(source: string): Promise<string> {
+    let py: PyodideInstance;
+    try {
+        py = await getPyodide();
+    } catch (e) {
+        throw new BuildIRError(
+            `Failed to load Pyodide runtime: ${e instanceof Error ? e.message : String(e)}`,
+            'internal',
+        );
+    }
+    const v5IR = await buildV5IR(source);
+    let interpreterMarshalCompressed: Uint8Array;
+    try {
+        interpreterMarshalCompressed = await getInterpreterMarshalCompressed(py);
+    } catch (e) {
+        const raw = e instanceof Error ? e.message : String(e);
+        throw new BuildIRError(
+            `Failed to prepare interpreter bytecode: ${raw}`,
+            'internal',
+        );
+    }
+    try {
+        return obfuscatePythonCode(source, {
+            v5IR,
+            compileAndMarshal: (src, filename) =>
+                compileAndMarshalViaPyodide(py, src, filename),
+            interpreterMarshalCompressed,
+        });
+    } catch (e) {
+        const raw = e instanceof Error ? e.message : String(e);
+        const { kind, message } = cleanPyodideError(raw);
+        throw new BuildIRError(message, kind);
+    }
 }
 
 export async function buildV5IR(source: string): Promise<V5IR> {

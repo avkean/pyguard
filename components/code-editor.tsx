@@ -82,7 +82,6 @@ export default function CodeEditor({
     }
     // Only re-mount when the backing DOM element or language swaps.
     // readOnly is reconfigured via Compartment below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [element, language])
 
   // Reconfigure readOnly without tearing down the editor.

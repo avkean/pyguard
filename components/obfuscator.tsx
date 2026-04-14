@@ -3,8 +3,7 @@
 import { useState, useEffect, useCallback } from "react"
 import CodeEditor from "./code-editor"
 import { Copy, Check, AlertCircle, CornerDownLeft } from "lucide-react"
-import { obfuscatePythonCode } from "@/lib/obfuscate"
-import { buildV5IR, BuildIRError } from "@/lib/v5/pyodide_loader"
+import { obfuscatePythonInBrowser, BuildIRError } from "@/lib/v5/pyodide_loader"
 import { cn } from "@/lib/utils"
 
 const SAMPLE = `def greet(name):
@@ -57,8 +56,7 @@ export default function Obfuscator() {
     setOutputCode("")
 
     try {
-      const v5IR = await buildV5IR(inputCode)
-      const obfuscated = obfuscatePythonCode(inputCode, { v5IR })
+      const obfuscated = await obfuscatePythonInBrowser(inputCode)
       setOutputCode(obfuscated)
       setTab("output")
     } catch (e) {
