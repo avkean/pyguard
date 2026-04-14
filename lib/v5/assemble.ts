@@ -18,7 +18,6 @@
 // interpreter; that dict is never compile()'d.
 
 import type { PolyProfile, ChunkedB64 } from './types';
-import { INTERPRETER_SRC_B64 } from './interpreter_src';
 import type { V5Schema } from './schema';
 
 // v5.2: the IR is built into a compressed byte blob by the Python side
@@ -74,6 +73,13 @@ export interface AssembleCipher {
     schemaVarObj: string;
     // helper name for the interpreter unpack function
     interpUnpack: string;
+    // chunked base64 of the compressed interpreter source
+    interpChunks: ChunkedB64;
+    // variable names for interpreter integrity binding
+    interpRawVar: string;   // holds compressed interpreter bytes
+    interpHashVar: string;  // holds sha256 of compressed bytes
+    // variable name for environment integrity check hash
+    envCheckVar: string;    // holds sha256 of thread-count + function-type checks
 }
 
 function bytesArrayLit(b: Uint8Array): string {
@@ -104,13 +110,20 @@ export function buildV5Stage2Source(
         irLabel, schemaLabel, irChunks, schemaChunks,
         irVarSeed, irVarP, irVarCt, irVarPt,
         schemaVarSeed, schemaVarP, schemaVarCt, schemaVarPt, schemaVarObj,
-        interpUnpack,
+        interpUnpack, interpChunks,
+        interpRawVar, interpHashVar,
+        envCheckVar,
     } = cipher;
 
     // The interpreter is embedded as a zlib-deflated base64 constant.
     // At stage2 exec time we unpack and exec it into stage2's namespace,
     // which makes Interp, _pg_parse_json, _decode_const etc. available.
     // This saves ~38KB per stub vs inlining the raw interpreter source.
+    // Build the env-check string obfuscated as byte operations so the
+    // expected answer isn't a greppable literal in the stage2 source.
+    // At runtime: str(len(sys._current_frames())) + '|' + type(zlib.decompress).__name__
+    // Expected:   '1|builtin_function_or_method'
+    // The hash of this check is XOR'd into the schema/IR seed; wrong env → wrong key.
     return `# v5.2 stage2: generic AST-walking interpreter + encrypted+compressed IR.
 # No user source is compiled by this program; the interpreter walks an
 # in-memory tree that is decrypted from the embedded ciphertext.
@@ -128,13 +141,17 @@ except Exception:
     pass
 if ${n_tchk}():
     raise SystemExit(0)
+${envCheckVar} = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__]).encode()).digest()
+${interpChunks.decls}
+${interpRawVar} = base64.b64decode(${interpChunks.concat})
+${interpHashVar} = hashlib.sha256(${interpRawVar}).digest()
 def ${interpUnpack}():
-    exec(zlib.decompress(base64.b64decode(${JSON.stringify(INTERPRETER_SRC_B64)}), -15).decode('utf-8'), globals())
+    exec(zlib.decompress(${interpRawVar}, -15).decode('utf-8'), globals())
 ${interpUnpack}()
-del ${interpUnpack}
+del ${interpUnpack}, ${interpRawVar}
 ${schemaChunks.decls}
 ${schemaVarCt} = base64.b64decode(${schemaChunks.concat})
-${schemaVarSeed} = hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(schemaLabel)})).digest()
+${schemaVarSeed} = bytes(a ^ b ^ c for a, b, c in zip(hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(schemaLabel)})).digest(), ${interpHashVar}, ${envCheckVar}))
 ${schemaVarP} = ${n_kd}(${schemaVarSeed})
 ${schemaVarPt} = ${n_dec}(${schemaVarCt}, ${schemaVarP}[0], ${schemaVarP}[1], ${schemaVarP}[2]).decode('utf-8')
 ${schemaVarObj} = globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_pg_parse_json'))}).decode()](${schemaVarPt})
@@ -148,12 +165,15 @@ globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_LAYOUTS'))}).decod
     k: {name: i + 1 for i, name in enumerate(v)}
     for k, v in dict(${schemaVarObj}['layouts'].items()).items()
 }
+globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_BIN_KEY'))}).decode()] = (${schemaVarObj}['binKey'][0] & 0xFFFFFFFF) | ((${schemaVarObj}['binKey'][1] & 0xFFFFFFFF) << 32)
+globals()[bytes(${bytesArrayLit(new TextEncoder().encode('_PG_NOISE_SCHEDULE'))}).decode()] = ${schemaVarObj}['noiseSchedule']
 del ${schemaVarObj}, ${schemaVarPt}, ${schemaVarCt}
 ${irChunks.decls}
 ${irVarCt} = base64.b64decode(${irChunks.concat})
-${irVarSeed} = hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(irLabel)})).digest()
+${irVarSeed} = bytes(a ^ b ^ c for a, b, c in zip(hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(irLabel)})).digest(), ${interpHashVar}, ${envCheckVar}))
 ${irVarP} = ${n_kd}(${irVarSeed})
 ${irVarPt} = zlib.decompress(${n_dec}(${irVarCt}, ${irVarP}[0], ${irVarP}[1], ${irVarP}[2]), -15)
+del ${envCheckVar}
 globals()[bytes(${bytesArrayLit(new TextEncoder().encode('run_blob'))}).decode()](${irVarPt}, '__main__')
 `;
 }

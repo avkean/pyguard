@@ -515,16 +515,34 @@ function chunkB64(b64: string, ng: NameGen): ChunkedB64 {
     return { decls, concat };
 }
 
-// Pick four distinct random state-machine state bytes for the flattened
-// `_dec` dispatcher.
-function makeStates(): { s0: number; s1: number; s2: number; sEnd: number } {
-    const r = randomBytes(32);
+// Pick N distinct random state-machine state values for the flattened
+// `_dec` dispatcher. v6: expanded from 4 to 20 states to defeat LLM tracing.
+function pickDistinct(n: number): number[] {
+    const r = randomBytes(64);
     const picks: number[] = [];
-    for (let i = 0; i < r.length && picks.length < 4; i++) {
+    for (let i = 0; i < r.length && picks.length < n; i++) {
         if (!picks.includes(r[i])) picks.push(r[i]);
     }
-    while (picks.length < 4) picks.push((picks[picks.length - 1] + 37) & 0xff);
-    return { s0: picks[0], s1: picks[1], s2: picks[2], sEnd: picks[3] };
+    while (picks.length < n) picks.push((picks[picks.length - 1] + 37) & 0xff);
+    return picks;
+}
+// v6 state machine: 9 real states + 7 dead states + sEnd = 17 states total.
+// Dead states do plausible-looking crypto ops but never affect the output.
+function makeStates(): {
+    s0: number; s1: number; s2: number; sEnd: number; // legacy compat
+    // real states (split from 3 → 9)
+    sCheck: number; sLoad: number; sRoundInit: number; sRoundCk: number;
+    sRotate: number; sSbox: number; sXorKey: number; sCbc: number; sAdv: number;
+    // dead states
+    d0: number; d1: number; d2: number; d3: number; d4: number; d5: number; d6: number;
+} {
+    const p = pickDistinct(17);
+    return {
+        s0: p[0], s1: p[1], s2: p[2], sEnd: p[3], // legacy (kept for type compat)
+        sCheck: p[0], sLoad: p[4], sRoundInit: p[5], sRoundCk: p[1],
+        sRotate: p[6], sSbox: p[7], sXorKey: p[8], sCbc: p[2], sAdv: p[9],
+        d0: p[10], d1: p[11], d2: p[12], d3: p[13], d4: p[14], d5: p[15], d6: p[16],
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +563,7 @@ const END_MARKER_BYTES_LIT = "[35, 80, 89, 71, 52, 69]";   // '#PYG4E'
 // interpreter source string.
 import { buildV5Stage2Source, serializeIR } from './v5/assemble';
 import type { V5IR } from './v5/assemble';
+import { INTERPRETER_SRC_B64 } from './v5/interpreter_src';
 
 export interface ObfuscateOpts {
     // When provided, uses the v5 AST-walking interpreter path:
@@ -564,6 +583,7 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     //    random state-machine states, random stage-2 KDF label.
     const prof = makeProfile();
     const stage2Label = randomBytes(6);
+    const hashFoldByte = randomBytes(1)[0];   // v6: canonical-region hash fold constant
     const ng = makeNameGen();
     const bcap = captureBuiltins();
     const bi = bcap.idx;
@@ -592,10 +612,7 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_src1     = ng.gen();
     const n_ns       = ng.gen();
     const n_co       = ng.gen();
-    const n_mask     = ng.gen(); // junk no-op mask var
-    const n_mask2    = ng.gen(); // junk no-op mask var
-    const n_chainA   = ng.gen(); // junk chain var
-    const n_chainB   = ng.gen(); // junk chain var
+    const n_chainA   = ng.gen(); // canonical region hash-fold variable
     const n_ftype    = ng.gen(); // type(lambda: 0) — FunctionType without importing types
     const n_rec_mod  = ng.gen(); // recompiled-from-disk module code object
     const n_cod      = ng.gen(); // deep co_code-tree digest helper
@@ -639,6 +656,12 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const d_b        = ng.gen();
     const d_st       = ng.gen();
     const d_k        = ng.gen();
+    // v6 dead-state internal names (plausible crypto-looking variables)
+    const d_acc      = ng.gen(); // dead accumulator
+    const d_tmp      = ng.gen(); // dead temporary
+    const d_chk      = ng.gen(); // dead checksum
+    const d_p2       = ng.gen(); // dead pointer
+    const d_m        = ng.gen(); // dead mask
 
     // Stage 1 internal names
     const s1_b       = ng.gen();
@@ -655,6 +678,10 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_vfy      = ng.gen();
     const v_in       = ng.gen();
     const v_out      = ng.gen();
+
+    // Frame-depth anti-analysis names
+    const n_fdFrame  = ng.gen();
+    const n_fdCnt    = ng.gen();
 
     // 3. Pepper graph. A chain of sha256-derived module-level byte arrays,
     //    referenced FROM INSIDE `_kd` as a closure global. An attacker who
@@ -721,10 +748,31 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
         const schemaVarPt   = ng.gen();
         const schemaVarObj  = ng.gen();
         const interpUnpack = ng.gen();
+        const interpRawVar = ng.gen();  // holds compressed interpreter bytes
+        const interpHashVar = ng.gen(); // holds sha256 of compressed bytes
+        const envCheckVar = ng.gen();   // holds environment integrity check hash
 
-        // Third-stage cipher: derived from the same seed with a fresh label.
+        // Cryptographic binding: the interpreter source hash is mixed into
+        // the seed for schema/IR key derivation. This means modifying the
+        // interpreter source (e.g., to add dump statements) changes the key
+        // and silently breaks schema/IR decryption. No check to bypass.
+        const interpCompressed = Buffer.from(INTERPRETER_SRC_B64, 'base64');
+        const interpHash = sha256(new Uint8Array(interpCompressed));
+
+        // Environment integrity binding: at runtime, we hash a check string
+        // built from thread count + zlib.decompress type + print type + getattr type.
+        // If any is wrong (extra threads, monkey-patched functions), the hash
+        // differs and decryption silently produces garbage.
+        // Expected: '1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method'
+        const envCheckExpected = sha256(
+            new TextEncoder().encode('1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method')
+        );
+
+        // Third-stage cipher: derived from seed + irLabel + interpHash + envCheck.
         const irLabel = randomBytes(6);
-        const irSeed3 = sha256(concatBytes(seed, irLabel));
+        const irSeed3Pre = sha256(concatBytes(seed, irLabel));
+        const irSeed3 = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) irSeed3[i] = irSeed3Pre[i] ^ interpHash[i] ^ envCheckExpected[i];
         const pepperedSeed3 = new Uint8Array(32);
         for (let i = 0; i < 32; i++) pepperedSeed3[i] = irSeed3[i] ^ pep[i];
         const params3 = kdf(pepperedSeed3, prof);
@@ -735,8 +783,11 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
         const encIRB64 = bytesToBase64(encIR);
         const irChunks = chunkB64(encIRB64, ng);
 
+        // Schema cipher: also bound to interpreter hash + env check.
         const schemaLabel = randomBytes(6);
-        const schemaSeed4 = sha256(concatBytes(seed, schemaLabel));
+        const schemaSeed4Pre = sha256(concatBytes(seed, schemaLabel));
+        const schemaSeed4 = new Uint8Array(32);
+        for (let i = 0; i < 32; i++) schemaSeed4[i] = schemaSeed4Pre[i] ^ interpHash[i] ^ envCheckExpected[i];
         const pepperedSeed4 = new Uint8Array(32);
         for (let i = 0; i < 32; i++) pepperedSeed4[i] = schemaSeed4[i] ^ pep[i];
         const params4 = kdf(pepperedSeed4, prof);
@@ -744,6 +795,10 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
         const encSchema = encrypt(schemaBytes, params4, prof);
         const encSchemaB64 = bytesToBase64(encSchema);
         const schemaChunks = chunkB64(encSchemaB64, ng);
+
+        // Chunk the interpreter base64 into fragments with decoys so there is
+        // no single extractable constant containing the full interpreter source.
+        const interpChunks = chunkB64(INTERPRETER_SRC_B64, ng);
 
         const stage2Src = buildV5Stage2Source(
             { n_seed, n_kd, n_dec, n_tchk },
@@ -756,6 +811,10 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
                 irVarSeed, irVarP, irVarCt, irVarPt,
                 schemaVarSeed, schemaVarP, schemaVarCt, schemaVarPt, schemaVarObj,
                 interpUnpack,
+                interpChunks,
+                interpRawVar,
+                interpHashVar,
+                envCheckVar,
             },
         );
         payloadBytes = strToUtf8(stage2Src);
@@ -769,7 +828,28 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // 4. Build Stage 1 source. Runs in a namespace where the canonical
     //    region has injected: __builtins__, the randomized `_O` tuple,
     //    the randomized seed/kd/dec names, sys, hashlib, base64, __file__.
+    // Stage 1 anti-analysis: CRYPTOGRAPHIC BINDING.
+    //
+    // Instead of `if debugger: exit()` (trivially NOP'd), detection of
+    // analysis tools POISONS the seed used for Stage 2 key derivation.
+    // No visible error — decryption produces garbage, the decode('utf-8')
+    // fails silently, and the stub exits. An attacker who patches out
+    // the checks gets a different seed and wrong decryption.
+    //
+    // The poison is accumulated into a "taint" variable that XORs the
+    // seed. On honest runs, taint == 0 (no XOR). Under analysis, taint
+    // is non-zero, silently corrupting all downstream crypto.
+    const s1_taint = ng.gen();
+    const s1_tpois1 = randomBytes(1)[0] | 1;  // non-zero
+    const s1_tpois2 = randomBytes(1)[0] | 1;
+    const s1_tpois3 = randomBytes(1)[0] | 1;
+    const s1_tpois4 = randomBytes(1)[0] | 1;
+    const s1_tpois5 = randomBytes(1)[0] | 1;
+    const s1_tcnt = ng.gen(); // timing counter
+    const s1_tstart = ng.gen(); // timing start
+
     const stage1Src = `${s1_b} = ${n_O}[${bi['__import__']}]('builtins')
+${s1_taint} = 0
 try:
     ${n_O}[${bi['getattr']}](sys, 'settrace')(None)
 except Exception:
@@ -778,22 +858,30 @@ try:
     ${n_O}[${bi['getattr']}](sys, 'setprofile')(None)
 except Exception:
     pass
-if ${n_tchk}(): ${s1_b}.exit(1)
-if ${n_O}[${bi['getattr']}](sys, 'gettrace')() is not None: ${s1_b}.exit(1)
-if ${n_O}[${bi['getattr']}](sys, 'getprofile')() is not None: ${s1_b}.exit(1)
-if compile is not ${n_O}[${bi['compile']}]: ${s1_b}.exit(1)
-if getattr is not ${n_O}[${bi['getattr']}]: ${s1_b}.exit(1)
-if type is not ${n_O}[${bi['type']}]: ${s1_b}.exit(1)
-if __import__ is not ${n_O}[${bi['__import__']}]: ${s1_b}.exit(1)
-if open is not ${n_O}[${bi['open']}]: ${s1_b}.exit(1)
-if exec is not ${n_O}[${bi['exec']}]: ${s1_b}.exit(1)
+if ${n_tchk}():
+    ${s1_taint} ^= ${s1_tpois1}
+if ${n_O}[${bi['getattr']}](sys, 'gettrace')() is not None:
+    ${s1_taint} ^= ${s1_tpois2}
+if ${n_O}[${bi['getattr']}](sys, 'getprofile')() is not None:
+    ${s1_taint} ^= ${s1_tpois2}
+if compile is not ${n_O}[${bi['compile']}] or getattr is not ${n_O}[${bi['getattr']}] or type is not ${n_O}[${bi['type']}]:
+    ${s1_taint} ^= ${s1_tpois3}
+if __import__ is not ${n_O}[${bi['__import__']}] or open is not ${n_O}[${bi['open']}] or exec is not ${n_O}[${bi['exec']}]:
+    ${s1_taint} ^= ${s1_tpois4}
 ${s1_bn} = 'builtin_function_or_method'
-if (compile.__class__.__name__ != ${s1_bn} or exec.__class__.__name__ != ${s1_bn} or
-    getattr.__class__.__name__ != ${s1_bn} or __import__.__class__.__name__ != ${s1_bn} or
-    open.__class__.__name__ != ${s1_bn} or
-    compile.__module__ != 'builtins' or exec.__module__ != 'builtins'):
-    ${s1_b}.exit(1)
-${s1_seed2} = hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(stage2Label)})).digest()
+try:
+    if (compile.__class__.__name__ != ${s1_bn} or exec.__class__.__name__ != ${s1_bn} or
+        getattr.__class__.__name__ != ${s1_bn} or __import__.__class__.__name__ != ${s1_bn} or
+        open.__class__.__name__ != ${s1_bn} or
+        compile.__module__ != 'builtins' or exec.__module__ != 'builtins'):
+        ${s1_taint} ^= ${s1_tpois5}
+except Exception:
+    ${s1_taint} ^= ${s1_tpois5}
+try:
+    ${s1_tstart} = ${n_O}[${bi['__import__']}]('time').monotonic()
+except Exception:
+    ${s1_tstart} = 0
+${s1_seed2} = hashlib.sha256(bytes(a ^ ${s1_taint} for a in ${n_seed}) + bytes(${bytesArrayLit(stage2Label)})).digest()
 ${s1_p2} = ${n_kd}(${s1_seed2})
 ${userChunks.decls}
 ${s1_S2} = base64.b64decode(${userChunks.concat})
@@ -802,6 +890,11 @@ try:
     ${s1_src2} = ${s1_pt2}.decode('utf-8')
 except Exception:
     sys.exit(0)
+try:
+    if ${s1_tstart} > 0 and ${n_O}[${bi['__import__']}]('time').monotonic() - ${s1_tstart} > 2.0:
+        ${s1_src2} = ${s1_src2}[::-1]
+except Exception:
+    pass
 ${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
 try:
     ${s1_co2} = ${n_O}[${bi['compile']}](${s1_src2}, __file__, 'exec')
@@ -907,34 +1000,95 @@ def ${n_dec}(${d_ct}, ${d_rks}, ${d_rotk}, ${d_inv}):
     ${d_r} = 0
     ${d_prev} = 0
     ${d_b} = 0
-    ${d_st} = ${st.s0}
+    ${d_acc} = 0
+    ${d_tmp} = 0
+    ${d_chk} = 0
+    ${d_p2} = 0
+    ${d_m} = 0xFF
+    ${d_st} = ${st.sCheck}
     while True:
         if ${d_st} == ${st.sEnd}:
             break
-        if ${d_st} == ${st.s0}:
+        if ${d_st} == ${st.sCheck}:
             if ${d_i} >= len(${d_ct}):
                 ${d_st} = ${st.sEnd}
-                continue
-            ${d_b} = ${d_ct}[${d_i}]
-            ${d_r} = ${d_N} - 1
-            ${d_st} = ${st.s1}
+            else:
+                ${d_st} = ${st.sLoad}
             continue
-        if ${d_st} == ${st.s1}:
+        if ${d_st} == ${st.sLoad}:
+            ${d_b} = ${d_ct}[${d_i}]
+            ${d_tmp} = ${d_b}
+            ${d_st} = ${st.sRoundInit}
+            continue
+        if ${d_st} == ${st.sRoundInit}:
+            ${d_r} = ${d_N} - 1
+            ${d_acc} = (${d_acc} + ${d_b}) & 0xFF
+            ${d_st} = ${st.sRoundCk}
+            continue
+        if ${d_st} == ${st.sRoundCk}:
             if ${d_r} < 0:
-                ${d_st} = ${st.s2}
-                continue
+                ${d_st} = ${st.sCbc}
+            else:
+                ${d_st} = ${st.sRotate}
+            continue
+        if ${d_st} == ${st.sRotate}:
             ${d_k} = ${d_rotk}[${d_r}]
             ${d_b} = ((${d_b} >> ${d_k}) | (${d_b} << (8 - ${d_k}))) & 0xFF
+            ${d_st} = ${st.sSbox}
+            continue
+        if ${d_st} == ${st.sSbox}:
             ${d_b} = ${d_inv}[${d_b}]
+            ${d_chk} = (${d_chk} ^ ${d_b}) & 0xFF
+            ${d_st} = ${st.sXorKey}
+            continue
+        if ${d_st} == ${st.sXorKey}:
             ${d_b} ^= ${d_rks}[${d_r}][${d_i} % 32]
             ${d_r} -= 1
+            ${d_st} = ${st.sRoundCk}
             continue
-        if ${d_st} == ${st.s2}:
+        if ${d_st} == ${st.sCbc}:
             ${d_b} ^= ${d_prev}
             ${d_out}[${d_i}] = ${d_b}
+            ${d_st} = ${st.sAdv}
+            continue
+        if ${d_st} == ${st.sAdv}:
             ${d_prev} = ${d_ct}[${d_i}]
             ${d_i} += 1
-            ${d_st} = ${st.s0}
+            ${d_p2} = (${d_p2} + 1) & ${d_m}
+            ${d_st} = ${st.sCheck}
+            continue
+        if ${d_st} == ${st.d0}:
+            ${d_tmp} = (${d_tmp} * 31 + ${d_acc}) & 0xFF
+            ${d_st} = ${st.d1}
+            continue
+        if ${d_st} == ${st.d1}:
+            ${d_chk} = (${d_chk} + ${d_tmp}) & 0xFF
+            if ${d_p2} > 0:
+                ${d_st} = ${st.d2}
+            else:
+                ${d_st} = ${st.sCheck}
+            continue
+        if ${d_st} == ${st.d2}:
+            ${d_acc} ^= ${d_inv}[${d_chk}]
+            ${d_p2} = (${d_p2} - 1) & ${d_m}
+            ${d_st} = ${st.d3}
+            continue
+        if ${d_st} == ${st.d3}:
+            ${d_tmp} = (${d_tmp} ^ ${d_rks}[0][${d_p2} % 32]) & 0xFF
+            ${d_st} = ${st.d4}
+            continue
+        if ${d_st} == ${st.d4}:
+            ${d_k} = ${d_rotk}[${d_p2} % ${d_N}]
+            ${d_b} = ((${d_acc} >> ${d_k}) | (${d_acc} << (8 - ${d_k}))) & 0xFF
+            ${d_st} = ${st.d5}
+            continue
+        if ${d_st} == ${st.d5}:
+            ${d_chk} = (${d_chk} ^ ${d_b} ^ ${d_prev}) & 0xFF
+            ${d_st} = ${st.d6}
+            continue
+        if ${d_st} == ${st.d6}:
+            ${d_acc} = (${d_acc} + ${d_chk}) & 0xFF
+            ${d_st} = ${st.sCheck}
             continue
     return bytes(${d_out})
 def ${n_cod}(${n_cod_c}):
@@ -1013,12 +1167,23 @@ try:
         ${n_h} = bytes((b ^ ${prof.poison3}) for b in ${n_h})
 except Exception:
     ${n_h} = bytes((b ^ ${prof.poison3}) for b in ${n_h})
-${n_mask} = sum(b for b in ${n_h}) & 0xFF
-${n_mask2} = ${n_mask}
-${n_h} = bytes((b ^ ${n_mask} ^ ${n_mask2}) for b in ${n_h})
-${n_chainA} = hashlib.sha256(${n_h}).digest()
-${n_chainB} = hashlib.sha256(${n_h}).digest()
-${n_h} = bytes((a ^ b ^ c) for a, b, c in zip(${n_h}, ${n_chainA}, ${n_chainB}))
+${n_chainA} = hashlib.sha256(${n_h} + bytes([${hashFoldByte}])).digest()
+${n_h} = bytes(a ^ b for a, b in zip(${n_h}, ${n_chainA}))
+try:
+    ${n_fdFrame} = ${n_gf}(0)
+    ${n_fdCnt} = 0
+    while ${n_fdFrame} is not None:
+        ${n_fdCnt} += 1
+        ${n_fdFrame} = ${n_fdFrame}.f_back
+    if ${n_fdCnt} > 12:
+        ${n_h} = bytes((b ^ ${prof.poison1} ^ ${prof.poison2}) for b in ${n_h})
+except Exception:
+    pass
+try:
+    if hasattr(sys, '_audit_hooks') or any(v is not None for v in ${n_O}[${bi['getattr']}](sys, '_current_exceptions', lambda: {})().values()):
+        ${n_h} = bytes((b ^ ${prof.poison3}) for b in ${n_h})
+except Exception:
+    pass
 ${n_seed} = bytes(a ^ b for a, b in zip(${n_X}, ${n_h}))
 ${n_p1} = ${n_kd}(${n_vfy}(${n_seed}))
 ${stage1Chunks.decls}
@@ -1058,7 +1223,10 @@ ${END_MARKER}
         new Uint8Array(32),
         canonicalBytes.slice(sIdx + halfOffset, eIdx),
     );
-    const hashOut = sha256(hashInput);
+    let hashOut = sha256(hashInput);
+    // v6: apply the same hash-fold that the canonical region applies at runtime
+    const foldKey = sha256(concatBytes(hashOut, new Uint8Array([hashFoldByte])));
+    hashOut = new Uint8Array(hashOut.map((b, i) => b ^ foldKey[i]));
 
     const stored = new Uint8Array(32);
     for (let i = 0; i < 32; i++) stored[i] = seed[i] ^ hashOut[i];

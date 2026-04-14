@@ -32,20 +32,27 @@ class _Continue(BaseException):
 
 _MISSING = object()
 
+# Internal schema storage — populated by run_blob(), not accessible as
+# _PG_* globals (those are wiped after copying to prevent frame-walk extraction).
+_S_K = {}   # keys mapping
+_S_RT = {}  # reverse tags
+_S_M = b''  # XOR mask
+_S_L = {}   # field layouts
+
 
 def _pg_key(key):
-    return globals().get('_PG_KEYS', {}).get(key, key)
+    return _S_K.get(key, key)
 
 
 def _pg_tag(tag):
-    return globals().get('_PG_RTAGS', {}).get(tag, tag)
+    return _S_RT.get(tag, tag)
 
 
 def _pg_text(value):
     if isinstance(value, str):
         return value
     if isinstance(value, (list, tuple)):
-        mask = bytes(globals().get('_PG_MASK', ()))
+        mask = _S_M
         if not mask:
             return ''.join(chr(x) for x in value)
         buf = bytearray(len(value))
@@ -149,7 +156,7 @@ def _nf(node, field, default=_MISSING):
             return default
         raise KeyError(field)
     canon_op = _pg_tag(node[0])
-    pos = globals().get('_PG_LAYOUTS', {}).get(canon_op, {}).get(field, _MISSING)
+    pos = _S_L.get(canon_op, {}).get(field, _MISSING)
     if pos is _MISSING:
         pos = _NODE_POS.get(canon_op, {}).get(field, _MISSING)
     if pos is _MISSING:
@@ -1669,7 +1676,29 @@ def run_json_blob(src, module_name='__main__'):
 
 
 def run_blob(blob, module_name='__main__'):
-    """Parse packed binary IR and execute it."""
+    """Parse packed binary IR and execute it.
+
+    v5.4: strip noise bytes and reverse rolling XOR before parsing.
+    The seed and noise schedule are injected as globals by stage2.
+    """
+    global _S_K, _S_RT, _S_M, _S_L
+    g = globals()
+    # Internalize schema from _PG_* globals → private module vars, then wipe.
+    # This prevents frame-walk attacks from extracting schema by known names.
+    _S_K = dict(g.pop('_PG_KEYS', {}))
+    _S_RT = dict(g.pop('_PG_RTAGS', {}))
+    _S_M = bytes(g.pop('_PG_MASK', ()))
+    _S_L = dict(g.pop('_PG_LAYOUTS', {}))
+    g.pop('_PG_TAGS', None)
+    # --- v5.4: undo noise injection + rolling XOR ---
+    _ns = g.pop('_PG_NOISE_SCHEDULE', None)
+    if _ns:
+        blob = _strip_noise(blob, _ns)
+    _bk = g.pop('_PG_BIN_KEY', None)
+    if _bk is not None:
+        blob = _rolling_xor(blob, _bk)
+    del _ns, _bk
+    # ------------------------------------------------
     loaded = _pg_parse_bin(blob)
     interp = Interp(loaded[0], tuple(_decode_const(c) for c in loaded[1]))
     tree = loaded[2]
@@ -1862,6 +1891,41 @@ def _pg_parse_json(src):
     return result
 
 
+def _rolling_xor(data, seed):
+    """Apply rolling XOR using an LCG-derived byte stream. Self-inverse."""
+    _MULT = 6364136223846793005
+    _INC = 1442695040888963407
+    _MASK64 = (1 << 64) - 1
+    out = bytearray(len(data))
+    key = seed & _MASK64
+    for i in range(len(data)):
+        key = (key * _MULT + _INC) & _MASK64
+        out[i] = data[i] ^ ((key >> 32) & 0xFF)
+    return bytes(out)
+
+
+def _strip_noise(data, noise_schedule):
+    """Remove noise bytes previously injected by _inject_noise.
+
+    Reverses the schedule in reverse order so that position accounting
+    is consistent with the forward injection pass.
+    """
+    buf = bytearray(data)
+    # Replay in reverse to undo the cumulative offset correctly
+    for pos, length in reversed(noise_schedule):
+        # During injection, actual = pos % (len(buf_at_that_time) + 1).
+        # We need to reconstruct the same actual position.  When stripping
+        # in reverse, buf is at the same length it was *after* that particular
+        # injection, so actual = pos % (len(buf) - length + 1) ... but the
+        # injection used len(buf_before)+1 = len(buf)-length+1.  Since we
+        # are undoing the *last* injection first, the current buf is exactly
+        # the state right after that injection.
+        before_len = len(buf) - length
+        actual = pos % (before_len + 1)
+        del buf[actual:actual + length]
+    return bytes(buf)
+
+
 def _pg_parse_bin(blob):
     idx = [0]
     n = len(blob)
@@ -1948,4 +2012,10 @@ if __name__ == '__main__':
             k: {name: i + 1 for i, name in enumerate(v)}
             for k, v in dict(schema.get('layouts', {}).items()).items()
         }
+        # v5.4: rolling XOR + noise injection globals
+        bin_key_pair = schema.get('binKey')
+        if bin_key_pair is not None:
+            lo, hi = bin_key_pair
+            globals()['_PG_BIN_KEY'] = (lo & 0xFFFFFFFF) | ((hi & 0xFFFFFFFF) << 32)
+        globals()['_PG_NOISE_SCHEDULE'] = schema.get('noiseSchedule', [])
     run_blob(blob)

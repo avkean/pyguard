@@ -3,6 +3,8 @@ export interface V5Schema {
     tags: Record<string, string>;
     mask: number[];
     layouts: Record<string, string[]>;
+    binKey: [number, number];               // 64-bit LCG seed as two 32-bit ints [lo, hi]
+    noiseSchedule: [number, number][];      // (position, noise_length) pairs
 }
 
 const KEY_NAMES = [
@@ -195,5 +197,25 @@ export function makeV5Schema(): V5Schema {
         layouts[op] = shuffle(fields);
     }
     const mask = Array.from({ length: 16 }, () => randByte());
-    return { keys, tags, mask, layouts };
+
+    // Rolling XOR seed: 64-bit value as [lo32, hi32] (JS lacks u64)
+    const binKey: [number, number] = [
+        (randByte() | (randByte() << 8) | (randByte() << 16) | (randByte() << 24)) >>> 0,
+        (randByte() | (randByte() << 8) | (randByte() << 16) | (randByte() << 24)) >>> 0,
+    ];
+
+    // Noise schedule: inject random-length noise blobs at random positions.
+    // We pick 4-8 noise entries; positions are offsets into the *post-XOR* blob.
+    // At build time (Python) we inject; at runtime (Python) we strip.
+    const noiseCount = 4 + (randByte() % 5);   // 4..8
+    const noiseSchedule: [number, number][] = [];
+    for (let i = 0; i < noiseCount; i++) {
+        // position: random 16-bit offset (will be taken modulo actual blob length)
+        const pos = ((randByte() << 8) | randByte()) >>> 0;
+        // length: 2..17 noise bytes
+        const len = 2 + (randByte() % 16);
+        noiseSchedule.push([pos, len]);
+    }
+
+    return { keys, tags, mask, layouts, binKey, noiseSchedule };
 }

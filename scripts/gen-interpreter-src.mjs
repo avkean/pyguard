@@ -27,17 +27,35 @@ const cutMarker = "# --- self-test entry point";
 const cut = src.indexOf(cutMarker);
 const trimmedRaw = cut >= 0 ? src.slice(0, cut).trimEnd() + '\n' : src;
 
-// Minify the trimmed source (strip comments, docstrings, blank lines) via
-// scripts/minify_py.py. This shrinks the embedded interpreter by ~10% and
-// correspondingly shrinks the encrypted stage2 ciphertext in every stub.
-// If python3 is not available (eg CI without Python), fall back to the
-// unminified source so the build never breaks.
-let trimmed = trimmedRaw;
+// Obfuscate the interpreter source via scripts/obfuscate_runtime.py.
+// This applies AST-level transformations: identifier renaming (lIl1O0-
+// style confusable names), XOR-encoded string literals, dead code
+// insertion, and method order scrambling. The obfuscated source is
+// functionally equivalent but dramatically harder for an attacker or
+// LLM to understand.
+//
+// After obfuscation we minify (strip comments, blank lines).
+// If obfuscation or minification fails, fall back gracefully.
+let trimmed;
+try {
+    trimmed = execFileSync(
+        'python3',
+        [path.join(root, 'scripts/obfuscate_runtime.py')],
+        { encoding: 'utf-8', timeout: 30000 },
+    );
+    console.log('[gen-interpreter-src] obfuscated interpreter source');
+} catch (err) {
+    console.warn(
+        `[gen-interpreter-src] obfuscator failed (${err.message}); ` +
+        'falling back to minification only',
+    );
+    trimmed = trimmedRaw;
+}
 try {
     trimmed = execFileSync(
         'python3',
         [path.join(root, 'scripts/minify_py.py')],
-        { input: trimmedRaw, encoding: 'utf-8' },
+        { input: trimmed, encoding: 'utf-8' },
     );
 } catch (err) {
     console.warn(

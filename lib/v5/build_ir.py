@@ -468,6 +468,23 @@ def compile_to_ir(source):
           'consts'  — list of all interned constant values (Python objects)
     """
     tree = ast.parse(source, mode='exec')
+
+    # v6 hardening: apply AST-level obfuscation transforms BEFORE lifting.
+    # This converts control flow into state machines, decomposes expressions,
+    # injects opaque predicates with dead code, unfolds constants into
+    # arithmetic, and obfuscates string literals. The resulting AST is
+    # semantically equivalent but structurally alien — the IR no longer maps
+    # 1:1 back to the original Python.
+    try:
+        from transform_ast import transform_ast_tree
+        tree = transform_ast_tree(tree)
+    except ImportError:
+        try:
+            from lib.v5.transform_ast import transform_ast_tree
+            tree = transform_ast_tree(tree)
+        except ImportError:
+            pass  # transforms not available (e.g. Pyodide without the module)
+
     lifter = _Lifter()
     lifted = lifter.lift(tree)
     return {
@@ -718,6 +735,24 @@ def _schema_parts(schema_json):
     )
 
 
+def _schema_bin_parts(schema_json):
+    """Extract binKey (as a 64-bit int) and noiseSchedule from the schema."""
+    if not schema_json:
+        return None, []
+    if isinstance(schema_json, str):
+        schema = json.loads(schema_json)
+    else:
+        schema = schema_json
+    bin_key_pair = schema.get('binKey')
+    if bin_key_pair is not None:
+        lo, hi = bin_key_pair
+        bin_key = (lo & 0xFFFFFFFF) | ((hi & 0xFFFFFFFF) << 32)
+    else:
+        bin_key = None
+    noise_schedule = schema.get('noiseSchedule', [])
+    return bin_key, noise_schedule
+
+
 def _mask_text(s, mask):
     if not mask:
         return s
@@ -897,6 +932,38 @@ def _to_positional(obj, key_map, rev_tag_map, layouts=None):
     return obj
 
 
+def _rolling_xor(data, seed):
+    """Apply rolling XOR using an LCG-derived byte stream. Self-inverse."""
+    _MULT = 6364136223846793005
+    _INC = 1442695040888963407
+    _MASK64 = (1 << 64) - 1
+    out = bytearray(len(data))
+    key = seed & _MASK64
+    for i in range(len(data)):
+        key = (key * _MULT + _INC) & _MASK64
+        out[i] = data[i] ^ ((key >> 32) & 0xFF)
+    return bytes(out)
+
+
+def _inject_noise(data, noise_schedule):
+    """Insert random noise bytes at positions derived from the noise schedule.
+
+    Each entry in *noise_schedule* is ``(position, length)``. The *position*
+    is taken modulo ``(len(data) + 1)`` so it always falls within range.
+    Entries are processed in order; each insertion shifts subsequent positions
+    so the schedule is applied left-to-right on the growing buffer.
+    """
+    import os as _nos
+    buf = bytearray(data)
+    offset = 0                          # cumulative shift from earlier insertions
+    for pos, length in noise_schedule:
+        actual = (pos % (len(buf) + 1))  # clamp into current buffer length
+        noise = _nos.urandom(length)
+        buf[actual:actual] = noise
+        offset += length
+    return bytes(buf)
+
+
 def compile_to_compressed_bytes(source, schema_json=None):
     """Return the IR as zlib-deflated (raw, -15 wbits) JSON bytes.
 
@@ -907,6 +974,12 @@ def compile_to_compressed_bytes(source, schema_json=None):
     The encoded IR uses a small custom binary container rather than JSON.
     That removes readable structure from the decrypted payload and avoids
     handing attackers a plaintext AST-ish blob if they intercept it.
+
+    v5.4 hardening: the packed binary blob is encrypted with a rolling XOR
+    (LCG-derived keystream) and then has random noise bytes injected at
+    positions determined by the schema's noise schedule. The XOR seed and
+    noise schedule are embedded in the encrypted schema, so an attacker
+    must first decrypt the schema to learn them.
     """
     import zlib
     payload = compile_to_json(source)
@@ -916,6 +989,14 @@ def compile_to_compressed_bytes(source, schema_json=None):
         payload = _apply_schema(payload, key_map, tag_map)
     payload = _to_positional(payload, key_map, {v: k for k, v in tag_map.items()}, layouts)
     packed = _pack_obj(payload)
+
+    # --- rolling XOR + noise injection (v5.4) ---
+    bin_key, noise_schedule = _schema_bin_parts(schema_json)
+    if bin_key is not None:
+        packed = _rolling_xor(packed, bin_key)
+    if noise_schedule:
+        packed = _inject_noise(packed, noise_schedule)
+
     co = zlib.compressobj(9, zlib.DEFLATED, -15)
     return co.compress(packed) + co.flush()
 

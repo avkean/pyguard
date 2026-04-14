@@ -162,11 +162,30 @@ function makeV5Schema() {
     for (const [op, fields] of Object.entries(NODE_LAYOUTS)) {
         layouts[op] = shuffle(fields);
     }
+    const rb = () => Math.floor(Math.random() * 256);
+
+    // Rolling XOR seed: 64-bit value as [lo32, hi32]
+    const binKey = [
+        (rb() | (rb() << 8) | (rb() << 16) | (rb() << 24)) >>> 0,
+        (rb() | (rb() << 8) | (rb() << 16) | (rb() << 24)) >>> 0,
+    ];
+
+    // Noise schedule: 4-8 (position, length) pairs
+    const noiseCount = 4 + (rb() % 5);
+    const noiseSchedule = [];
+    for (let i = 0; i < noiseCount; i++) {
+        const pos = ((rb() << 8) | rb()) >>> 0;
+        const len = 2 + (rb() % 16);
+        noiseSchedule.push([pos, len]);
+    }
+
     return {
         keys: Object.fromEntries(keys.map((k) => [k, randToken(used)])),
         tags: Object.fromEntries(tags.map((t) => [t, randToken(used)])),
-        mask: Array.from({ length: 16 }, () => Math.floor(Math.random() * 256)),
+        mask: Array.from({ length: 16 }, () => rb()),
         layouts,
+        binKey,
+        noiseSchedule,
     };
 }
 

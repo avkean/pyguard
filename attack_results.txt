@@ -1,0 +1,77 @@
+Found 25 items
+
+=== STRING_POOL ===
+['HAVE_FACCESSAT', 'HAVE_FCHDIR', 'HAVE_FCHMOD', 'HAVE_FCHMODAT', 'HAVE_FCHOWN', 'HAVE_FCHOWNAT', 'HAVE_FDOPENDIR', 'HAVE_FPATHCONF', 'HAVE_FSTATAT', 'HAVE_FSTATVFS', 'HAVE_FTRUNCATE', 'HAVE_FUTIMENS', 'HAVE_FUTIMES', 'HAVE_LINKAT', 'HAVE_LCHFLAGS', 'HAVE_LCHMOD', 'HAVE_LCHOWN', 'HAVE_LSTAT', 'HAVE_LUTIMES', 'HAVE_MKDIRAT', 'HAVE_OPENAT', 'HAVE_READLINKAT', 'HAVE_RENAMEAT', 'HAVE_SYMLINKAT', 'HAVE_UNLINKAT', 'HAVE_UTIMENSAT']
+
+=== STRING_POOL ===
+['register', 'lookup', 'open', 'EncodedFile', 'BOM', 'BOM_BE', 'BOM_LE', 'BOM32_BE', 'BOM32_LE', 'BOM64_BE', 'BOM64_LE', 'BOM_UTF8', 'BOM_UTF16', 'BOM_UTF16_LE', 'BOM_UTF16_BE', 'BOM_UTF32', 'BOM_UTF32_LE', 'BOM_UTF32_BE', 'CodecInfo', 'Codec', 'IncrementalEncoder', 'IncrementalDecoder', 'StreamReader', 'StreamWriter', 'StreamReaderWriter', 'StreamRecoder', 'getencoder', 'getdecoder', 'getincrementalencoder', 'getincrementaldecoder', 'getreader', 'getwriter', 'encode', 'decode', 'iterencode', 'iterdecode', 'strict_errors', 'ignore_errors', 'replace_errors', 'xmlcharrefreplace_errors', 'backslashreplace_errors', 'namereplace_errors', 'register_error', 'lookup_error']
+
+=== STRING_POOL ===
+['BlockingIOError', 'open', 'open_code', 'IOBase', 'RawIOBase', 'FileIO', 'BytesIO', 'StringIO', 'BufferedIOBase', 'BufferedReader', 'BufferedWriter', 'BufferedRWPair', 'BufferedRandom', 'TextIOBase', 'TextIOWrapper', 'UnsupportedOperation', 'SEEK_SET', 'SEEK_CUR', 'SEEK_END', 'DEFAULT_BUFFER_SIZE', 'text_encoding', 'IncrementalNewlineDecoder']
+
+=== STRING_POOL ===
+['Awaitable', 'Coroutine', 'AsyncIterable', 'AsyncIterator', 'AsyncGenerator', 'Hashable', 'Iterable', 'Iterator', 'Generator', 'Reversible', 'Sized', 'Container', 'Callable', 'Collection', 'Set', 'MutableSet', 'Mapping', 'MutableMapping', 'MappingView', 'KeysView', 'ItemsView', 'ValuesView', 'Sequence', 'MutableSequence', 'ByteString', 'Buffer']
+
+=== STRING_POOL ===
+['commonprefix', 'exists', 'getatime', 'getctime', 'getmtime', 'getsize', 'isdir', 'isfile', 'islink', 'samefile', 'sameopenfile', 'samestat']
+
+=== STRING_POOL ===
+['normcase', 'isabs', 'join', 'splitdrive', 'splitroot', 'split', 'splitext', 'basename', 'dirname', 'commonprefix', 'getsize', 'getmtime', 'getatime', 'getctime', 'islink', 'exists', 'lexists', 'isdir', 'isfile', 'ismount', 'expanduser', 'expandvars', 'normpath', 'abspath', 'samefile', 'sameopenfile', 'samestat', 'curdir', 'pardir', 'sep', 'pathsep', 'defpath', 'altsep', 'extsep', 'devnull', 'realpath', 'supports_unicode_filenames', 'relpath', 'commonpath', 'isjunction']
+
+=== STRING_POOL ===
+['FunctionType', 'LambdaType', 'CodeType', 'MappingProxyType', 'SimpleNamespace', 'CellType', 'GeneratorType', 'CoroutineType', 'AsyncGeneratorType', 'MethodType', 'BuiltinFunctionType', 'BuiltinMethodType', 'WrapperDescriptorType', 'MethodWrapperType', 'MethodDescriptorType', 'ClassMethodDescriptorType', 'ModuleType', 'TracebackType', 'FrameType', 'GetSetDescriptorType', 'MemberDescriptorType', 'new_class', 'resolve_bases', 'prepare_class', 'get_original_bases', 'DynamicClassAttribute', 'coroutine', 'GenericAlias', 'UnionType', 'EllipsisType', 'NoneType', 'NotImplementedType']
+
+=== STRING_POOL ===
+['__import__', 'import_module', 'invalidate_caches', 'reload']
+
+=== STRING_POOL ===
+['warn', 'warn_explicit', 'showwarning', 'formatwarning', 'filterwarnings', 'simplefilter', 'resetwarnings', 'catch_warnings']
+
+=== STRING_POOL ===
+['dump', 'dumps', 'load', 'loads', 'JSONDecoder', 'JSONDecodeError', 'JSONEncoder']
+
+=== STRING_POOL ===
+['abs', 'add', 'and_', 'attrgetter', 'call', 'concat', 'contains', 'countOf', 'delitem', 'eq', 'floordiv', 'ge', 'getitem', 'gt', 'iadd', 'iand', 'iconcat', 'ifloordiv', 'ilshift', 'imatmul', 'imod', 'imul', 'index', 'indexOf', 'inv', 'invert', 'ior', 'ipow', 'irshift', 'is_', 'is_not', 'isub', 'itemgetter', 'itruediv', 'ixor', 'le', 'length_hint', 'lshift', 'lt', 'matmul', 'methodcaller', 'mod', 'mul', 'ne', 'neg', 'not_', 'or_', 'pos', 'pow', 'rshift']
+
+=== STRING_POOL ===
+['update_wrapper', 'wraps', 'WRAPPER_ASSIGNMENTS', 'WRAPPER_UPDATES', 'total_ordering', 'cache', 'cmp_to_key', 'lru_cache', 'reduce', 'partial', 'partialmethod', 'singledispatch', 'singledispatchmethod', 'cached_property']
+
+=== STRING_POOL ===
+['ChainMap', 'Counter', 'OrderedDict', 'UserDict', 'UserList', 'UserString', 'defaultdict', 'deque', 'namedtuple']
+
+=== STRING_POOL ===
+['iskeyword', 'issoftkeyword', 'kwlist', 'softkwlist']
+
+=== STRING_POOL ===
+['False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield']
+
+=== STRING_POOL ===
+['_', 'case', 'match', 'type']
+
+=== STRING_POOL ===
+['Repr', 'repr', 'recursive_repr']
+
+=== STRING_POOL ===
+['EnumType', 'EnumMeta', 'Enum', 'IntEnum', 'StrEnum', 'Flag', 'IntFlag', 'ReprEnum', 'auto', 'unique', 'property', 'verify', 'member', 'nonmember', 'FlagBoundary', 'STRICT', 'CONFORM', 'EJECT', 'KEEP', 'global_flag_repr', 'global_enum_repr', 'global_str', 'global_enum', 'EnumCheck', 'CONTINUOUS', 'NAMED_FLAGS', 'UNIQUE', 'pickle_by_global_name', 'pickle_by_enum_name']
+
+=== STRING_POOL ===
+['match', 'fullmatch', 'search', 'sub', 'subn', 'split', 'findall', 'finditer', 'compile', 'purge', 'template', 'escape', 'error', 'Pattern', 'Match', 'A', 'I', 'L', 'M', 'S', 'X', 'U', 'ASCII', 'IGNORECASE', 'LOCALE', 'MULTILINE', 'DOTALL', 'VERBOSE', 'UNICODE', 'NOFLAG', 'RegexFlag']
+
+=== STRING_POOL ===
+['STRICT', 'CONFORM', 'EJECT', 'KEEP']
+
+=== STRING_POOL ===
+['CONTINUOUS', 'NAMED_FLAGS', 'UNIQUE']
+
+=== STRING_POOL ===
+['ASCII', 'IGNORECASE', 'LOCALE', 'UNICODE', 'MULTILINE', 'DOTALL', 'VERBOSE', 'TEMPLATE', 'DEBUG']
+
+=== STRING_POOL ===
+['pickle', 'constructor', 'add_extension', 'remove_extension', 'clear_extension_cache']
+
+=== STRING_POOL ===
+['calcsize', 'pack', 'pack_into', 'unpack', 'unpack_from', 'iter_unpack', 'Struct', 'error']
+
+=== STRING_POOL ===
+['encode', 'decode', 'encodebytes', 'decodebytes', 'b64encode', 'b64decode', 'b32encode', 'b32decode', 'b32hexencode', 'b32hexdecode', 'b16encode', 'b16decode', 'b85encode', 'b85decode', 'a85encode', 'a85decode', 'standard_b64encode', 'standard_b64decode', 'urlsafe_b64encode', 'urlsafe_b64decode']
+
