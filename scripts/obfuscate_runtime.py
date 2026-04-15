@@ -958,7 +958,13 @@ def obfuscate(src):
         if transform_ast_path not in sys.path:
             sys.path.insert(0, transform_ast_path)
         from transform_ast import transform_ast_tree
-        tree = transform_ast_tree(tree, None, rename_identifiers=False)
+        # rewrite_secret_gates=False: the rewriter mistakes interpreter
+        # dispatch branches (`if op == 'IBreak':`) for password gates and
+        # wraps them in scrypt-AEAD exec bodies that break raise/generator
+        # semantics and crush perf. The interpreter gets plenty of other
+        # hardening layers (CFF, MBA, string obfuscation, rename, etc.).
+        tree = transform_ast_tree(tree, None, rename_identifiers=False,
+                                  rewrite_secret_gates=False)
         ast.fix_missing_locations(tree)
     except Exception as e:
         print(f"[obfuscate_runtime] AST transforms skipped: {e}", file=sys.stderr)

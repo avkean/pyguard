@@ -170,7 +170,7 @@ except Exception:
     pass
 if ${n_tchk}():
     raise SystemExit(0)
-${envCheckVar} = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__]).encode()).digest()
+${envCheckVar} = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress))]).encode()).digest()
 ${interpChunks.decls}
 ${interpCtVar} = base64.b64decode(${interpChunks.concat})
 ${interpHashVar} = hashlib.sha256(${interpCtVar}).digest()

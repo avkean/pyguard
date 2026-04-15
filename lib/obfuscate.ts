@@ -872,13 +872,38 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
         // `interp_ns[bytes([...random...])]`.
         const bootKeyBytes = BOOT_KEY_BYTES;
 
-        // Environment integrity binding. The runtime hash is
-        //   sha256("1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method")
-        // — one thread, three builtins of the expected type. The build side
-        // precomputes the SAME hash and XORs it into schema / IR key
-        // derivation. Wrong env → wrong keys → garbage plaintext.
+        // Environment integrity binding. The runtime hash mixes
+        //   * thread count (1),
+        //   * types of three builtins (zlib.decompress / print / getattr),
+        //   * v12.3: types of the four sys trace/profile hook functions.
+        // An attacker who replaces sys.settrace / sys.setprofile /
+        // sys.gettrace / sys.getprofile with Python-level shims (A5 style)
+        // turns their type from 'builtin_function_or_method' into
+        // 'function', which mismatches this hash, which mismatches the
+        // derived interpreter / IR / schema keys, which turns every AEAD
+        // decrypt into garbage. The build side precomputes the SAME hash
+        // and XORs it into the three key-derivation paths.
         const envCheckExpected = sha256(
-            new TextEncoder().encode('1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method')
+            new TextEncoder().encode(
+                '1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method'
+                // v12.3: sys.settrace/setprofile/gettrace/getprofile types.
+                + '|builtin_function_or_method|builtin_function_or_method'
+                + '|builtin_function_or_method|builtin_function_or_method'
+                // v12.4: exec / marshal.loads / hashlib.scrypt types. A6's
+                // attack hooks all three; any of them being a Python-level
+                // function flips this check to 'function' and crashes crypto.
+                + '|builtin_function_or_method|builtin_function_or_method'
+                + '|builtin_function_or_method'
+                // v12.3 strengthening: identity check `type(sys.settrace) is
+                // type(zlib.decompress)`. A8's attack spoofs __name__ with a
+                // custom class named 'builtin_function_or_method'; but that
+                // class's TYPE is not the C-level builtin_function_or_method,
+                // so the `is` comparison flips to 'False'.
+                + '|True|True|True|True'
+                // v12.4: same identity check for exec / marshal.loads /
+                // hashlib.scrypt. All three are hooked by A6 with Python
+                // shims; the `is type(zlib.decompress)` check catches them.
+                + '|True|True|True')
         );
 
         // ---- 1. Encrypt the pre-marshaled interpreter --------------------

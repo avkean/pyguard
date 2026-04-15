@@ -170,57 +170,23 @@ def _nf(node, field, default=_MISSING):
     return node[pos]
 
 
-# v8: _PGMap class deleted. Previously, parsed IR map-nodes and the
-# decoded schema were wrapped in a class with __slots__ == ('_k', '_v').
-# That structural invariant was a single fingerprint by which an attacker
-# could find the wrapper class in the interpreter namespace and patch its
-# __init__ to dump every materialized map (schema, layouts, IR map-nodes,
-# const wrappers, …). v8 removes the class and uses plain dict / tuple,
-# which have no unique-to-pyguard structural shape an attacker can target.
-# All remaining call sites construct dict(items) inline; the const wire
-# format is now positional (t, v) tuples (see _decode_const), so the only
+# No _PGMap wrapper class: a class with __slots__ == ('_k', '_v') would
+# be a single unique fingerprint an attacker could locate and patch to
+# dump every materialized map (schema, layouts, IR map-nodes, const
+# wrappers, …). Call sites construct dict(items) inline; the const wire
+# format is positional (t, v) tuples (see _decode_const), so the only
 # dict that exists at parse time is the transient schema map, and even
 # that is replaced in step D by a positional binary schema parser inside
 # _pg_boot's frame (no dict ever materializes).
 
 
-# --- operator dispatch tables --------------------------------------------
-
-_BIN_OPS = {
-    'Add':       lambda a, b: a + b,
-    'Sub':       lambda a, b: a - b,
-    'Mult':      lambda a, b: a * b,
-    'MatMult':   lambda a, b: a @ b,
-    'Div':       lambda a, b: a / b,
-    'Mod':       lambda a, b: a % b,
-    'Pow':       lambda a, b: a ** b,
-    'LShift':    lambda a, b: a << b,
-    'RShift':    lambda a, b: a >> b,
-    'BitOr':     lambda a, b: a | b,
-    'BitXor':    lambda a, b: a ^ b,
-    'BitAnd':    lambda a, b: a & b,
-    'FloorDiv':  lambda a, b: a // b,
-}
-
-_UNARY_OPS = {
-    'Invert':  lambda x: ~x,
-    'Not':     lambda x: not x,
-    'UAdd':    lambda x: +x,
-    'USub':    lambda x: -x,
-}
-
-_CMP_OPS = {
-    'Eq':     lambda a, b: a == b,
-    'NotEq':  lambda a, b: a != b,
-    'Lt':     lambda a, b: a < b,
-    'LtE':    lambda a, b: a <= b,
-    'Gt':     lambda a, b: a > b,
-    'GtE':    lambda a, b: a >= b,
-    'Is':     lambda a, b: a is b,
-    'IsNot':  lambda a, b: a is not b,
-    'In':     lambda a, b: a in b,
-    'NotIn':  lambda a, b: a not in b,
-}
+# --- operator dispatch ---------------------------------------------------
+#
+# Op dispatch is inlined at each call site. Module-level dicts would
+# centralize a hook point (`runtime_interp._CMP_OPS['Eq'] = sniff` would
+# intercept every compare in one line); with the tables gone, each of the
+# five call sites performs its own if/elif chain on the op tag. No single
+# observable symbol intercepts every compare or every binary op.
 
 
 # --- scope ---------------------------------------------------------------
@@ -366,27 +332,20 @@ def _drive_sync(gen):
 # --- interpreter ---------------------------------------------------------
 
 class Interp:
-    """v8: holds an opaque accessor closure instead of plain strings/consts
-    tuples. Previously `Interp(strings, consts)` exposed both tables as
-    constructor arguments AND as `self.strings` / `self.consts`. Anyone who
-    found the Interp class (e.g. by 3-arg `__init__` signature, or by
-    walking interp_ns post-init) could snapshot both tables in one shot.
-
-    v8 changes the contract: callers build `(_a)` where `_a(kind, idx)` is
-    a closure holding the encrypted/masked tables. The strings/consts never
-    live as instance attributes — only inside the closure cells of `_a`,
-    which are not addressable without first locating `_a` itself (and `_a`
-    is a vanilla function with no stable name across builds). The decoy
-    arguments break any signature-based heuristic search.
+    """Holds an opaque accessor closure instead of plain strings/consts
+    tuples. Callers build `(_a)` where `_a(kind, idx)` is a closure holding
+    the encrypted/masked tables. The strings/consts never live as instance
+    attributes — only inside the closure cells of `_a`, which are not
+    addressable without first locating `_a` itself (and `_a` is a vanilla
+    function with no stable name across builds).
     """
 
     def __init__(self, *_args):
-        # v10: vararg. Previously `__init__(self, _a, _decoy_a=None,
-        # _decoy_b=None, _decoy_c=None)` — `co_argcount == 5`, which the
-        # v9 red team used to structurally locate the Interp class
-        # regardless of name obfuscation. Under varargs, argcount is 1
-        # (self) and cannot be distinguished from dozens of other
-        # methods on other classes.
+        # Vararg signature: `co_argcount == 1` (self), indistinguishable
+        # from dozens of other methods. A fixed-arity signature like
+        # `__init__(self, _a, _decoy_a=None, _decoy_b=None, _decoy_c=None)`
+        # gives `co_argcount == 5` — a structural fingerprint that locates
+        # the Interp class regardless of name obfuscation.
         #
         # `_args[0]` MUST be the accessor closure `_a`. Remaining entries
         # are decoys (ignored).
@@ -526,7 +485,21 @@ class Interp:
             tgt = _nf(node, 'target')
             cur = yield from self._load_target(tgt, scope)
             inc = yield from self.step_expr(_nf(node, 'value'), scope)
-            new_v = _BIN_OPS[_pg_tag(_nf(node, 'op2'))](cur, inc)
+            _ot = _pg_tag(_nf(node, 'op2'))
+            if   _ot == 'Add':      new_v = cur + inc
+            elif _ot == 'Sub':      new_v = cur - inc
+            elif _ot == 'Mult':     new_v = cur * inc
+            elif _ot == 'FloorDiv': new_v = cur // inc
+            elif _ot == 'Div':      new_v = cur / inc
+            elif _ot == 'Mod':      new_v = cur % inc
+            elif _ot == 'Pow':      new_v = cur ** inc
+            elif _ot == 'BitOr':    new_v = cur | inc
+            elif _ot == 'BitXor':   new_v = cur ^ inc
+            elif _ot == 'BitAnd':   new_v = cur & inc
+            elif _ot == 'LShift':   new_v = cur << inc
+            elif _ot == 'RShift':   new_v = cur >> inc
+            elif _ot == 'MatMult':  new_v = cur @ inc
+            else: raise ValueError(_ot)
             yield from self._assign(tgt, new_v, scope)
             return
 
@@ -725,7 +698,21 @@ class Interp:
             tgt = _nf(node, 'target')
             cur = yield from self._load_target(tgt, scope)
             inc = yield from self.step_expr(_nf(node, 'value'), scope)
-            new_v = _BIN_OPS[_pg_tag(_nf(node, 'op2'))](cur, inc)
+            _ot = _pg_tag(_nf(node, 'op2'))
+            if   _ot == 'Add':      new_v = cur + inc
+            elif _ot == 'Sub':      new_v = cur - inc
+            elif _ot == 'Mult':     new_v = cur * inc
+            elif _ot == 'FloorDiv': new_v = cur // inc
+            elif _ot == 'Div':      new_v = cur / inc
+            elif _ot == 'Mod':      new_v = cur % inc
+            elif _ot == 'Pow':      new_v = cur ** inc
+            elif _ot == 'BitOr':    new_v = cur | inc
+            elif _ot == 'BitXor':   new_v = cur ^ inc
+            elif _ot == 'BitAnd':   new_v = cur & inc
+            elif _ot == 'LShift':   new_v = cur << inc
+            elif _ot == 'RShift':   new_v = cur >> inc
+            elif _ot == 'MatMult':  new_v = cur @ inc
+            else: raise ValueError(_ot)
             yield from self._assign(tgt, new_v, scope)
             return
 
@@ -876,11 +863,30 @@ class Interp:
         if op == 'BinOp':
             l = yield from self.step_expr(_nf(node, 'left'), scope)
             r = yield from self.step_expr(_nf(node, 'right'), scope)
-            return _BIN_OPS[_pg_tag(_nf(node, 'op2'))](l, r)
+            _ot = _pg_tag(_nf(node, 'op2'))
+            if   _ot == 'Add':      return l + r
+            elif _ot == 'Sub':      return l - r
+            elif _ot == 'Mult':     return l * r
+            elif _ot == 'FloorDiv': return l // r
+            elif _ot == 'Div':      return l / r
+            elif _ot == 'Mod':      return l % r
+            elif _ot == 'Pow':      return l ** r
+            elif _ot == 'BitOr':    return l | r
+            elif _ot == 'BitXor':   return l ^ r
+            elif _ot == 'BitAnd':   return l & r
+            elif _ot == 'LShift':   return l << r
+            elif _ot == 'RShift':   return l >> r
+            elif _ot == 'MatMult':  return l @ r
+            raise ValueError(_ot)
 
         if op == 'UnaryOp':
             v = yield from self.step_expr(_nf(node, 'operand'), scope)
-            return _UNARY_OPS[_pg_tag(_nf(node, 'op2'))](v)
+            _ot = _pg_tag(_nf(node, 'op2'))
+            if   _ot == 'USub':   return -v
+            elif _ot == 'UAdd':   return +v
+            elif _ot == 'Not':    return not v
+            elif _ot == 'Invert': return ~v
+            raise ValueError(_ot)
 
         if op == 'BoolOp':
             if _pg_tag(_nf(node, 'op2')) == 'And':
@@ -902,7 +908,19 @@ class Interp:
             left = yield from self.step_expr(_nf(node, 'left'), scope)
             for cmp_op, cn in zip(_nf(node, 'ops'), _nf(node, 'comparators')):
                 right = yield from self.step_expr(cn, scope)
-                if not _CMP_OPS[_pg_tag(cmp_op)](left, right):
+                _ot = _pg_tag(cmp_op)
+                if   _ot == 'Eq':    ok = left == right
+                elif _ot == 'NotEq': ok = left != right
+                elif _ot == 'Lt':    ok = left < right
+                elif _ot == 'LtE':   ok = left <= right
+                elif _ot == 'Gt':    ok = left > right
+                elif _ot == 'GtE':   ok = left >= right
+                elif _ot == 'In':    ok = left in right
+                elif _ot == 'NotIn': ok = left not in right
+                elif _ot == 'Is':    ok = left is right
+                elif _ot == 'IsNot': ok = left is not right
+                else: raise ValueError(_ot)
+                if not ok:
                     return False
                 left = right
             return True
@@ -1697,34 +1715,11 @@ def _build_accessor(strings, consts):
     return _a
 
 
-def run_ir(ir, module_name='__main__'):
-    """Run a v5 IR dict (already-decoded form: consts are Python objects)."""
-    interp = Interp(_build_accessor(ir['strings'], ir['consts']))
-    interp.run(ir['tree'], module_name)
-
-
-def run_json_ir(jir, module_name='__main__'):
-    """Run a JSON-form IR dict (consts are positional list/tuple wrappers)."""
-    consts = tuple(_decode_const(c) for c in jir['consts'])
-    interp = Interp(_build_accessor(jir['strings'], consts))
-    interp.run(jir['tree'], module_name)
-
-
-def run_json_blob(src, module_name='__main__'):
-    """Parse packed JSON IR and execute it without exposing plain dict IR."""
-    loaded = _pg_parse_json(src)
-    consts = tuple(_decode_const(c) for c in loaded[1])
-    interp = Interp(_build_accessor(loaded[0], consts))
-    tree = loaded[2]
-    del loaded, src, consts
-    interp.run(tree, module_name)
-
-
 def run_blob(blob, module_name='__main__'):
     """Parse packed binary IR and execute it.
 
-    v5.4: strip noise bytes and reverse rolling XOR before parsing.
-    The seed and noise schedule are injected as globals by stage2.
+    Strips noise bytes and reverses rolling XOR before parsing. The
+    seed and noise schedule are injected as globals by stage2.
     """
     global _S_K, _S_RT, _S_M, _S_L
     g = globals()
@@ -1735,7 +1730,7 @@ def run_blob(blob, module_name='__main__'):
     _S_M = bytes(g.pop('_PG_MASK', ()))
     _S_L = dict(g.pop('_PG_LAYOUTS', {}))
     g.pop('_PG_TAGS', None)
-    # --- v5.4: undo noise injection + rolling XOR ---
+    # --- undo noise injection + rolling XOR ---
     _ns = g.pop('_PG_NOISE_SCHEDULE', None)
     if _ns:
         blob = _strip_noise(blob, _ns)
@@ -1755,22 +1750,19 @@ def run_blob(blob, module_name='__main__'):
 def _pg_boot(*_a):
     """PyGuard interpreter entry point.
 
-    v11 signature (9 or 10 inert-bytes positional args, no callables):
+    Signature (9 or 10 inert-bytes positional args, no callables):
       schema_ct, schema_label, ir_ct, ir_label, seed,
       interp_hash, env_hash, pep, profile[, module_name='__main__']
 
-    Architectural shift from v10 to v11: the `kd` and `dec` closures that
-    stage2 previously injected as Python callables have been replaced by
-    (a) the 32-byte `pep` pepper, and (b) the 15-byte `profile` struct
-    (rounds, rot_mod, sbx_nudge, rk_label[4], rot_label[4], sbx_label[4]).
-    The cipher algorithm itself is implemented inline here via the
-    renamed _k_derive / _c_dec helpers defined above. An attacker
-    hooking `types.FunctionType` now finds only inert bytes in the
-    boot-args tuple — no callable to replace with a logging wrapper
-    (which was the `v10_attack_boot_args_sniff` vector).
+    All stage2-supplied "config" is inert bytes: a 32-byte `pep` pepper,
+    and a 15-byte `profile` struct (rounds, rot_mod, sbx_nudge,
+    rk_label[4], rot_label[4], sbx_label[4]). The cipher algorithm is
+    implemented inline here via the _k_derive / _c_dec helpers above.
+    An attacker hooking `types.FunctionType` finds only inert bytes in
+    the boot-args tuple — no callable to replace with a logging wrapper.
 
-    v10 vararg rationale preserved: `co_argcount == 0` defeats any
-    structural fingerprint keyed on argument count.
+    `co_argcount == 0` (vararg-only) defeats any structural fingerprint
+    keyed on argument count.
     """
     if len(_a) == 9:
         (schema_ct, schema_label, ir_ct, ir_label, seed,
@@ -1867,7 +1859,7 @@ def _pg_boot(*_a):
     del _ir_seed, _ir_seed_pre, _ir_p, schema_ct, ir_ct, seed, pep, profile
     del _rounds, _rot_mod, _sbx_nudge, _rk_label, _rot_label, _sbx_label
 
-    # --- strip noise + rolling XOR (was in v6 run_blob) ---
+    # --- strip noise + rolling XOR ---
     if _noise:
         blob = _strip_noise(blob, _noise)
     if _bin_key is not None:
@@ -1877,9 +1869,9 @@ def _pg_boot(*_a):
     # --- parse + run ---
     loaded = _pg_parse_bin(blob)
     _consts = tuple(_decode_const(c) for c in loaded[1])
-    # v8: build accessor closure here. The strings tuple (loaded[0]) and
-    # the decoded consts are captured in `_a`'s closure cells. They are
-    # not stored as Interp instance attributes, so a class-init hook on
+    # Build accessor closure here. The strings tuple (loaded[0]) and the
+    # decoded consts are captured in `_a`'s closure cells. They are not
+    # stored as Interp instance attributes, so a class-init hook on
     # Interp captures only `_a` (an opaque function), not the underlying
     # tables.
     interp = Interp(_build_accessor(loaded[0], _consts))
@@ -1888,204 +1880,14 @@ def _pg_boot(*_a):
     interp.run(tree, module_name)
 
 
-# --- inline JSON parser -------------------------------------------------
-#
-# v5.1 hardening: stage2 loads the decrypted IR via this hand-rolled
-# recursive-descent parser instead of `json.loads`. The motivating attack
-# (attack 11) was a one-line `json.loads` monkey-patch that captured the
-# IR dict the moment stage2 decoded it. Using a local parser with a
-# per-build randomized entry-point name forces an attacker to either
-#   (a) frame-walk during interpretation and dump locals of Interp.run
-#       (attack 12), or
-#   (b) statically locate and patch this function inside the stub
-#       (defeated by the outer encryption — by the time this function
-#       exists as bytecode, the stub has already decrypted it).
-#
-# This parser is NOT a fully general JSON implementation — it only
-# handles the subset the IR uses: objects, arrays, strings (including
-# \uXXXX and \\ \/ \" \b \f \n \r \t escapes), integers, floats,
-# true/false/null. It intentionally does not allocate temporary strings
-# for keys beyond what the dict needs, to limit the set of observable
-# string-pool events an attacker could listen to.
-
-def _pg_parse_json(src):
-    """Parse a JSON string into opaque mapping wrappers / tuples / scalars.
-
-    Same subset of JSON that compile_to_json emits in build_ir.py.
-    Runs in O(n), single-pass, no regex, no stdlib json import.
-    """
-    idx = [0]
-    n = len(src)
-
-    def _skip_ws():
-        i = idx[0]
-        while i < n:
-            c = src[i]
-            if c == ' ' or c == '\t' or c == '\n' or c == '\r':
-                i += 1
-            else:
-                break
-        idx[0] = i
-
-    def _parse_string():
-        i = idx[0]
-        if src[i] != '"':
-            raise ValueError("expected string at " + str(i))
-        i += 1
-        out = []
-        while i < n:
-            c = src[i]
-            if c == '"':
-                idx[0] = i + 1
-                return ''.join(out)
-            if c == '\\':
-                i += 1
-                if i >= n:
-                    raise ValueError("bad escape at EOF")
-                e = src[i]
-                if e == '"' or e == '\\' or e == '/':
-                    out.append(e); i += 1
-                elif e == 'n':
-                    out.append('\n'); i += 1
-                elif e == 't':
-                    out.append('\t'); i += 1
-                elif e == 'r':
-                    out.append('\r'); i += 1
-                elif e == 'b':
-                    out.append('\b'); i += 1
-                elif e == 'f':
-                    out.append('\f'); i += 1
-                elif e == 'u':
-                    if i + 5 > n:
-                        raise ValueError("short \\u escape")
-                    hex4 = src[i+1:i+5]
-                    cp = int(hex4, 16)
-                    # Handle UTF-16 surrogate pair.
-                    if 0xD800 <= cp <= 0xDBFF and i + 11 <= n and src[i+5:i+7] == '\\u':
-                        hi = cp
-                        lo = int(src[i+7:i+11], 16)
-                        cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                        out.append(chr(cp))
-                        i += 11
-                    else:
-                        out.append(chr(cp))
-                        i += 5
-                else:
-                    raise ValueError("bad escape \\" + e)
-            else:
-                out.append(c)
-                i += 1
-        raise ValueError("unterminated string")
-
-    def _parse_number():
-        i = idx[0]
-        start = i
-        if src[i] == '-':
-            i += 1
-        while i < n:
-            c = src[i]
-            if ('0' <= c <= '9') or c == '.' or c == 'e' or c == 'E' or c == '+' or c == '-':
-                i += 1
-            else:
-                break
-        frag = src[start:i]
-        idx[0] = i
-        if '.' in frag or 'e' in frag or 'E' in frag:
-            return float(frag)
-        return int(frag)
-
-    def _parse_value():
-        _skip_ws()
-        i = idx[0]
-        if i >= n:
-            raise ValueError("unexpected EOF")
-        c = src[i]
-        if c == '{':
-            idx[0] = i + 1
-            items = []
-            _skip_ws()
-            if idx[0] < n and src[idx[0]] == '}':
-                idx[0] += 1
-                return {}
-            while True:
-                _skip_ws()
-                k = _parse_string()
-                _skip_ws()
-                if idx[0] >= n or src[idx[0]] != ':':
-                    raise ValueError("expected ':'")
-                idx[0] += 1
-                v = _parse_value()
-                items.append((k, v))
-                _skip_ws()
-                if idx[0] >= n:
-                    raise ValueError("unterminated object")
-                if src[idx[0]] == ',':
-                    idx[0] += 1
-                    continue
-                if src[idx[0]] == '}':
-                    idx[0] += 1
-                    return dict(items)
-                raise ValueError("expected ',' or '}'")
-        if c == '[':
-            idx[0] = i + 1
-            lst = []
-            _skip_ws()
-            if idx[0] < n and src[idx[0]] == ']':
-                idx[0] += 1
-                return ()
-            while True:
-                lst.append(_parse_value())
-                _skip_ws()
-                if idx[0] >= n:
-                    raise ValueError("unterminated array")
-                if src[idx[0]] == ',':
-                    idx[0] += 1
-                    continue
-                if src[idx[0]] == ']':
-                    idx[0] += 1
-                    return tuple(lst)
-                raise ValueError("expected ',' or ']'")
-        if c == '"':
-            return _parse_string()
-        if c == 't':
-            if src[i:i+4] == 'true':
-                idx[0] = i + 4
-                return True
-            raise ValueError("bad literal at " + str(i))
-        if c == 'f':
-            if src[i:i+5] == 'false':
-                idx[0] = i + 5
-                return False
-            raise ValueError("bad literal at " + str(i))
-        if c == 'n':
-            if src[i:i+4] == 'null':
-                idx[0] = i + 4
-                return None
-            raise ValueError("bad literal at " + str(i))
-        if c == '-' or ('0' <= c <= '9'):
-            return _parse_number()
-        raise ValueError("unexpected char " + repr(c) + " at " + str(i))
-
-    result = _parse_value()
-    _skip_ws()
-    if idx[0] != n:
-        raise ValueError("trailing data at " + str(idx[0]))
-    return result
-
-
 def _k_derive(input_seed, pep, rounds, rk_label, rot_label, sbx_label, rot_mod, sbx_nudge):
-    """v11 inline key-derivation — mirror of stage1's _kd.
+    """Inline key-derivation — mirror of stage1's _kd.
 
-    Previously stage1 passed its _kd CLOSURE (along with _dec) into _pg_boot
-    as a positional argument. The red team's `v10_attack_boot_args_sniff`
-    wrapped that closure in a logger, let the stub run, and captured every
-    plaintext byte as it flowed through decrypt.
-
-    v11 moves derivation INSIDE the interpreter. The profile parameters
-    (rounds, labels, rot_mod, sbx_nudge) travel as inert bytes in the
-    boot-args tuple; there is no Python callable to wrap. An attacker
-    who captures the args now has only raw bytes and must reimplement
-    this derivation offline to make use of them.
+    Derivation runs INSIDE the interpreter. Profile parameters (rounds,
+    labels, rot_mod, sbx_nudge) travel as inert bytes in the boot-args
+    tuple; there is no Python callable to wrap. An attacker who captures
+    the args has only raw bytes and must reimplement this derivation
+    offline to make use of them.
 
     Algorithm must match lib/obfuscate.ts `kdf()` exactly — the stage1
     encryption side used the same math and any drift breaks compat.
@@ -2112,8 +1914,8 @@ def _k_derive(input_seed, pep, rounds, rk_label, rot_label, sbx_label, rot_mod, 
 
 
 def _c_dec(ct, rks, rotk, inv):
-    """v11 inline cipher decrypt — canonical (unflattened) version of
-    the state machine stage1 generates as source. Equivalent semantics,
+    """Inline cipher decrypt — canonical (unflattened) version of the
+    state machine stage1 generates as source. Equivalent semantics,
     ~20x less code. Stage1's flattened version is retained for its own
     use (where extraction resistance matters); the interpreter's copy
     runs after FunctionType has already latched the code object, so
@@ -2230,7 +2032,6 @@ def _pg_parse_bin(blob):
 if __name__ == '__main__':
     import json
     import os
-    import io
 
     # Smoke test: read source from argv[1], compile via the real packed
     # binary path (compile_to_compressed_bytes + run_blob) so this exercises
@@ -2261,7 +2062,7 @@ if __name__ == '__main__':
             k: {name: i + 1 for i, name in enumerate(v)}
             for k, v in dict(schema.get('layouts', {}).items()).items()
         }
-        # v5.4: rolling XOR + noise injection globals
+        # rolling XOR + noise injection globals
         bin_key_pair = schema.get('binKey')
         if bin_key_pair is not None:
             lo, hi = bin_key_pair
