@@ -456,6 +456,12 @@ function shuffleArr<T>(a: T[]): void {
     }
 }
 
+function xor32(a: Uint8Array, b: Uint8Array): Uint8Array {
+    const out = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) out[i] = a[i] ^ b[i];
+    return out;
+}
+
 interface ChunkedB64 {
     decls: string;   // Python-source lines declaring every chunk
     concat: string;  // Python concat expression of ONLY the real chunks
@@ -498,6 +504,42 @@ function chunkB64(b64: string, ng: NameGen): ChunkedB64 {
     const decls = all.map(e => `${e.name} = "${e.value}"`).join("\n");
     const concat = realNames.join(" + ");
     return { decls, concat };
+}
+
+// v5.1 / C3: fixed-count chunking. Pre-allocate N names at canonical
+// assembly time (so the concat expression can appear inside canonical
+// bytes BEFORE the ciphertext is known). After the ciphertext is
+// encrypted with the canonical-hash-derived key, slice it into the same
+// N pieces and emit shuffled decls *outside* the canonical region.
+//
+// Rationale: the old flow embedded stage1 ciphertext inside canonical,
+// which forced the master seed to be stored as `seed XOR canonical_hash`
+// in the preamble — A35 inverted that XOR in one line. By moving
+// ciphertext out of canonical we decouple the hash from the ciphertext,
+// letting `seed = KDF(canonical_hash, pep)` be derived directly at
+// runtime without any stored XOR blob.
+function chunkB64Plan(ng: NameGen, count: number): { names: string[], concat: string } {
+    const names: string[] = [];
+    for (let i = 0; i < count; i++) names.push(ng.gen());
+    return { names, concat: names.join(" + ") };
+}
+
+function chunkB64Apply(b64: string, names: string[]): string {
+    const n = names.length;
+    const each = Math.ceil(b64.length / n);
+    const pieces: string[] = [];
+    for (let i = 0; i < n; i++) {
+        pieces.push(b64.slice(i * each, (i + 1) * each));
+    }
+    // Last chunk can be shorter or empty — that's fine, the runtime
+    // just base64-decodes the concat. Empty trailing pieces yield ''.
+    interface Entry { name: string; value: string; }
+    const all: Entry[] = [];
+    for (let k = 0; k < n; k++) {
+        all.push({ name: names[k], value: pieces[k] });
+    }
+    shuffleArr(all);
+    return all.map(e => `${e.name} = "${e.value}"`).join("\n");
 }
 
 // Pick N distinct random state-machine state values for the flattened
@@ -676,7 +718,6 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // 2. Random confusable identifier for every logical symbol in the stub.
     //    Grouped here so the template-literal substitutions below are
     //    compact and mechanical.
-    const n_X        = ng.gen();
     const n_O        = ng.gen();
     const n_kd       = ng.gen();
     const n_dec      = ng.gen();
@@ -693,7 +734,6 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_p1       = ng.gen();
     const n_S1       = ng.gen();
     const n_pt1      = ng.gen();
-    const n_src1     = ng.gen();
     const n_ns       = ng.gen();
     const n_co       = ng.gen();
     const n_chainA   = ng.gen(); // canonical region hash-fold variable
@@ -790,312 +830,18 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const pepC = sha256(concatBytes(pepB, pepA));
     const pep = pepC;
 
-    // 4. Derive cipher parameters and encrypt user payload.
-    //    The runtime `_kd` XORs its input with `pep` before any sha256.
-    //    We reproduce that here so encryption matches the stub runtime.
-    //    `seed` is the VALUE THE STUB STORES (post-formula, pre-pepper).
-    //    `pepperedSeed` is what the cipher rounds actually consume.
-    const seed = randomBytes(32);
-
-    // _vfy returns sha256(seed || 32-byte-zero-corr) on honest run.
-    // Its output (not the raw seed) is what _kd receives for stage 1.
-    // Stage 1 itself still uses the raw `seed` via `_seed` for stage 2
-    // derivation, so seed2 computation below stays keyed on `seed`.
-    const vfySeed1 = sha256(concatBytes(seed, new Uint8Array(32)));
-    const pepperedSeed = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) pepperedSeed[i] = vfySeed1[i] ^ pep[i];
-
-    const params1 = kdf(pepperedSeed, prof);
-
-    // Stage-2 seed derivation: sha256(storedSeed || stage2Label). The runtime
-    // uses `_seed` (the formula-seed, before pepper) here, matching.
-    const seed2 = sha256(concatBytes(seed, stage2Label));
-    const pepperedSeed2 = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) pepperedSeed2[i] = seed2[i] ^ pep[i];
-    const params2 = kdf(pepperedSeed2, prof);
-
-    // In v5/v6 this block built a stage2 *source* string, encrypted it, and
-    // let stage1 call compile() on the decrypted text. v7 replaces the
-    // source-round-trip with marshaled code objects so no `compile()` audit
-    // event ever sees the text of stage2 or the interpreter:
+    // v5.1 / C3 — master seed is DERIVED FROM the canonical-region hash,
+    // not stored XOR'd with it. A35 closed (as written): the stub contains
+    // no `_X = bytes(...)` preamble literal and no `seed = zip(X,h) XOR`
+    // regex pattern. To match runtime, we first build the full canonical
+    // region (below), compute its hash, then set `seed = sha256(h || pep)`.
     //
-    //   1. Decompress the interpreter source once, compile+marshal it on the
-    //      build machine via `opts.compileAndMarshal`, zlib-compress the
-    //      marshaled bytes, encrypt+base64+chunk that as `interpChunks`.
-    //   2. Build the stage2 *source* as before (only so we can compile+marshal
-    //      it ourselves) — then throw away the source; only the marshaled
-    //      bytecode is embedded.
-    //   3. Stage1 (see below) is likewise compiled+marshaled and the
-    //      canonical region does `marshal.loads` on it instead of `compile`.
-    //
-    // The attacker who installs an audit hook no longer sees stage1/stage2/
-    // interpreter source at any point — only marshaled bytecode, which
-    // requires a Python-version-specific decompiler pass to approach source
-    // fidelity.
-    let payloadBytes: Uint8Array;
-    if (opts && opts.v5IR) {
-        if (!opts.compileAndMarshal) {
-            throw new Error(
-                'v7 obfuscation requires opts.compileAndMarshal. ' +
-                'The Node driver (gen-v5-stub.mjs) and the browser driver ' +
-                '(pyodide_loader.ts) each supply one; callers that embed ' +
-                'the library directly must provide a callback that returns ' +
-                '`marshal.dumps(compile(source, filename, "exec"))` bytes.',
-            );
-        }
-        if (!opts.interpreterMarshalCompressed) {
-            throw new Error(
-                'v7 obfuscation requires opts.interpreterMarshalCompressed — ' +
-                'zlib-deflated (raw, -15) marshal.dumps bytes for the ' +
-                'interpreter. Callers prepare this by decompressing ' +
-                'INTERPRETER_SRC_B64, compile+marshal+deflate in the target ' +
-                "Python. See build_ir.py's compile_and_marshal helper.",
-            );
-        }
-        // Fresh names used inside stage2's Python source.
-        const envCheckVar        = ng.gen();
-        const interpCtVar        = ng.gen();
-        const interpHashVar      = ng.gen();
-        const interpSeedVar      = ng.gen();
-        const interpPVar         = ng.gen();
-        const interpMarshalVar   = ng.gen();
-        const interpCodeVar      = ng.gen();
-        const interpNsVar        = ng.gen();
-        const schemaCtVar        = ng.gen();
-        const irCtVar            = ng.gen();
+    // Pre-allocate 32 stage-1-chunk names NOW. Canonical references them
+    // via `s1Plan.concat` (names only). Their VALUES (base64 ciphertext)
+    // are injected into the stub preamble OUTSIDE canonical, after
+    // encryption, via chunkB64Apply below.
+    const s1Plan = chunkB64Plan(ng, 32);
 
-        // v9: boot entry point indexed by a RANDOMIZED BYTES KEY, not by
-        // the literal string "_pg_boot". The bytes come from
-        // interpreter_src.ts (generated by gen-interpreter-src.mjs,
-        // which captures them from obfuscate_runtime.py). No original
-        // API name exists in interp_ns; stage2 looks up
-        // `interp_ns[bytes([...random...])]`.
-        const bootKeyBytes = BOOT_KEY_BYTES;
-
-        // Environment integrity binding. The runtime hash mixes
-        //   * thread count (1),
-        //   * types of three builtins (zlib.decompress / print / getattr),
-        //   * v12.3: types of the four sys trace/profile hook functions.
-        // An attacker who replaces sys.settrace / sys.setprofile /
-        // sys.gettrace / sys.getprofile with Python-level shims (A5 style)
-        // turns their type from 'builtin_function_or_method' into
-        // 'function', which mismatches this hash, which mismatches the
-        // derived interpreter / IR / schema keys, which turns every AEAD
-        // decrypt into garbage. The build side precomputes the SAME hash
-        // and XORs it into the three key-derivation paths.
-        const envCheckExpected = sha256(
-            new TextEncoder().encode(
-                '1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method'
-                // v12.3: sys.settrace/setprofile/gettrace/getprofile types.
-                + '|builtin_function_or_method|builtin_function_or_method'
-                + '|builtin_function_or_method|builtin_function_or_method'
-                // v12.4: exec / marshal.loads / hashlib.scrypt types. A6's
-                // attack hooks all three; any of them being a Python-level
-                // function flips this check to 'function' and crashes crypto.
-                + '|builtin_function_or_method|builtin_function_or_method'
-                + '|builtin_function_or_method'
-                // v12.3 strengthening: identity check `type(sys.settrace) is
-                // type(zlib.decompress)`. A8's attack spoofs __name__ with a
-                // custom class named 'builtin_function_or_method'; but that
-                // class's TYPE is not the C-level builtin_function_or_method,
-                // so the `is` comparison flips to 'False'.
-                + '|True|True|True|True'
-                // v12.4: same identity check for exec / marshal.loads /
-                // hashlib.scrypt. All three are hooked by A6 with Python
-                // shims; the `is type(zlib.decompress)` check catches them.
-                + '|True|True|True')
-        );
-
-        // ---- 1. Encrypt the pre-marshaled interpreter --------------------
-        // The caller has already decompressed INTERPRETER_SRC_B64, compiled
-        // the interpreter in the target Python, marshaled, and re-compressed.
-        // We just encrypt + chunk. (Zlib work is pushed to the caller so
-        // obfuscate.ts doesn't need node:zlib in the browser bundle.)
-        const interpMarshalCompressed = opts.interpreterMarshalCompressed;
-
-        // Interpreter cipher: derived from seed + interpLabel + envCheck.
-        // NOT XOR'd with interpHash because interpHash IS the hash of the
-        // interpreter ciphertext (known at stage2 runtime only after decode).
-        const interpLabel = randomBytes(6);
-        const interpSeedPre = sha256(concatBytes(seed, interpLabel));
-        const interpSeed = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) interpSeed[i] = interpSeedPre[i] ^ envCheckExpected[i];
-        const pepperedInterpSeed = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) pepperedInterpSeed[i] = interpSeed[i] ^ pep[i];
-        const paramsInterp = kdf(pepperedInterpSeed, prof);
-        const encInterp = encrypt(interpMarshalCompressed, paramsInterp, prof);
-        const encInterpB64 = bytesToBase64(encInterp);
-        const interpChunks = chunkB64(encInterpB64, ng);
-
-        // ---- 2. Interp-hash binding for schema + IR ----------------------
-        // The schema and IR keys XOR in the hash of the *encrypted*
-        // interpreter blob. Any tampering (e.g. attacker swaps interpreter
-        // ciphertext for a debug version) changes this hash and silently
-        // corrupts schema+IR decryption.
-        const interpHash = sha256(encInterp);
-
-        // Third-stage cipher: IR. Seed = sha256(seed || irLabel) ^ interpHash ^ envCheck.
-        const irLabel = randomBytes(6);
-        const irSeed3Pre = sha256(concatBytes(seed, irLabel));
-        const irSeed3 = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) irSeed3[i] = irSeed3Pre[i] ^ interpHash[i] ^ envCheckExpected[i];
-        const pepperedSeed3 = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) pepperedSeed3[i] = irSeed3[i] ^ pep[i];
-        const params3 = kdf(pepperedSeed3, prof);
-        const irJsonBytes = serializeIR(opts.v5IR);
-        const encIR = encrypt(irJsonBytes, params3, prof);
-        const encIRB64 = bytesToBase64(encIR);
-        const irChunks = chunkB64(encIRB64, ng);
-
-        // Schema cipher: same pattern.
-        const schemaLabel = randomBytes(6);
-        const schemaSeed4Pre = sha256(concatBytes(seed, schemaLabel));
-        const schemaSeed4 = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) schemaSeed4[i] = schemaSeed4Pre[i] ^ interpHash[i] ^ envCheckExpected[i];
-        const pepperedSeed4 = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) pepperedSeed4[i] = schemaSeed4[i] ^ pep[i];
-        const params4 = kdf(pepperedSeed4, prof);
-        const schemaBytes = serializeSchemaBinary(opts.v5IR.schema);
-        const encSchema = encrypt(schemaBytes, params4, prof);
-        const encSchemaB64 = bytesToBase64(encSchema);
-        const schemaChunks = chunkB64(encSchemaB64, ng);
-
-        // ---- 3. Build + marshal stage2 -----------------------------------
-        // v11: pack PolyProfile into 15 bytes for inline _k_derive inside
-        // the interpreter. Layout must match the `_pg_boot` unpack in
-        // lib/v5/runtime_interp.py:
-        //   [0] rounds, [1] rotMod, [2] sbxNudge,
-        //   [3..7] rkLabel, [7..11] rotLabel, [11..15] sbxLabel.
-        const profileBytes = new Uint8Array(15);
-        profileBytes[0] = prof.rounds;
-        profileBytes[1] = prof.rotMod;
-        profileBytes[2] = prof.sbxNudge;
-        profileBytes.set(prof.rkLabel, 3);
-        profileBytes.set(prof.rotLabel, 7);
-        profileBytes.set(prof.sbxLabel, 11);
-        // `pep` is already the 32-byte sha256 chain result computed at the
-        // top of this function. Re-expose it here for stage2 consumption.
-        const pepBytes = pep;
-        const stage2Src = buildV5Stage2Source(
-            { n_seed, n_kd, n_dec, n_tchk },
-            {
-                prof,
-                interpLabel, irLabel, schemaLabel,
-                interpChunks, irChunks, schemaChunks,
-                envCheckVar,
-                interpCtVar, interpHashVar,
-                interpSeedVar, interpPVar, interpMarshalVar,
-                interpCodeVar, interpNsVar,
-                schemaCtVar, irCtVar,
-                bootKeyBytes,
-                pepBytes, profileBytes,
-            },
-        );
-        // Marshal stage2 to bytecode. The bytes we embed (and that stage1
-        // will `marshal.loads`) are version-locked to the Python that ran
-        // `opts.compileAndMarshal`, i.e. the same Python the end user will
-        // use to run the stub. No `compile()` call happens at stub runtime.
-        payloadBytes = opts.compileAndMarshal(stage2Src, '<pg_s2>');
-    } else {
-        payloadBytes = strToUtf8(input);
-    }
-    const encUser = encrypt(payloadBytes, params2, prof);
-    const encUserB64 = bytesToBase64(encUser);
-    const userChunks = chunkB64(encUserB64, ng);
-
-    // 4. Build Stage 1 source. Runs in a namespace where the canonical
-    //    region has injected: __builtins__, the randomized `_O` tuple,
-    //    the randomized seed/kd/dec names, sys, hashlib, base64, __file__.
-    // Stage 1 anti-analysis: CRYPTOGRAPHIC BINDING.
-    //
-    // Instead of `if debugger: exit()` (trivially NOP'd), detection of
-    // analysis tools POISONS the seed used for Stage 2 key derivation.
-    // No visible error — decryption produces garbage, the decode('utf-8')
-    // fails silently, and the stub exits. An attacker who patches out
-    // the checks gets a different seed and wrong decryption.
-    //
-    // The poison is accumulated into a "taint" variable that XORs the
-    // seed. On honest runs, taint == 0 (no XOR). Under analysis, taint
-    // is non-zero, silently corrupting all downstream crypto.
-    const s1_taint = ng.gen();
-    const s1_tpois1 = randomBytes(1)[0] | 1;  // non-zero
-    const s1_tpois2 = randomBytes(1)[0] | 1;
-    const s1_tpois3 = randomBytes(1)[0] | 1;
-    const s1_tpois4 = randomBytes(1)[0] | 1;
-    const s1_tpois5 = randomBytes(1)[0] | 1;
-    const s1_tcnt = ng.gen(); // timing counter
-    const s1_tstart = ng.gen(); // timing start
-
-    const stage1Src = `${s1_b} = ${n_O}[${bi['__import__']}]('builtins')
-${s1_taint} = 0
-try:
-    ${n_O}[${bi['getattr']}](sys, 'settrace')(None)
-except Exception:
-    pass
-try:
-    ${n_O}[${bi['getattr']}](sys, 'setprofile')(None)
-except Exception:
-    pass
-if ${n_tchk}():
-    ${s1_taint} ^= ${s1_tpois1}
-if ${n_O}[${bi['getattr']}](sys, 'gettrace')() is not None:
-    ${s1_taint} ^= ${s1_tpois2}
-if ${n_O}[${bi['getattr']}](sys, 'getprofile')() is not None:
-    ${s1_taint} ^= ${s1_tpois2}
-if compile is not ${n_O}[${bi['compile']}] or getattr is not ${n_O}[${bi['getattr']}] or type is not ${n_O}[${bi['type']}]:
-    ${s1_taint} ^= ${s1_tpois3}
-if __import__ is not ${n_O}[${bi['__import__']}] or open is not ${n_O}[${bi['open']}] or exec is not ${n_O}[${bi['exec']}]:
-    ${s1_taint} ^= ${s1_tpois4}
-${s1_bn} = 'builtin_function_or_method'
-try:
-    if (compile.__class__.__name__ != ${s1_bn} or exec.__class__.__name__ != ${s1_bn} or
-        getattr.__class__.__name__ != ${s1_bn} or __import__.__class__.__name__ != ${s1_bn} or
-        open.__class__.__name__ != ${s1_bn} or
-        compile.__module__ != 'builtins' or exec.__module__ != 'builtins'):
-        ${s1_taint} ^= ${s1_tpois5}
-except Exception:
-    ${s1_taint} ^= ${s1_tpois5}
-try:
-    ${s1_tstart} = ${n_O}[${bi['__import__']}]('time').monotonic()
-except Exception:
-    ${s1_tstart} = 0
-${s1_seed2} = hashlib.sha256(bytes(a ^ ${s1_taint} for a in ${n_seed}) + bytes(${bytesArrayLit(stage2Label)})).digest()
-${s1_p2} = ${n_kd}(${s1_seed2})
-${userChunks.decls}
-${s1_S2} = base64.b64decode(${userChunks.concat})
-${s1_pt2} = ${n_dec}(${s1_S2}, ${s1_p2}[0], ${s1_p2}[1], ${s1_p2}[2])
-try:
-    if ${s1_tstart} > 0 and ${n_O}[${bi['__import__']}]('time').monotonic() - ${s1_tstart} > 2.0:
-        ${s1_pt2} = ${s1_pt2}[::-1]
-except Exception:
-    pass
-${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None, 'marshal': marshal${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
-try:
-    ${s1_co2} = marshal.loads(${s1_pt2})
-except Exception:
-    sys.exit(0)
-${n_ftype}(${s1_co2}, ${s1_uns})()
-`;
-
-    // v7: stage1 itself is marshaled (compile+marshal.dumps) so that the
-    // outer canonical region's `marshal.loads` consumes bytecode directly.
-    // No `compile()` audit event fires for stage1 source at runtime.
-    const stage1Bytes = opts && opts.v5IR && opts.compileAndMarshal
-        ? opts.compileAndMarshal(stage1Src, '<pg_s1>')
-        : strToUtf8(stage1Src);
-    const encStage1 = encrypt(stage1Bytes, params1, prof);
-    const encStage1B64 = bytesToBase64(encStage1);
-    const stage1Chunks = chunkB64(encStage1B64, ng);
-
-    // 5. Build the canonical region. Every named identifier is randomized;
-    //    _dec is a flattened state machine; hash is computed via two
-    //    update() calls; junk no-op XORs are folded into the chain.
-    // Pepper graph: chained sha256 computations producing the actual
-    // pepper used by `_kd`, interleaved with decoys of identical shape.
-    // The real chain is `pepSeed -> pepA -> pepB -> pepC -> pep`, and
-    // `_kd` references only `${n_pep}`. Extracting just `_kd` in
-    // isolation NameErrors on `${n_pep}`. The real chain is emitted in
-    // dependency order; decoys are randomly woven in between.
     const realChain = [
         `${n_pepSeed} = bytes(${bytesArrayLit(pepSeedBytes)})`,
         `${n_pepA} = hashlib.sha256(${n_pepSeed}).digest()`,
@@ -1108,22 +854,30 @@ ${n_ftype}(${s1_co2}, ${s1_uns})()
         `${n_pepDecoy2} = hashlib.sha256(${n_pepDecoy1} + bytes(${bytesArrayLit(randomBytes(16))})).digest()`,
         `${n_pepDecoy3} = hashlib.sha256(${n_pepDecoy2} + ${n_pepDecoy1}).digest()`,
     ];
-    // Interleave without breaking the real chain's internal dependency order.
-    const interleaved: string[] = [];
-    let ri = 0, di = 0;
-    const rpick = randomBytes(realChain.length + decoyChain.length);
-    while (ri < realChain.length || di < decoyChain.length) {
-        const tryDecoy =
-            di < decoyChain.length &&
-            (ri >= realChain.length || (rpick[ri + di] & 1) === 0);
-        if (tryDecoy) {
-            interleaved.push(decoyChain[di++]);
-        } else {
-            interleaved.push(realChain[ri++]);
+    const interleavedPep: string[] = [];
+    {
+        let ri = 0, di = 0;
+        const rpick = randomBytes(realChain.length + decoyChain.length);
+        while (ri < realChain.length || di < decoyChain.length) {
+            const tryDecoy =
+                di < decoyChain.length &&
+                (ri >= realChain.length || (rpick[ri + di] & 1) === 0);
+            if (tryDecoy) {
+                interleavedPep.push(decoyChain[di++]);
+            } else {
+                interleavedPep.push(realChain[ri++]);
+            }
         }
     }
-    const pepperBlock = interleaved.join("\n");
+    const pepperBlock = interleavedPep.join("\n");
 
+    // Canonical region — built BEFORE seed derivation. References only
+    // NAMES (n_seed, n_h, n_pep, s1Plan.concat) and deterministic byte
+    // literals. Does NOT embed seed or seed-derived ciphertext; those
+    // are derived at runtime inside canonical via
+    //   ${n_seed} = hashlib.sha256(${n_h} + ${n_pep}).digest()
+    // and consumed against the stage1 chunk names, whose values live in
+    // the stub preamble (outside canonical).
     const canonicalRegion =
 `${BEGIN_MARKER}
 import sys, hashlib, base64, marshal
@@ -1348,10 +1102,9 @@ try:
         ${n_h} = bytes((b ^ ${prof.poison3}) for b in ${n_h})
 except Exception:
     pass
-${n_seed} = bytes(a ^ b for a, b in zip(${n_X}, ${n_h}))
+${n_seed} = hashlib.sha256(${n_h} + ${n_pep}).digest()
 ${n_p1} = ${n_kd}(${n_vfy}(${n_seed}))
-${stage1Chunks.decls}
-${n_S1} = base64.b64decode(${stage1Chunks.concat})
+${n_S1} = base64.b64decode(${s1Plan.concat})
 ${n_pt1} = ${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2])
 ${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, '__file__': ${n_path}}
 try:
@@ -1362,7 +1115,8 @@ ${n_ftype}(${n_co}, ${n_ns})()
 ${END_MARKER}
 `;
 
-    // 6. Compute canonical-region hash → stored XOR blob.
+    // Canonical-region hash (with runtime-substituted 32-zero midpoint)
+    // and single-byte fold. Matches the runtime sequence above exactly.
     const canonicalBytes = strToUtf8(canonicalRegion);
     const startBytes = strToUtf8(BEGIN_MARKER);
     const endBytes = strToUtf8(END_MARKER);
@@ -1371,12 +1125,6 @@ ${END_MARKER}
     if (sIdx < 0 || eIdx < 0) {
         throw new Error("internal: integrity markers not found in template");
     }
-    // Runtime feeds the hasher three chunks:
-    //   1. canonical bytes [s : half]
-    //   2. a 32-byte term that is self-cancelling to zeros on honest run
-    //      (sha256(live_deep_digest + rec_deep_digest) XOR sha256(rec||rec))
-    //   3. canonical bytes [half : e]
-    // so the baked hash must include 32 zero bytes at the midpoint.
     const halfOffset = Math.floor((eIdx - sIdx) / 2);
     const hashInput = concatBytes(
         canonicalBytes.slice(sIdx, sIdx + halfOffset),
@@ -1384,30 +1132,307 @@ ${END_MARKER}
         canonicalBytes.slice(sIdx + halfOffset, eIdx),
     );
     let hashOut = sha256(hashInput);
-    // v6: apply the same hash-fold that the canonical region applies at runtime
     const foldKey = sha256(concatBytes(hashOut, new Uint8Array([hashFoldByte])));
     hashOut = new Uint8Array(hashOut.map((b, i) => b ^ foldKey[i]));
 
-    const stored = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) stored[i] = seed[i] ^ hashOut[i];
-    const storedLit = bytesArrayLit(stored);
+    // v5.1 / C3 — master seed = sha256(canonical_hash || pep). Not stored
+    // anywhere; any byte flip inside canonical → different hash → garbage
+    // seed → silent decryption failure downstream.
+    const seed = sha256(concatBytes(hashOut, pep));
 
-    // 7. Preamble with the real stored key and several decoy byte arrays
-    //    of the exact same form. The real one is identified only by its
-    //    randomized name; every other reference in the canonical region
-    //    names it explicitly via `${n_X}`.
-    const numDecoys = 3 + (randomBytes(1)[0] % 3); // 3..5
-    const keyDecls: string[] = [];
-    keyDecls.push(`${n_X} = bytes(${storedLit})`);
-    for (let i = 0; i < numDecoys; i++) {
-        const dName = ng.gen();
-        const dBytes = randomBytes(32);
-        keyDecls.push(`${dName} = bytes(${bytesArrayLit(dBytes)})`);
+    // 4. Derive cipher parameters and encrypt user payload.
+    //    The runtime `_kd` XORs its input with `pep` before any sha256.
+    //    We reproduce that here so encryption matches the stub runtime.
+    //    `pepperedSeed` is what the cipher rounds actually consume.
+    //
+    // _vfy returns sha256(seed || 32-byte-zero-corr) on honest run.
+    // Its output (not the raw seed) is what _kd receives for stage 1.
+    // Stage 1 itself still uses the raw `seed` via `_seed` for stage 2
+    // derivation, so seed2 computation below stays keyed on `seed`.
+    const vfySeed1 = sha256(concatBytes(seed, new Uint8Array(32)));
+    const pepperedSeed = xor32(vfySeed1, pep);
+
+    const params1 = kdf(pepperedSeed, prof);
+
+    // Stage-2 seed derivation: sha256(storedSeed || stage2Label). The runtime
+    // uses `_seed` (the formula-seed, before pepper) here, matching.
+    const seed2 = sha256(concatBytes(seed, stage2Label));
+    const pepperedSeed2 = xor32(seed2, pep);
+    const params2 = kdf(pepperedSeed2, prof);
+
+    // In v5/v6 this block built a stage2 *source* string, encrypted it, and
+    // let stage1 call compile() on the decrypted text. v7 replaces the
+    // source-round-trip with marshaled code objects so no `compile()` audit
+    // event ever sees the text of stage2 or the interpreter:
+    //
+    //   1. Decompress the interpreter source once, compile+marshal it on the
+    //      build machine via `opts.compileAndMarshal`, zlib-compress the
+    //      marshaled bytes, encrypt+base64+chunk that as `interpChunks`.
+    //   2. Build the stage2 *source* as before (only so we can compile+marshal
+    //      it ourselves) — then throw away the source; only the marshaled
+    //      bytecode is embedded.
+    //   3. Stage1 (see below) is likewise compiled+marshaled and the
+    //      canonical region does `marshal.loads` on it instead of `compile`.
+    //
+    // The attacker who installs an audit hook no longer sees stage1/stage2/
+    // interpreter source at any point — only marshaled bytecode, which
+    // requires a Python-version-specific decompiler pass to approach source
+    // fidelity.
+    let payloadBytes: Uint8Array;
+    if (opts && opts.v5IR) {
+        if (!opts.compileAndMarshal) {
+            throw new Error(
+                'v7 obfuscation requires opts.compileAndMarshal. ' +
+                'The Node driver (gen-v5-stub.mjs) and the browser driver ' +
+                '(pyodide_loader.ts) each supply one; callers that embed ' +
+                'the library directly must provide a callback that returns ' +
+                '`marshal.dumps(compile(source, filename, "exec"))` bytes.',
+            );
+        }
+        if (!opts.interpreterMarshalCompressed) {
+            throw new Error(
+                'v7 obfuscation requires opts.interpreterMarshalCompressed — ' +
+                'zlib-deflated (raw, -15) marshal.dumps bytes for the ' +
+                'interpreter. Callers prepare this by decompressing ' +
+                'INTERPRETER_SRC_B64, compile+marshal+deflate in the target ' +
+                "Python. See build_ir.py's compile_and_marshal helper.",
+            );
+        }
+        // Fresh names used inside stage2's Python source.
+        const envCheckVar        = ng.gen();
+        const interpCtVar        = ng.gen();
+        const interpHashVar      = ng.gen();
+        const interpSeedVar      = ng.gen();
+        const interpPVar         = ng.gen();
+        const interpMarshalVar   = ng.gen();
+        const interpCodeVar      = ng.gen();
+        const interpNsVar        = ng.gen();
+        const schemaCtVar        = ng.gen();
+        const irCtVar            = ng.gen();
+
+        // v9: boot entry point indexed by a RANDOMIZED BYTES KEY, not by
+        // the literal string "_pg_boot". The bytes come from
+        // interpreter_src.ts (generated by gen-interpreter-src.mjs,
+        // which captures them from obfuscate_runtime.py). No original
+        // API name exists in interp_ns; stage2 looks up
+        // `interp_ns[bytes([...random...])]`.
+        const bootKeyBytes = BOOT_KEY_BYTES;
+
+        // Environment integrity binding. The runtime hash mixes
+        //   * thread count (1),
+        //   * types of three builtins (zlib.decompress / print / getattr),
+        //   * v12.3: types of the four sys trace/profile hook functions.
+        // An attacker who replaces sys.settrace / sys.setprofile /
+        // sys.gettrace / sys.getprofile with Python-level shims (A5 style)
+        // turns their type from 'builtin_function_or_method' into
+        // 'function', which mismatches this hash, which mismatches the
+        // derived interpreter / IR / schema keys, which turns every AEAD
+        // decrypt into garbage. The build side precomputes the SAME hash
+        // and XORs it into the three key-derivation paths.
+        const envCheckExpected = sha256(
+            new TextEncoder().encode(
+                '1|builtin_function_or_method|builtin_function_or_method|builtin_function_or_method'
+                // v12.3: sys.settrace/setprofile/gettrace/getprofile types.
+                + '|builtin_function_or_method|builtin_function_or_method'
+                + '|builtin_function_or_method|builtin_function_or_method'
+                // v12.4: exec / marshal.loads / hashlib.scrypt types. A6's
+                // attack hooks all three; any of them being a Python-level
+                // function flips this check to 'function' and crashes crypto.
+                + '|builtin_function_or_method|builtin_function_or_method'
+                + '|builtin_function_or_method'
+                // v12.3 strengthening: identity check `type(sys.settrace) is
+                // type(zlib.decompress)`. A8's attack spoofs __name__ with a
+                // custom class named 'builtin_function_or_method'; but that
+                // class's TYPE is not the C-level builtin_function_or_method,
+                // so the `is` comparison flips to 'False'.
+                + '|True|True|True|True'
+                // v12.4: same identity check for exec / marshal.loads /
+                // hashlib.scrypt. All three are hooked by A6 with Python
+                // shims; the `is type(zlib.decompress)` check catches them.
+                + '|True|True|True')
+        );
+
+        // ---- 1. Encrypt the pre-marshaled interpreter --------------------
+        // The caller has already decompressed INTERPRETER_SRC_B64, compiled
+        // the interpreter in the target Python, marshaled, and re-compressed.
+        // We just encrypt + chunk. (Zlib work is pushed to the caller so
+        // obfuscate.ts doesn't need node:zlib in the browser bundle.)
+        const interpMarshalCompressed = opts.interpreterMarshalCompressed;
+
+        // Interpreter cipher: derived from seed + interpLabel + envCheck.
+        // NOT XOR'd with interpHash because interpHash IS the hash of the
+        // interpreter ciphertext (known at stage2 runtime only after decode).
+        const interpLabel = randomBytes(6);
+        const interpSeedPre = sha256(concatBytes(seed, interpLabel));
+        const interpSeed = xor32(interpSeedPre, envCheckExpected);
+        const pepperedInterpSeed = xor32(interpSeed, pep);
+        const paramsInterp = kdf(pepperedInterpSeed, prof);
+        const encInterp = encrypt(interpMarshalCompressed, paramsInterp, prof);
+        const encInterpB64 = bytesToBase64(encInterp);
+        const interpChunks = chunkB64(encInterpB64, ng);
+
+        // ---- 2. Interp-hash binding for schema + IR ----------------------
+        // The schema and IR keys XOR in the hash of the *encrypted*
+        // interpreter blob. Any tampering (e.g. attacker swaps interpreter
+        // ciphertext for a debug version) changes this hash and silently
+        // corrupts schema+IR decryption.
+        const interpHash = sha256(encInterp);
+
+        // Third-stage cipher: IR. Seed = sha256(seed || irLabel) ^ interpHash ^ envCheck.
+        const irLabel = randomBytes(6);
+        const irSeed3Pre = sha256(concatBytes(seed, irLabel));
+        const irSeed3 = xor32(xor32(irSeed3Pre, interpHash), envCheckExpected);
+        const pepperedSeed3 = xor32(irSeed3, pep);
+        const params3 = kdf(pepperedSeed3, prof);
+        const irJsonBytes = serializeIR(opts.v5IR);
+        const encIR = encrypt(irJsonBytes, params3, prof);
+        const encIRB64 = bytesToBase64(encIR);
+        const irChunks = chunkB64(encIRB64, ng);
+
+        // Schema cipher: same pattern.
+        const schemaLabel = randomBytes(6);
+        const schemaSeed4Pre = sha256(concatBytes(seed, schemaLabel));
+        const schemaSeed4 = xor32(xor32(schemaSeed4Pre, interpHash), envCheckExpected);
+        const pepperedSeed4 = xor32(schemaSeed4, pep);
+        const params4 = kdf(pepperedSeed4, prof);
+        const schemaBytes = serializeSchemaBinary(opts.v5IR.schema);
+        const encSchema = encrypt(schemaBytes, params4, prof);
+        const encSchemaB64 = bytesToBase64(encSchema);
+        const schemaChunks = chunkB64(encSchemaB64, ng);
+
+        // ---- 3. Build + marshal stage2 -----------------------------------
+        // v11: pack PolyProfile into 15 bytes for inline _k_derive inside
+        // the interpreter. Layout must match the `_pg_boot` unpack in
+        // lib/v5/runtime_interp.py:
+        //   [0] rounds, [1] rotMod, [2] sbxNudge,
+        //   [3..7] rkLabel, [7..11] rotLabel, [11..15] sbxLabel.
+        const profileBytes = new Uint8Array(15);
+        profileBytes[0] = prof.rounds;
+        profileBytes[1] = prof.rotMod;
+        profileBytes[2] = prof.sbxNudge;
+        profileBytes.set(prof.rkLabel, 3);
+        profileBytes.set(prof.rotLabel, 7);
+        profileBytes.set(prof.sbxLabel, 11);
+        // `pep` is already the 32-byte sha256 chain result computed at the
+        // top of this function. Re-expose it here for stage2 consumption.
+        const pepBytes = pep;
+        const stage2Src = buildV5Stage2Source(
+            { n_seed, n_kd, n_dec, n_tchk },
+            {
+                prof,
+                interpLabel, irLabel, schemaLabel,
+                interpChunks, irChunks, schemaChunks,
+                envCheckVar,
+                interpCtVar, interpHashVar,
+                interpSeedVar, interpPVar, interpMarshalVar,
+                interpCodeVar, interpNsVar,
+                schemaCtVar, irCtVar,
+                bootKeyBytes,
+                pepBytes, profileBytes,
+            },
+        );
+        // Marshal stage2 to bytecode. The bytes we embed (and that stage1
+        // will `marshal.loads`) are version-locked to the Python that ran
+        // `opts.compileAndMarshal`, i.e. the same Python the end user will
+        // use to run the stub. No `compile()` call happens at stub runtime.
+        payloadBytes = opts.compileAndMarshal(stage2Src, '<pg_s2>');
+    } else {
+        payloadBytes = strToUtf8(input);
     }
-    shuffleArr(keyDecls);
+    const encUser = encrypt(payloadBytes, params2, prof);
+    const encUserB64 = bytesToBase64(encUser);
+    const userChunks = chunkB64(encUserB64, ng);
+
+    // 4. Build Stage 1 source. Runs in a namespace where the canonical
+    //    region has injected: __builtins__, the randomized `_O` tuple,
+    //    the randomized seed/kd/dec names, sys, hashlib, base64, __file__.
+    // Stage 1 anti-analysis: CRYPTOGRAPHIC BINDING.
+    //
+    // Instead of `if debugger: exit()` (trivially NOP'd), detection of
+    // analysis tools POISONS the seed used for Stage 2 key derivation.
+    // No visible error — decryption produces garbage, the decode('utf-8')
+    // fails silently, and the stub exits. An attacker who patches out
+    // the checks gets a different seed and wrong decryption.
+    //
+    // The poison is accumulated into a "taint" variable that XORs the
+    // seed. On honest runs, taint == 0 (no XOR). Under analysis, taint
+    // is non-zero, silently corrupting all downstream crypto.
+    const s1_taint = ng.gen();
+    const s1_tpois1 = randomBytes(1)[0] | 1;  // non-zero
+    const s1_tpois2 = randomBytes(1)[0] | 1;
+    const s1_tpois3 = randomBytes(1)[0] | 1;
+    const s1_tpois4 = randomBytes(1)[0] | 1;
+    const s1_tpois5 = randomBytes(1)[0] | 1;
+    const s1_tcnt = ng.gen(); // timing counter
+    const s1_tstart = ng.gen(); // timing start
+
+    const stage1Src = `${s1_b} = ${n_O}[${bi['__import__']}]('builtins')
+${s1_taint} = 0
+try:
+    ${n_O}[${bi['getattr']}](sys, 'settrace')(None)
+except Exception:
+    pass
+try:
+    ${n_O}[${bi['getattr']}](sys, 'setprofile')(None)
+except Exception:
+    pass
+if ${n_tchk}():
+    ${s1_taint} ^= ${s1_tpois1}
+if ${n_O}[${bi['getattr']}](sys, 'gettrace')() is not None:
+    ${s1_taint} ^= ${s1_tpois2}
+if ${n_O}[${bi['getattr']}](sys, 'getprofile')() is not None:
+    ${s1_taint} ^= ${s1_tpois2}
+if compile is not ${n_O}[${bi['compile']}] or getattr is not ${n_O}[${bi['getattr']}] or type is not ${n_O}[${bi['type']}]:
+    ${s1_taint} ^= ${s1_tpois3}
+if __import__ is not ${n_O}[${bi['__import__']}] or open is not ${n_O}[${bi['open']}] or exec is not ${n_O}[${bi['exec']}]:
+    ${s1_taint} ^= ${s1_tpois4}
+${s1_bn} = 'builtin_function_or_method'
+try:
+    if (compile.__class__.__name__ != ${s1_bn} or exec.__class__.__name__ != ${s1_bn} or
+        getattr.__class__.__name__ != ${s1_bn} or __import__.__class__.__name__ != ${s1_bn} or
+        open.__class__.__name__ != ${s1_bn} or
+        compile.__module__ != 'builtins' or exec.__module__ != 'builtins'):
+        ${s1_taint} ^= ${s1_tpois5}
+except Exception:
+    ${s1_taint} ^= ${s1_tpois5}
+try:
+    ${s1_tstart} = ${n_O}[${bi['__import__']}]('time').monotonic()
+except Exception:
+    ${s1_tstart} = 0
+${s1_seed2} = hashlib.sha256(bytes(a ^ ${s1_taint} for a in ${n_seed}) + bytes(${bytesArrayLit(stage2Label)})).digest()
+${s1_p2} = ${n_kd}(${s1_seed2})
+${userChunks.decls}
+${s1_S2} = base64.b64decode(${userChunks.concat})
+${s1_pt2} = ${n_dec}(${s1_S2}, ${s1_p2}[0], ${s1_p2}[1], ${s1_p2}[2])
+try:
+    if ${s1_tstart} > 0 and ${n_O}[${bi['__import__']}]('time').monotonic() - ${s1_tstart} > 2.0:
+        ${s1_pt2} = ${s1_pt2}[::-1]
+except Exception:
+    pass
+${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None, 'marshal': marshal${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
+try:
+    ${s1_co2} = marshal.loads(${s1_pt2})
+except Exception:
+    sys.exit(0)
+${n_ftype}(${s1_co2}, ${s1_uns})()
+`;
+
+    // v7: stage1 itself is marshaled (compile+marshal.dumps) so that the
+    // outer canonical region's `marshal.loads` consumes bytecode directly.
+    // No `compile()` audit event fires for stage1 source at runtime.
+    const stage1Bytes = opts && opts.v5IR && opts.compileAndMarshal
+        ? opts.compileAndMarshal(stage1Src, '<pg_s1>')
+        : strToUtf8(stage1Src);
+    const encStage1 = encrypt(stage1Bytes, params1, prof);
+    const encStage1B64 = bytesToBase64(encStage1);
+    // v5.1 / C3 — emit stage1 ciphertext chunks OUTSIDE canonical, into
+    // the stub preamble. Canonical already references them by NAME via
+    // s1Plan.concat; we now fill in the VALUES. Shuffle order so the
+    // declaration sequence does not itself fingerprint the concat order.
+    const stage1DeclsBlock = chunkB64Apply(encStage1B64, s1Plan.names);
 
     return `#!/usr/bin/env python3
 # Protected by PyGuard v5 (pyguard.avkean.com)
-${keyDecls.join("\n")}
+${stage1DeclsBlock}
 ${canonicalRegion}`;
 }

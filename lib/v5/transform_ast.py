@@ -58,6 +58,440 @@ class _NameGen:
 
 
 # ---------------------------------------------------------------------------
+# Attribute Mangler (v5.1 / C1)
+# ---------------------------------------------------------------------------
+#
+# H1 hole: `lib/v5/build_ir.py:348` writes `node.attr` (the attribute name
+# string) into the IR string pool via `self.s(node.attr)`. Attribute names
+# survive verbatim through lifting, encryption, and transport; a profile-
+# hook attack (A36) extracts the pool at runtime and recovers names like
+# `_stash_ciphertext` by grep.
+#
+# C1 rewrites every non-dunder `obj.attr` / `obj.attr = v` / `del obj.attr`
+# into `_gA(obj, K)` / `_sA(obj, K, v)` / `_dA(obj, K)` where K is a small
+# integer and the actual attribute name lives XOR-masked in a synthesized
+# module-level `_ATAB` tuple. At runtime the three helpers decode the name
+# *inline* (on the evaluation stack, NOT as a named local) and call the
+# C-level getattr/setattr/delattr — so a profile-hook sees only
+# {o, k} in f_locals, never the plaintext name.
+#
+# Why inline-decode matters: if we wrote
+#     def _gA(o, k):
+#         name = _decode(_ATAB[k])   # name is now a NAMED local
+#         return getattr(o, name)
+# then frame.f_locals at the call/return event leaks `name`. The fused
+# single-expression form keeps the decoded name only on the bytecode stack.
+#
+# Dunders are skipped: renaming `__init__`, `__len__`, etc. breaks Python
+# semantics (descriptor protocol, dataclass dunders, the class statement
+# body namespace).
+#
+# Limitations (honest disclosure):
+# - Attribute access where the attribute name is already a string literal
+#   (e.g. `getattr(obj, "x")`) is NOT mangled by this pass. Users are
+#   expected to prefer dot-syntax; literal-name getattr is a manual leak.
+# - Tuple-unpacking stores with Attribute targets fall back to a
+#   sequential rewrite via a temporary (`_t`); if rhs is an infinite
+#   iterator the behavior still completes because we list() it.
+# - AugAssign (`obj.attr += v`) expands to `_sA(obj,k,_gA(obj,k)+v)`.
+# - Method calls work naturally: `obj.m(x)` → `_gA(obj, k)(x)`.
+
+class _AttributeMangler(ast.NodeTransformer):
+    """Replace Attribute nodes with numeric-key _gA/_sA/_dA calls.
+
+    MUST run before _IdentifierRenamer so the renamer can rename the
+    synthesized helper names (`_gA`/`_sA`/`_dA`/`_ATAB`/`_AM`) into the
+    opaque-name pool consistently.
+
+    Usage:
+        mg = _AttributeMangler(ng)
+        tree = mg.visit(tree)
+        mg.inject_prelude(tree, rng)   # prepends _ATAB/_AM/_gA/_sA/_dA
+    """
+
+    def __init__(self, ng):
+        self.ng = ng
+        # attr_name -> int key
+        self._key = {}
+        self._next_key = 0
+        # How many Attribute nodes were mangled (for telemetry/tests).
+        self.mangled = 0
+        # Helper names (per-build opaque). Runs AFTER identifier
+        # renaming, so these can't clash with user names and don't
+        # need to be re-renamed. build_ir will intern them into the
+        # strings pool in their opaque form — no stable `_gA` token
+        # ever appears in the pool.
+        self.n_gA = self.ng.temp()
+        self.n_sA = self.ng.temp()
+        self.n_dA = self.ng.temp()
+        self.n_ATAB = self.ng.temp()
+        self.n_AM = self.ng.temp()
+        # C2 (ImportConcealer) shares attr-name table via `_kfor` but
+        # has its own module-path table `_IMPT` and helper `_imp`.
+        # These are lazily populated by ImportConcealer and emitted
+        # by inject_prelude if non-empty.
+        self.n_imp = self.ng.temp()
+        self.n_IMPT = self.ng.temp()
+        self._mod_key = {}      # "collections" -> int
+        self._next_mod_key = 0
+
+    # --- shared interface used by _ImportConcealer ---
+
+    def add_attr_key(self, name):
+        """Public: register an attr name (e.g. an imported name) so the
+        ImportConcealer can reuse _gA/_ATAB for it."""
+        return self._kfor(name)
+
+    def add_mod_key(self, module_path):
+        k = self._mod_key.get(module_path)
+        if k is None:
+            k = self._next_mod_key
+            self._next_mod_key += 1
+            self._mod_key[module_path] = k
+        return k
+
+    @staticmethod
+    def _is_dunder(name):
+        return bool(name) and name.startswith('__') and name.endswith('__')
+
+    def _kfor(self, attr):
+        k = self._key.get(attr)
+        if k is None:
+            k = self._next_key
+            self._next_key += 1
+            self._key[attr] = k
+        return k
+
+    # --- helpers to build call AST nodes ---
+
+    def _call(self, fname, args):
+        return ast.Call(
+            func=ast.Name(id=fname, ctx=ast.Load()),
+            args=args, keywords=[])
+
+    def _gA_call(self, value, attr):
+        return self._call(self.n_gA, [value, ast.Constant(value=self._kfor(attr))])
+
+    def _sA_call(self, obj, attr, val):
+        return self._call(self.n_sA, [obj, ast.Constant(value=self._kfor(attr)), val])
+
+    def _dA_call(self, obj, attr):
+        return self._call(self.n_dA, [obj, ast.Constant(value=self._kfor(attr))])
+
+    # --- transform Attribute in Load context ---
+
+    def visit_Attribute(self, node):
+        # Recurse first so nested attrs (a.b.c) transform bottom-up.
+        node.value = self.visit(node.value)
+        if self._is_dunder(node.attr):
+            return node
+        if isinstance(node.ctx, ast.Load):
+            self.mangled += 1
+            return self._gA_call(node.value, node.attr)
+        # Store/Del contexts are handled by the parent Assign/Delete/AugAssign
+        # visitors — leave the Attribute node intact here so those visitors
+        # can detect it. (Visit stops at Attribute in Store/Del ctx.)
+        return node
+
+    # --- Assign: rewrite `obj.attr = v` → _sA(obj, k, v) ---
+
+    def visit_Assign(self, node):
+        # Visit the rhs first — plain expression, Load ctx, safe.
+        node.value = self.visit(node.value)
+
+        # Each target is either Name/Tuple/List/Starred/Attribute/Subscript.
+        # If ANY target contains an Attribute-in-Store somewhere (including
+        # nested tuple), we need to rewrite the whole assign.
+        if not any(self._has_store_attr(t) for t in node.targets):
+            # Recurse normally into targets (Subscripts with Load-context
+            # sub-expressions need visiting).
+            node.targets = [self.visit(t) for t in node.targets]
+            return node
+
+        # Rewrite: `_t = value` then one _sA / assign per target element.
+        tname = self.ng.temp()
+        out = [ast.Assign(
+            targets=[ast.Name(id=tname, ctx=ast.Store())],
+            value=node.value)]
+        for tgt in node.targets:
+            out.extend(self._emit_store(tgt, ast.Name(id=tname, ctx=ast.Load())))
+        return out
+
+    def _has_store_attr(self, target):
+        """True if `target` (or any nested target) contains an Attribute
+        node in Store context."""
+        for n in ast.walk(target):
+            if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store):
+                if not self._is_dunder(n.attr):
+                    return True
+        return False
+
+    def _emit_store(self, target, value_ast):
+        """Emit statements that store `value_ast` into `target`, using
+        _sA for Attribute leaves and regular Assign for everything else.
+        Handles Name/Tuple/List/Starred/Attribute/Subscript."""
+        if isinstance(target, ast.Attribute) and isinstance(target.ctx, ast.Store):
+            if self._is_dunder(target.attr):
+                return [ast.Assign(targets=[target], value=value_ast)]
+            obj = self.visit(target.value)
+            return [ast.Expr(value=self._sA_call(obj, target.attr, value_ast))]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            # List-ify the rhs once (supports iterators) then index per-elt.
+            # Starred elements: handled by letting Python unpack via a
+            # plain assign that reconstructs the star form (we can't easily
+            # index around a star). In that case fall back to one assign
+            # to a list-of-stores that Python evaluates natively.
+            if any(isinstance(e, ast.Starred) for e in target.elts):
+                # Fall back: single Assign with the (possibly-Attribute-
+                # containing) target preserved — attr name leaks, rare case.
+                return [ast.Assign(targets=[target], value=value_ast)]
+            tlist = self.ng.temp()
+            stmts = [ast.Assign(
+                targets=[ast.Name(id=tlist, ctx=ast.Store())],
+                value=ast.Call(func=ast.Name(id='list', ctx=ast.Load()),
+                               args=[value_ast], keywords=[]))]
+            for i, elt in enumerate(target.elts):
+                idx_val = ast.Subscript(
+                    value=ast.Name(id=tlist, ctx=ast.Load()),
+                    slice=ast.Constant(value=i),
+                    ctx=ast.Load())
+                stmts.extend(self._emit_store(elt, idx_val))
+            return stmts
+        # Name / Subscript / others — normal assign, but visit value context.
+        return [ast.Assign(targets=[target], value=value_ast)]
+
+    def visit_AugAssign(self, node):
+        # `obj.attr OP= v`  →  `_sA(obj, k, _gA(obj, k) OP v)`
+        # `name OP= v`  →  untouched (no Attribute)
+        # `subscript OP= v`  →  untouched (no Attribute)
+        node.value = self.visit(node.value)
+        tgt = node.target
+        if isinstance(tgt, ast.Attribute) and isinstance(tgt.ctx, ast.Store) \
+                and not self._is_dunder(tgt.attr):
+            obj = self.visit(tgt.value)
+            # Need a fresh temp for `obj` so we don't evaluate it twice
+            # (side-effects).
+            tname = self.ng.temp()
+            stmts = [ast.Assign(
+                targets=[ast.Name(id=tname, ctx=ast.Store())],
+                value=obj)]
+            get_expr = self._gA_call(ast.Name(id=tname, ctx=ast.Load()), tgt.attr)
+            new_val = ast.BinOp(left=get_expr, op=node.op, right=node.value)
+            stmts.append(ast.Expr(value=self._sA_call(
+                ast.Name(id=tname, ctx=ast.Load()), tgt.attr, new_val)))
+            return stmts
+        # Fall through — visit children
+        self.generic_visit(node)
+        return node
+
+    # --- Delete: `del obj.attr` → _dA(obj, k) ---
+
+    def visit_Delete(self, node):
+        new_targets = []
+        extra = []
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Attribute) and isinstance(tgt.ctx, ast.Del) \
+                    and not self._is_dunder(tgt.attr):
+                obj = self.visit(tgt.value)
+                extra.append(ast.Expr(value=self._dA_call(obj, tgt.attr)))
+            else:
+                new_targets.append(self.visit(tgt))
+        if extra and new_targets:
+            return [ast.Delete(targets=new_targets)] + extra
+        if extra:
+            return extra
+        return node
+
+    # --- prelude injection ---
+
+    @staticmethod
+    def _masked_bytes_node(b, mask):
+        masked = bytes(c ^ mask[i & 15] for i, c in enumerate(b))
+        return ast.Call(
+            func=ast.Name(id='bytes', ctx=ast.Load()),
+            args=[ast.List(
+                elts=[ast.Constant(value=x) for x in masked],
+                ctx=ast.Load())],
+            keywords=[])
+
+    def inject_prelude(self, tree, rng):
+        """Prepend C1 (+ optional C2) helper definitions to module body.
+
+        `rng` must be a random.Random-compatible object.
+
+        Always emitted (if any attr was mangled OR any import concealed):
+            _AM     = bytes([..16 random..])
+            _ATAB   = (masked attr name 0, masked attr name 1, ...)
+            def _gA(o, k): ...        # decode + getattr
+            def _sA(o, k, v): ...      # decode + setattr
+            def _dA(o, k): ...          # decode + delattr
+
+        Emitted only when C2 registered module paths:
+            _IMPT   = (masked module path 0, masked module path 1, ...)
+            def _imp(k): return __import__(decode(_IMPT[k]))
+        """
+        if not self._key and not self._mod_key:
+            return  # nothing to do
+        if not isinstance(tree, ast.Module):
+            return
+
+        mask = bytes(rng.randint(0, 255) for _ in range(16))
+
+        prelude_body = []
+
+        # _AM = bytes([...16 random...])
+        prelude_body.append(ast.Assign(
+            targets=[ast.Name(id=self.n_AM, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id='bytes', ctx=ast.Load()),
+                args=[ast.List(
+                    elts=[ast.Constant(value=b) for b in mask],
+                    ctx=ast.Load())],
+                keywords=[])))
+
+        # _ATAB is required even if empty (in case only imports were
+        # registered) — keep _gA/_sA/_dA definitions self-contained.
+        ordered_attr = sorted(self._key.items(), key=lambda kv: kv[1])
+        atab_entries = [self._masked_bytes_node(name.encode('utf-8'), mask)
+                        for name, _k in ordered_attr]
+        prelude_body.append(ast.Assign(
+            targets=[ast.Name(id=self.n_ATAB, ctx=ast.Store())],
+            value=ast.Tuple(elts=atab_entries, ctx=ast.Load())))
+
+        attr_helpers_src = (
+            f'def {self.n_gA}(_o, _k):\n'
+            f'    return getattr(_o, bytes(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode())\n'
+            f'def {self.n_sA}(_o, _k, _v):\n'
+            f'    setattr(_o, bytes(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode(), _v)\n'
+            f'def {self.n_dA}(_o, _k):\n'
+            f'    delattr(_o, bytes(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode())\n'
+        )
+        prelude_body.extend(ast.parse(attr_helpers_src).body)
+
+        # C2: emit _IMPT + _imp only if any import was concealed.
+        if self._mod_key:
+            ordered_mod = sorted(self._mod_key.items(), key=lambda kv: kv[1])
+            impt_entries = [self._masked_bytes_node(path.encode('utf-8'), mask)
+                            for path, _k in ordered_mod]
+            prelude_body.append(ast.Assign(
+                targets=[ast.Name(id=self.n_IMPT, ctx=ast.Store())],
+                value=ast.Tuple(elts=impt_entries, ctx=ast.Load())))
+            # fromlist=('_',) is the minimum incantation that makes
+            # __import__('X.Y', …) return the submodule X.Y rather than
+            # the top-level X. A non-empty fromlist triggers submodule
+            # semantics; '_' is a common name that may exist in some
+            # modules but harmless when missing (fromlist is lenient).
+            imp_src = (
+                f'def {self.n_imp}(_k):\n'
+                f'    return __import__(bytes(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_IMPT}[_k])).decode(), None, None, (\'_\',), 0)\n'
+            )
+            prelude_body.extend(ast.parse(imp_src).body)
+
+        tree.body = prelude_body + tree.body
+        ast.fix_missing_locations(tree)
+
+
+# ---------------------------------------------------------------------------
+# Import Concealment (C2)
+# ---------------------------------------------------------------------------
+
+class _ImportConcealer(ast.NodeTransformer):
+    """Rewrite `import X` / `from X import Y` into opaque-key lookups.
+
+    Shares state with _AttributeMangler:
+      - Module paths are interned into `_IMPT` (mangler.add_mod_key)
+      - Imported names are interned into the same `_ATAB` used for
+        attribute access (mangler.add_attr_key), so a single table hides
+        both surfaces.
+
+    Transforms:
+      import X                    →  X = _imp(k_X)            # k_X in _IMPT
+      import X as Y               →  Y = _imp(k_X)
+      import X.Y as Z             →  Z = _imp(k_XY)           # fromlist → submod
+      from X import Y             →  _t = _imp(k_X); Y = _gA(_t, k_Y)
+      from X import Y as Z        →  _t = _imp(k_X); Z = _gA(_t, k_Y)
+      from X import Y1, Y2        →  _t = _imp(k_X); Y1=_gA(_t,k1); Y2=_gA(_t,k2)
+      from X.Y import Z           →  _t = _imp(k_XY); Z = _gA(_t, k_Z)
+
+    Not transformed (left structurally intact — rare / complex):
+      import X.Y                  (no asname; binds top-level X)
+      from . import X             (relative; level > 0)
+      from X import *             (star; __all__ semantics)
+
+    Must run AFTER _IdentifierRenamer so that `alias.asname` already
+    reflects the final (renamed) local binding — otherwise the assignment
+    target would be the pre-rename plaintext name and the renamer's map
+    wouldn't apply.
+    """
+
+    def __init__(self, ng, mangler):
+        self.ng = ng
+        self.mangler = mangler
+        self.concealed = 0
+
+    def visit_Import(self, node):
+        out = []
+        leftover = []
+        for alias in node.names:
+            # asname present if the renamer tagged one (it does for all
+            # non-dotted imports), else we bind the original name.
+            mod = alias.name
+            if '.' in mod and not alias.asname:
+                # `import X.Y` with no asname binds `X` (top-level). Our
+                # `_imp` helper returns the deepest submodule (X.Y), which
+                # doesn't match that semantic. Leave this intact.
+                leftover.append(alias)
+                continue
+            if not mod:
+                leftover.append(alias)
+                continue
+            local = alias.asname if alias.asname else mod
+            mod_key = self.mangler.add_mod_key(mod)
+            out.append(ast.Assign(
+                targets=[ast.Name(id=local, ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Name(id=self.mangler.n_imp, ctx=ast.Load()),
+                    args=[ast.Constant(value=mod_key)],
+                    keywords=[])))
+            self.concealed += 1
+        if leftover:
+            out.insert(0, ast.Import(names=leftover))
+        return out if out else node
+
+    def visit_ImportFrom(self, node):
+        # Relative imports: skip. `__import__` with level>0 needs the
+        # caller's __package__ and a valid globals dict; safer to leave
+        # them as plaintext.
+        if node.level and node.level > 0:
+            return node
+        if not node.module:
+            return node
+        # `from X import *`: __all__ semantics not worth replicating.
+        if any(a.name == '*' for a in node.names):
+            return node
+        mod_key = self.mangler.add_mod_key(node.module)
+        tname = self.ng.temp()
+        stmts = [ast.Assign(
+            targets=[ast.Name(id=tname, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id=self.mangler.n_imp, ctx=ast.Load()),
+                args=[ast.Constant(value=mod_key)],
+                keywords=[]))]
+        for alias in node.names:
+            name_key = self.mangler.add_attr_key(alias.name)
+            local = alias.asname if alias.asname else alias.name
+            stmts.append(ast.Assign(
+                targets=[ast.Name(id=local, ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Name(id=self.mangler.n_gA, ctx=ast.Load()),
+                    args=[ast.Name(id=tname, ctx=ast.Load()),
+                          ast.Constant(value=name_key)],
+                    keywords=[])))
+            self.concealed += 1
+        return stmts
+
+
+# ---------------------------------------------------------------------------
 # Identifier Renaming
 # ---------------------------------------------------------------------------
 
@@ -2116,6 +2550,29 @@ def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=Tr
         renamer = _IdentifierRenamer(ng)
         renamer.prepare(tree)
         tree = renamer.visit(tree)
+        ast.fix_missing_locations(tree)
+
+    # v5.1 / C1: mangle attribute access into _gA/_sA/_dA calls keyed by
+    # small ints, with real names XOR-masked in a synthesized `_ATAB`
+    # tuple. Must run AFTER identifier renaming — otherwise the renamer
+    # sees zero Attribute nodes (we replaced them all with Calls) and
+    # proceeds to rename method definitions like `def unlock():` whose
+    # callers no longer match. By running the mangler SECOND, the
+    # renamer already preserved method names via its `_attr_names`
+    # collection pass, and the mangler's helper names (self.n_gA etc.)
+    # are already opaque temps (allocated via `ng.temp()`) so they
+    # won't be re-renamed and won't clash with user identifiers.
+    if rename_identifiers and isinstance(tree, ast.Module):
+        mangler = _AttributeMangler(ng)
+        tree = mangler.visit(tree)
+        # C2: conceal imports by routing them through _imp (module paths
+        # in _IMPT) and _gA (imported names reuse _ATAB). Runs BEFORE
+        # inject_prelude so registered module keys show up in the emitted
+        # _IMPT tuple. Shares mangler state so `from X import Y` reuses
+        # the attr-table index allocator rather than fighting for a
+        # separate keyspace.
+        tree = _ImportConcealer(ng, mangler).visit(tree)
+        mangler.inject_prelude(tree, ng._rng)
         ast.fix_missing_locations(tree)
 
     tree = _ExprDecomposer(ng).visit(tree)
