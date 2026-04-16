@@ -16,7 +16,7 @@ export default function Footer() {
         <span className="hidden sm:inline text-ink-dim">
           Obfuscation is not encryption.{" "}
           <a
-            href="https://github.com/InsanelyAvner/pyguard#security-what-pyguard-actually-defends-against"
+            href="https://github.com/avkean/pyguard#honest-limits"
             target="_blank"
             rel="noreferrer"
             className="text-ink-muted hover:text-ink underline underline-offset-2 decoration-line-strong transition-colors"

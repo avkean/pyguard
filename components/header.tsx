@@ -21,13 +21,13 @@ export default function Header() {
             pyguard
           </span>
           <span className="hidden sm:inline ml-2 text-[10.5px] font-mono text-ink-dim tracking-wider">
-            v5.2
+            v0.6.4
           </span>
         </Link>
 
         <nav className="flex items-center gap-1">
           <a
-            href="https://github.com/InsanelyAvner/pyguard"
+            href="https://github.com/avkean/pyguard"
             target="_blank"
             rel="noopener noreferrer"
             aria-label="GitHub"

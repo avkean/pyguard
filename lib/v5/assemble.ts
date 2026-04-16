@@ -149,13 +149,24 @@ export function buildV5Stage2Source(
     const pepLit = bytesArrayLit(pepBytes);
     const profileLit = bytesArrayLit(profileBytes);
 
-    return `# PyGuard v7 stage2 (marshaled): generic AST interpreter + encrypted+compressed IR.
-# No user source is compiled by this program at any point. The interpreter
-# is loaded via marshal.loads (not compile), the schema is decrypted inside
-# the interpreter's own boot frame (never stage2 globals), and the IR is
-# walked by an in-memory tree the attacker cannot lift without decompiling
-# the marshaled interpreter first.
-import sys
+    // Stage2 source (marshaled before shipping):
+    //   - no user source is compile()d here — the interpreter is
+    //     marshal.loads'd so no PEP-578 compile audit event fires
+    //   - the schema is decrypted inside the interpreter's own boot
+    //     frame, never in stage2 globals (no settrace-at-globals leak)
+    //   - FunctionType is recovered via (lambda: 0).__class__ — a C-slot
+    //     read on object.__class__ (Py_TYPE) that routes around both
+    //     'from types import FunctionType' (rebindable module attr) and
+    //     'type(lambda: 0)' (rebindable builtins.type). Mutating
+    //     FT.__name__/__module__ is possible but the envCheck witnesses
+    //     fold those attributes into the key, silently poisoning the seed.
+    //   - envCheck witnesses below include type-identity checks on every
+    //     trace-surface builtin (settrace/setprofile/gettrace/getprofile/
+    //     exec/marshal.loads/hashlib.scrypt) against zlib.decompress, so
+    //     any Python-level wrapper flips the 'function' vs
+    //     'builtin_function_or_method' discriminator.
+    // Keep this Python code-only — no # comments in the emitted stub.
+    return `import sys
 import hashlib
 import base64
 import zlib
@@ -170,16 +181,6 @@ except Exception:
     pass
 if ${n_tchk}():
     raise SystemExit(0)
-# v6.1 / C7.2: recover FunctionType via (lambda: 0).__class__ — a slot
-# read (object.__class__ descriptor -> Py_TYPE) that routes around both
-#   (a) 'from types import FunctionType'  (C7.0 hole: types-module rebind)
-#   (b) 'type(lambda: 0)'                  (C7.1 hole: builtins.type rebind
-#                                           returning a singleton proxy)
-# Py_TYPE is a C-level macro on the object header and does not consult
-# any Python-level name. An attacker cannot intercept it without patching
-# CPython itself. (They could mutate types.FunctionType.__name__ to
-# corrupt the witnesses below, but envCheck hashes those witnesses into
-# the key derivation so any mutation silently poisons the seed.)
 ${interpFTVar} = (lambda: 0).__class__
 ${envCheckVar} = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), ${interpFTVar}.__name__, str(${interpFTVar} is (lambda: None).__class__), ${interpFTVar}.__class__.__name__, ${interpFTVar}.__module__]).encode()).digest()
 ${interpChunks.decls}

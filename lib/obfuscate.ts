@@ -935,6 +935,27 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     //   ${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg}).digest()
     // and consumed against the stage1 chunk names, whose values live in
     // the stub preamble (outside canonical).
+    //
+    // IMPORTANT: do NOT embed # Python comments inside the template
+    // literal below — anything that ships in the canonical region
+    // doubles as a free defense map for attackers (citing attack file
+    // paths, bit layouts, version numbers). Keep rationale in these
+    // TS-side // comments; the emitted Python stays code-only.
+    //
+    // Witness bytes folded into the seed (all yield 0x00 in a clean env):
+    //   n_mon (C8): bitmap of sys.monitoring tool_ids 0..5 busy; sweep
+    //     uses use_tool_id+set_events(0)+free_tool_id which ValueErrors
+    //     on any slot an attacker pre-reserved.
+    //   n_hk (C9): low nibble = len(gc.callbacks) & 0x0F; bit 6 =
+    //     gc.get_debug() nonzero; bit 5 = tracemalloc.is_tracing().
+    //   n_sg (C10/C11): signal/faulthandler/excepthook composite —
+    //     bit 0 SIGPROF != SIG_DFL, bits 1-3 ITIMER_{PROF,VIRTUAL,REAL}
+    //     armed, bit 4 faulthandler.is_enabled(), bit 5 SIGUSR1/2 handler
+    //     callable, bit 6 SIGXCPU/FSZ handler callable (uses callable()
+    //     because SIGXFSZ defaults to SIG_IGN not SIG_DFL on POSIX),
+    //     bit 7 sys.excepthook/unraisablehook replaced.
+    // Any bit flip → seed diverges → silent AES-CTR garbage → marshal
+    // fails → SystemExit(0) before interpreter bytecode runs.
     const canonicalRegion =
 `${BEGIN_MARKER}
 import sys, hashlib, base64, marshal
@@ -949,16 +970,6 @@ try:
     ${n_O}[${bi['getattr']}](sys, 'setprofile')(None)
 except Exception:
     pass
-# v6.1 / C8: clear sys.monitoring (PEP 669, Python 3.12+). This API is
-# ORTHOGONAL to settrace/setprofile — callbacks fire on every PY_START/
-# PY_RETURN without routing through sys.gettrace(). Before C8, an
-# attacker who registered a monitoring tool BEFORE running the stub
-# observed every frame's f_locals inside the interpreter (the _SttR
-# return path leaked decoded user strings like 'hello world'). Here we
-# sweep all 6 tool slots: if we can take_tool_id + set_events(0) +
-# free_tool_id the slot was empty (clean); if ValueError the attacker
-# owns it (busy). The bitmap goes into ${n_mon} and then into the key
-# seed below — any busy slot silently corrupts the derived key.
 try:
     ${n_mon_var} = sys.monitoring
     ${n_mon_busy} = 0
@@ -972,15 +983,6 @@ try:
     ${n_mon} = bytes([${n_mon_busy} & 0xFF])
 except AttributeError:
     ${n_mon} = bytes([0])
-# v6.2 / C9: orthogonal-hook witness. gc.callbacks + tracemalloc tracing
-# are trace surfaces that bypass settrace/setprofile/monitoring entirely.
-# An attacker that appends a gc.callbacks entry BEFORE running the stub
-# gets invoked at every GC cycle during user execution and can walk
-# gc.get_objects() + get_referents() to snapshot decoded user-source
-# strings live in memory (see tests/pentest/c9_attack_gc_walk.py). We
-# pack a witness byte over these surfaces and fold it into the seed —
-# any pre-installed callback or active tracer flips a bit, seed diverges,
-# decryption silently fails before interpreter bytecode ever runs.
 try:
     import gc as ${n_hk_gc}
     ${n_hk_acc} = len(${n_hk_gc}.callbacks) & 0x0F
@@ -995,38 +997,6 @@ try:
 except Exception:
     pass
 ${n_hk} = bytes([${n_hk_acc} & 0xFF])
-# v6.3 / C10 + v6.4 / C11: signal / faulthandler / excepthook witness.
-# SIGPROF + ITIMER_PROF is a C-level trace surface that bypasses
-# settrace/setprofile/monitoring/gc. An attacker installs
-# signal.signal(SIGPROF, spy) + setitimer from sitecustomize; the
-# handler fires between bytecodes and walks sys._current_frames() to
-# dump f_locals of <pg_*> frames without any Python-level trace hook
-# ever being installed (see
-# tests/pentest/c10_attack_faulthandler_sigprof.py).
-#
-# v6.4 / C11 extends the witness to cover the unaudited signals and
-# exception-hook surfaces: an attacker registers sys.excepthook = spy
-# + installs SIGUSR1/SIGUSR2/SIGXCPU/SIGXFSZ handlers that call
-# _thread.interrupt_main() from a poller thread; KeyboardInterrupt is a
-# BaseException, NOT Exception, so the stub's 'except Exception:'
-# clauses let it propagate to CPython's top-level → sys.excepthook
-# dumps every traceback frame's f_locals (see
-# tests/pentest/c11_attack_excepthook_sigxcpu.py). sys.unraisablehook
-# is the parallel surface for exceptions during GC/finalizer callbacks.
-#
-# Bits packed into n_sg:
-#   bit 0: SIGPROF handler  != SIG_DFL
-#   bit 1: ITIMER_PROF armed
-#   bit 2: ITIMER_VIRTUAL armed
-#   bit 3: ITIMER_REAL armed
-#   bit 4: faulthandler.is_enabled()
-#   bit 5: SIGUSR1 or SIGUSR2 handler != SIG_DFL      (C11)
-#   bit 6: SIGXCPU or SIGXFSZ handler != SIG_DFL      (C11)
-#   bit 7: sys.excepthook or sys.unraisablehook       (C11)
-#          != sys.__excepthook__/__unraisablehook__
-# Any flip → seed diverges → silent decrypt failure before the first
-# sampler or signal interrupt lands. Probing the signal/sys modules
-# themselves doesn't install a handler, so a clean env yields 0x00.
 try:
     import signal as ${n_sg_sig}
     ${n_sg_acc} = 0
@@ -1038,12 +1008,6 @@ try:
         ${n_sg_acc} |= 0x04
     if ${n_sg_sig}.getitimer(${n_sg_sig}.ITIMER_REAL)[0] > 0:
         ${n_sg_acc} |= 0x08
-    # C11: unaudited signals attackers use with _thread.interrupt_main
-    # to force a KeyboardInterrupt that escapes 'except Exception:'.
-    # Use callable() rather than "is not SIG_DFL" because some signals
-    # (e.g. SIGXFSZ on macOS/Linux) default to SIG_IGN (1) not SIG_DFL
-    # (0). A user-installed handler is always callable; SIG_DFL and
-    # SIG_IGN are sentinel integers.
     for _pg_sg_name in ('SIGUSR1', 'SIGUSR2'):
         _pg_sg_sn = getattr(${n_sg_sig}, _pg_sg_name, None)
         if _pg_sg_sn is not None and callable(${n_sg_sig}.getsignal(_pg_sg_sn)):
@@ -1063,9 +1027,6 @@ try:
         ${n_sg_acc} |= 0x10
 except Exception:
     pass
-# C11: sys.excepthook / sys.unraisablehook — attacker-replacement
-# captures full traceback f_locals when any BaseException escapes the
-# stub's 'except Exception:' envelope.
 try:
     if sys.excepthook is not sys.__excepthook__:
         ${n_sg_acc} |= 0x80
