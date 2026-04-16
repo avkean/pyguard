@@ -77,6 +77,7 @@ export interface AssembleCipher {
     interpMarshalVar: string; // decrypted marshal bytes
     interpCodeVar: string;    // marshal.loads result (code object)
     interpNsVar: string;      // isolated namespace for interpreter exec
+    interpFTVar: string;      // FunctionType recovered via `type(lambda:0)` — bypasses types.FunctionType hook (C7.1)
     schemaCtVar: string;
     irCtVar: string;
     // v9: randomized bytes-key under which the interpreter module
@@ -134,7 +135,7 @@ export function buildV5Stage2Source(
         interpChunks, irChunks, schemaChunks,
         envCheckVar,
         interpCtVar, interpHashVar,
-        interpSeedVar, interpPVar, interpMarshalVar, interpCodeVar, interpNsVar,
+        interpSeedVar, interpPVar, interpMarshalVar, interpCodeVar, interpNsVar, interpFTVar,
         schemaCtVar, irCtVar,
         bootKeyBytes,
         pepBytes, profileBytes,
@@ -159,7 +160,6 @@ import hashlib
 import base64
 import zlib
 import marshal
-from types import FunctionType
 try:
     sys.settrace(None)
 except Exception:
@@ -170,9 +170,20 @@ except Exception:
     pass
 if ${n_tchk}():
     raise SystemExit(0)
-${envCheckVar} = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress))]).encode()).digest()
+# v6.1 / C7.2: recover FunctionType via (lambda: 0).__class__ — a slot
+# read (object.__class__ descriptor -> Py_TYPE) that routes around both
+#   (a) 'from types import FunctionType'  (C7.0 hole: types-module rebind)
+#   (b) 'type(lambda: 0)'                  (C7.1 hole: builtins.type rebind
+#                                           returning a singleton proxy)
+# Py_TYPE is a C-level macro on the object header and does not consult
+# any Python-level name. An attacker cannot intercept it without patching
+# CPython itself. (They could mutate types.FunctionType.__name__ to
+# corrupt the witnesses below, but envCheck hashes those witnesses into
+# the key derivation so any mutation silently poisons the seed.)
+${interpFTVar} = (lambda: 0).__class__
+${envCheckVar} = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), ${interpFTVar}.__name__, str(${interpFTVar} is (lambda: None).__class__), ${interpFTVar}.__class__.__name__, ${interpFTVar}.__module__]).encode()).digest()
 ${interpChunks.decls}
-${interpCtVar} = base64.b64decode(${interpChunks.concat})
+${interpCtVar} = base64.b85decode(${interpChunks.concat})
 ${interpHashVar} = hashlib.sha256(${interpCtVar}).digest()
 ${interpSeedVar} = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(interpLabel)})).digest(), ${envCheckVar}))
 ${interpPVar} = ${n_kd}(${interpSeedVar})
@@ -180,11 +191,11 @@ ${interpMarshalVar} = zlib.decompress(${n_dec}(${interpCtVar}, ${interpPVar}[0],
 ${interpCodeVar} = marshal.loads(${interpMarshalVar})
 ${interpNsVar} = {bytes([95, 95, 98, 117, 105, 108, 116, 105, 110, 115, 95, 95]).decode(): __builtins__, bytes([95, 95, 110, 97, 109, 101, 95, 95]).decode(): bytes([60, 112, 103, 95, 105, 62]).decode()}
 ${schemaChunks.decls}
-${schemaCtVar} = base64.b64decode(${schemaChunks.concat})
+${schemaCtVar} = base64.b85decode(${schemaChunks.concat})
 ${irChunks.decls}
-${irCtVar} = base64.b64decode(${irChunks.concat})
+${irCtVar} = base64.b85decode(${irChunks.concat})
 ${interpNsVar}[bytes(${bootKeyLit})] = (${schemaCtVar}, bytes(${bytesArrayLit(schemaLabel)}), ${irCtVar}, bytes(${bytesArrayLit(irLabel)}), ${n_seed}, ${interpHashVar}, ${envCheckVar}, bytes(${pepLit}), bytes(${profileLit}), bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode())
-FunctionType(${interpCodeVar}, ${interpNsVar})()
+${interpFTVar}(${interpCodeVar}, ${interpNsVar})()
 del ${interpMarshalVar}, ${interpCodeVar}, ${interpCtVar}
 `;
 }

@@ -223,6 +223,51 @@ function bytesToBase64(bytes: Uint8Array): string {
     return Buffer.from(s, "binary").toString("base64");
 }
 
+// O5 (2026-04-16): RFC-1924 base85 ("b85") encoder matching Python's
+// `base64.b85encode(data, pad=False)`. Alphabet is 85 chars selected to
+// be safe inside a Python `"..."` literal — no `"` or `\` or `'`. 85^5
+// = 4.43B per 5 chars (for 4 bytes), giving a 5/4 expansion ratio vs
+// base64's 4/3 — ~6.25% denser. Saves ~14 KB per stub on the ~200 KB
+// of ciphertext chunks the outer stub carries. Partial trailing
+// bytes encode as `rem+1` chars, matching Python's `pad=False` mode.
+const _B85_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+    "abcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+
+function bytesToBase85(bytes: Uint8Array): string {
+    const out: string[] = [];
+    const fullChunks = Math.floor(bytes.length / 4);
+    for (let i = 0; i < fullChunks; i++) {
+        const base = i * 4;
+        // Use regular arithmetic, not bit-shift, to stay in unsigned
+        // 32-bit range (JS bit-shifts are signed).
+        let n = bytes[base] * 16777216 +
+                bytes[base + 1] * 65536 +
+                bytes[base + 2] * 256 +
+                bytes[base + 3];
+        const chars = ["", "", "", "", ""];
+        for (let j = 4; j >= 0; j--) {
+            chars[j] = _B85_ALPHABET[n % 85];
+            n = Math.floor(n / 85);
+        }
+        out.push(chars.join(""));
+    }
+    const rem = bytes.length - fullChunks * 4;
+    if (rem > 0) {
+        const base = fullChunks * 4;
+        let n = 0;
+        for (let k = 0; k < 4; k++) {
+            n = n * 256 + (k < rem ? bytes[base + k] : 0);
+        }
+        const chars = ["", "", "", "", ""];
+        for (let j = 4; j >= 0; j--) {
+            chars[j] = _B85_ALPHABET[n % 85];
+            n = Math.floor(n / 85);
+        }
+        out.push(chars.slice(0, rem + 1).join(""));
+    }
+    return out.join("");
+}
+
 function randomBytes(n: number): Uint8Array {
     const out = new Uint8Array(n);
     const g: any = typeof globalThis !== "undefined" ? globalThis : {};
@@ -752,6 +797,18 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_te       = ng.gen(); // traceback helper exception
     const n_ttb      = ng.gen(); // traceback helper tb
     const n_tfr      = ng.gen(); // traceback helper frame
+    const n_mon      = ng.gen(); // sys.monitoring busy-slot fingerprint (C8)
+    const n_mon_var  = ng.gen(); // sys.monitoring module alias
+    const n_mon_busy = ng.gen(); // sys.monitoring busy-slot bitmap
+    const n_mon_i    = ng.gen(); // sys.monitoring loop counter
+    const n_hk       = ng.gen(); // C9 orthogonal-hook witness byte
+    const n_hk_acc   = ng.gen(); // C9 accumulator
+    const n_hk_gc    = ng.gen(); // C9 gc module alias
+    const n_hk_tm    = ng.gen(); // C9 tracemalloc module alias
+    const n_sg       = ng.gen(); // C10 signal/faulthandler witness byte
+    const n_sg_acc   = ng.gen(); // C10 accumulator
+    const n_sg_sig   = ng.gen(); // C10 signal module alias
+    const n_sg_fh    = ng.gen(); // C10 faulthandler module alias
 
     // _kd internal names
     const k_seed     = ng.gen();
@@ -875,13 +932,13 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // NAMES (n_seed, n_h, n_pep, s1Plan.concat) and deterministic byte
     // literals. Does NOT embed seed or seed-derived ciphertext; those
     // are derived at runtime inside canonical via
-    //   ${n_seed} = hashlib.sha256(${n_h} + ${n_pep}).digest()
+    //   ${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg}).digest()
     // and consumed against the stage1 chunk names, whose values live in
     // the stub preamble (outside canonical).
     const canonicalRegion =
 `${BEGIN_MARKER}
 import sys, hashlib, base64, marshal
-${n_ftype} = type(lambda: 0)
+${n_ftype} = (lambda: 0).__class__
 ${n_O} = ${bcap.tupleSource}
 ${n_gf} = ${n_O}[${bi['getattr']}](sys, '_getf' + 'rame')
 try:
@@ -892,6 +949,134 @@ try:
     ${n_O}[${bi['getattr']}](sys, 'setprofile')(None)
 except Exception:
     pass
+# v6.1 / C8: clear sys.monitoring (PEP 669, Python 3.12+). This API is
+# ORTHOGONAL to settrace/setprofile — callbacks fire on every PY_START/
+# PY_RETURN without routing through sys.gettrace(). Before C8, an
+# attacker who registered a monitoring tool BEFORE running the stub
+# observed every frame's f_locals inside the interpreter (the _SttR
+# return path leaked decoded user strings like 'hello world'). Here we
+# sweep all 6 tool slots: if we can take_tool_id + set_events(0) +
+# free_tool_id the slot was empty (clean); if ValueError the attacker
+# owns it (busy). The bitmap goes into ${n_mon} and then into the key
+# seed below — any busy slot silently corrupts the derived key.
+try:
+    ${n_mon_var} = sys.monitoring
+    ${n_mon_busy} = 0
+    for ${n_mon_i} in range(6):
+        try:
+            ${n_mon_var}.use_tool_id(${n_mon_i}, 'pg')
+            ${n_mon_var}.set_events(${n_mon_i}, 0)
+            ${n_mon_var}.free_tool_id(${n_mon_i})
+        except Exception:
+            ${n_mon_busy} |= (1 << ${n_mon_i})
+    ${n_mon} = bytes([${n_mon_busy} & 0xFF])
+except AttributeError:
+    ${n_mon} = bytes([0])
+# v6.2 / C9: orthogonal-hook witness. gc.callbacks + tracemalloc tracing
+# are trace surfaces that bypass settrace/setprofile/monitoring entirely.
+# An attacker that appends a gc.callbacks entry BEFORE running the stub
+# gets invoked at every GC cycle during user execution and can walk
+# gc.get_objects() + get_referents() to snapshot decoded user-source
+# strings live in memory (see tests/pentest/c9_attack_gc_walk.py). We
+# pack a witness byte over these surfaces and fold it into the seed —
+# any pre-installed callback or active tracer flips a bit, seed diverges,
+# decryption silently fails before interpreter bytecode ever runs.
+try:
+    import gc as ${n_hk_gc}
+    ${n_hk_acc} = len(${n_hk_gc}.callbacks) & 0x0F
+    if ${n_hk_gc}.get_debug():
+        ${n_hk_acc} |= 0x40
+except Exception:
+    ${n_hk_acc} = 0
+try:
+    import tracemalloc as ${n_hk_tm}
+    if ${n_hk_tm}.is_tracing():
+        ${n_hk_acc} |= 0x20
+except Exception:
+    pass
+${n_hk} = bytes([${n_hk_acc} & 0xFF])
+# v6.3 / C10 + v6.4 / C11: signal / faulthandler / excepthook witness.
+# SIGPROF + ITIMER_PROF is a C-level trace surface that bypasses
+# settrace/setprofile/monitoring/gc. An attacker installs
+# signal.signal(SIGPROF, spy) + setitimer from sitecustomize; the
+# handler fires between bytecodes and walks sys._current_frames() to
+# dump f_locals of <pg_*> frames without any Python-level trace hook
+# ever being installed (see
+# tests/pentest/c10_attack_faulthandler_sigprof.py).
+#
+# v6.4 / C11 extends the witness to cover the unaudited signals and
+# exception-hook surfaces: an attacker registers sys.excepthook = spy
+# + installs SIGUSR1/SIGUSR2/SIGXCPU/SIGXFSZ handlers that call
+# _thread.interrupt_main() from a poller thread; KeyboardInterrupt is a
+# BaseException, NOT Exception, so the stub's 'except Exception:'
+# clauses let it propagate to CPython's top-level → sys.excepthook
+# dumps every traceback frame's f_locals (see
+# tests/pentest/c11_attack_excepthook_sigxcpu.py). sys.unraisablehook
+# is the parallel surface for exceptions during GC/finalizer callbacks.
+#
+# Bits packed into n_sg:
+#   bit 0: SIGPROF handler  != SIG_DFL
+#   bit 1: ITIMER_PROF armed
+#   bit 2: ITIMER_VIRTUAL armed
+#   bit 3: ITIMER_REAL armed
+#   bit 4: faulthandler.is_enabled()
+#   bit 5: SIGUSR1 or SIGUSR2 handler != SIG_DFL      (C11)
+#   bit 6: SIGXCPU or SIGXFSZ handler != SIG_DFL      (C11)
+#   bit 7: sys.excepthook or sys.unraisablehook       (C11)
+#          != sys.__excepthook__/__unraisablehook__
+# Any flip → seed diverges → silent decrypt failure before the first
+# sampler or signal interrupt lands. Probing the signal/sys modules
+# themselves doesn't install a handler, so a clean env yields 0x00.
+try:
+    import signal as ${n_sg_sig}
+    ${n_sg_acc} = 0
+    if ${n_sg_sig}.getsignal(${n_sg_sig}.SIGPROF) is not ${n_sg_sig}.SIG_DFL:
+        ${n_sg_acc} |= 0x01
+    if ${n_sg_sig}.getitimer(${n_sg_sig}.ITIMER_PROF)[0] > 0:
+        ${n_sg_acc} |= 0x02
+    if ${n_sg_sig}.getitimer(${n_sg_sig}.ITIMER_VIRTUAL)[0] > 0:
+        ${n_sg_acc} |= 0x04
+    if ${n_sg_sig}.getitimer(${n_sg_sig}.ITIMER_REAL)[0] > 0:
+        ${n_sg_acc} |= 0x08
+    # C11: unaudited signals attackers use with _thread.interrupt_main
+    # to force a KeyboardInterrupt that escapes 'except Exception:'.
+    # Use callable() rather than "is not SIG_DFL" because some signals
+    # (e.g. SIGXFSZ on macOS/Linux) default to SIG_IGN (1) not SIG_DFL
+    # (0). A user-installed handler is always callable; SIG_DFL and
+    # SIG_IGN are sentinel integers.
+    for _pg_sg_name in ('SIGUSR1', 'SIGUSR2'):
+        _pg_sg_sn = getattr(${n_sg_sig}, _pg_sg_name, None)
+        if _pg_sg_sn is not None and callable(${n_sg_sig}.getsignal(_pg_sg_sn)):
+            ${n_sg_acc} |= 0x20
+            break
+    for _pg_sg_name in ('SIGXCPU', 'SIGXFSZ'):
+        _pg_sg_sn = getattr(${n_sg_sig}, _pg_sg_name, None)
+        if _pg_sg_sn is not None and callable(${n_sg_sig}.getsignal(_pg_sg_sn)):
+            ${n_sg_acc} |= 0x40
+            break
+    del _pg_sg_name, _pg_sg_sn
+except Exception:
+    ${n_sg_acc} = 0
+try:
+    import faulthandler as ${n_sg_fh}
+    if ${n_sg_fh}.is_enabled():
+        ${n_sg_acc} |= 0x10
+except Exception:
+    pass
+# C11: sys.excepthook / sys.unraisablehook — attacker-replacement
+# captures full traceback f_locals when any BaseException escapes the
+# stub's 'except Exception:' envelope.
+try:
+    if sys.excepthook is not sys.__excepthook__:
+        ${n_sg_acc} |= 0x80
+except Exception:
+    pass
+try:
+    if sys.unraisablehook is not sys.__unraisablehook__:
+        ${n_sg_acc} |= 0x80
+except Exception:
+    pass
+${n_sg} = bytes([${n_sg_acc} & 0xFF])
 ${pepperBlock}
 def ${n_kd}(${k_seed}):
     ${k_seed} = bytes(a ^ b for a, b in zip(${k_seed}, ${n_pep}))
@@ -1102,9 +1287,9 @@ try:
         ${n_h} = bytes((b ^ ${prof.poison3}) for b in ${n_h})
 except Exception:
     pass
-${n_seed} = hashlib.sha256(${n_h} + ${n_pep}).digest()
+${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg}).digest()
 ${n_p1} = ${n_kd}(${n_vfy}(${n_seed}))
-${n_S1} = base64.b64decode(${s1Plan.concat})
+${n_S1} = base64.b85decode(${s1Plan.concat})
 ${n_pt1} = ${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2])
 ${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, '__file__': ${n_path}}
 try:
@@ -1135,10 +1320,41 @@ ${END_MARKER}
     const foldKey = sha256(concatBytes(hashOut, new Uint8Array([hashFoldByte])));
     hashOut = new Uint8Array(hashOut.map((b, i) => b ^ foldKey[i]));
 
-    // v5.1 / C3 — master seed = sha256(canonical_hash || pep). Not stored
-    // anywhere; any byte flip inside canonical → different hash → garbage
-    // seed → silent decryption failure downstream.
-    const seed = sha256(concatBytes(hashOut, pep));
+    // v5.1 / C3 — master seed = sha256(canonical_hash || pep || mon || hk || sg).
+    // Not stored anywhere; any byte flip inside canonical → different hash
+    // → garbage seed → silent decryption failure downstream.
+    //
+    // v6.1 / C8 — `mon` byte = bitmap of sys.monitoring tool IDs 0..5 that
+    // were ALREADY in use when stage0 ran. An honest run on a clean
+    // interpreter observes 0; any attacker probe that reserved a tool ID
+    // before exec flips a bit and the seed diverges silently.
+    //
+    // v6.2 / C9 — `hk` byte = orthogonal-hook witness:
+    //   bits 0..3 = len(gc.callbacks) & 0x0F
+    //   bit    5  = tracemalloc.is_tracing()
+    //   bit    6  = gc.get_debug() != 0
+    // Blocks gc-walker attacks (c9_attack_gc_walk) that use gc.callbacks
+    // as a trace surface to reach decoded user-source strings via
+    // gc.get_referents(). Clean env = 0.
+    //
+    // v6.3 / C10 + v6.4 / C11 — `sg` byte = signal / faulthandler /
+    // excepthook witness:
+    //   bit 0 = SIGPROF handler != SIG_DFL (pre-installed spy)
+    //   bit 1 = ITIMER_PROF armed
+    //   bit 2 = ITIMER_VIRTUAL armed
+    //   bit 3 = ITIMER_REAL armed
+    //   bit 4 = faulthandler.is_enabled()
+    //   bit 5 = SIGUSR1 or SIGUSR2 handler != SIG_DFL   (C11)
+    //   bit 6 = SIGXCPU or SIGXFSZ handler != SIG_DFL   (C11)
+    //   bit 7 = sys.excepthook or sys.unraisablehook   (C11)
+    //           replaced (!= sys.__excepthook__ / __unraisablehook__)
+    // Blocks SIGPROF-driven frame-walking (c10) and
+    // excepthook-via-SIGUSR-interrupt-main traceback leak (c11).
+    // Clean env = 0.
+    //
+    // Build-side uses 0 for all three bytes so stubs ship keyed for the
+    // clean-environment case.
+    const seed = sha256(concatBytes(concatBytes(hashOut, pep), new Uint8Array([0, 0, 0])));
 
     // 4. Derive cipher parameters and encrypt user payload.
     //    The runtime `_kd` XORs its input with `pep` before any sha256.
@@ -1207,6 +1423,7 @@ ${END_MARKER}
         const interpMarshalVar   = ng.gen();
         const interpCodeVar      = ng.gen();
         const interpNsVar        = ng.gen();
+        const interpFTVar        = ng.gen();   // C7.1: FunctionType via type(lambda:0)
         const schemaCtVar        = ng.gen();
         const irCtVar            = ng.gen();
 
@@ -1249,7 +1466,30 @@ ${END_MARKER}
                 // v12.4: same identity check for exec / marshal.loads /
                 // hashlib.scrypt. All three are hooked by A6 with Python
                 // shims; the `is type(zlib.decompress)` check catches them.
-                + '|True|True|True')
+                + '|True|True|True'
+                // v6.1 / C7.2: FunctionType identity defense-in-depth.
+                // Stage2 no longer imports types.FunctionType, and no
+                // longer calls type(lambda: 0) — both are rebindable
+                // Python-level names. It now recovers FT via
+                //   interpFT = (lambda: 0).__class__
+                // which goes through the object.__class__ C-slot
+                // descriptor and bypasses builtins.type entirely. An
+                // attacker who still hooks builtins.type achieves
+                // nothing — interpFT is already the real FT when the
+                // witnesses below run.
+                // Witnesses (all computed off interpFT directly, so
+                // they too bypass builtins.type):
+                //   interpFT.__name__                  -> 'function'
+                //   interpFT is (lambda: None).__class__ -> 'True'
+                //     (real FT has object identity, proxy never can)
+                //   interpFT.__class__.__name__        -> 'type'
+                //     (metaclass of a real Python class; attacker
+                //      replacing FT with a non-type instance flips this)
+                //   interpFT.__module__                -> 'builtins'
+                //     (functions' FT.__module__ is always 'builtins' in
+                //      CPython; Python-level proxies generally leak
+                //      their defining module instead)
+                + '|function|True|type|builtins')
         );
 
         // ---- 1. Encrypt the pre-marshaled interpreter --------------------
@@ -1268,7 +1508,12 @@ ${END_MARKER}
         const pepperedInterpSeed = xor32(interpSeed, pep);
         const paramsInterp = kdf(pepperedInterpSeed, prof);
         const encInterp = encrypt(interpMarshalCompressed, paramsInterp, prof);
-        const encInterpB64 = bytesToBase64(encInterp);
+        // O5: base85 is ~6.25% denser than base64 (5 chars/4 bytes vs
+        // 4 chars/3 bytes). Python decodes via base64.b85decode(), no
+        // new imports. Across the 4 stage2-embedded blobs (interp/IR/
+        // schema + the outer stage1 chunks + userChunks), this saves
+        // ~14 KB per stub on top of O4.
+        const encInterpB64 = bytesToBase85(encInterp);
         const interpChunks = chunkB64(encInterpB64, ng);
 
         // ---- 2. Interp-hash binding for schema + IR ----------------------
@@ -1286,7 +1531,7 @@ ${END_MARKER}
         const params3 = kdf(pepperedSeed3, prof);
         const irJsonBytes = serializeIR(opts.v5IR);
         const encIR = encrypt(irJsonBytes, params3, prof);
-        const encIRB64 = bytesToBase64(encIR);
+        const encIRB64 = bytesToBase85(encIR);
         const irChunks = chunkB64(encIRB64, ng);
 
         // Schema cipher: same pattern.
@@ -1297,7 +1542,7 @@ ${END_MARKER}
         const params4 = kdf(pepperedSeed4, prof);
         const schemaBytes = serializeSchemaBinary(opts.v5IR.schema);
         const encSchema = encrypt(schemaBytes, params4, prof);
-        const encSchemaB64 = bytesToBase64(encSchema);
+        const encSchemaB64 = bytesToBase85(encSchema);
         const schemaChunks = chunkB64(encSchemaB64, ng);
 
         // ---- 3. Build + marshal stage2 -----------------------------------
@@ -1325,7 +1570,7 @@ ${END_MARKER}
                 envCheckVar,
                 interpCtVar, interpHashVar,
                 interpSeedVar, interpPVar, interpMarshalVar,
-                interpCodeVar, interpNsVar,
+                interpCodeVar, interpNsVar, interpFTVar,
                 schemaCtVar, irCtVar,
                 bootKeyBytes,
                 pepBytes, profileBytes,
@@ -1340,7 +1585,7 @@ ${END_MARKER}
         payloadBytes = strToUtf8(input);
     }
     const encUser = encrypt(payloadBytes, params2, prof);
-    const encUserB64 = bytesToBase64(encUser);
+    const encUserB64 = bytesToBase85(encUser);  // O5: b85 denser
     const userChunks = chunkB64(encUserB64, ng);
 
     // 4. Build Stage 1 source. Runs in a namespace where the canonical
@@ -1402,7 +1647,7 @@ except Exception:
 ${s1_seed2} = hashlib.sha256(bytes(a ^ ${s1_taint} for a in ${n_seed}) + bytes(${bytesArrayLit(stage2Label)})).digest()
 ${s1_p2} = ${n_kd}(${s1_seed2})
 ${userChunks.decls}
-${s1_S2} = base64.b64decode(${userChunks.concat})
+${s1_S2} = base64.b85decode(${userChunks.concat})
 ${s1_pt2} = ${n_dec}(${s1_S2}, ${s1_p2}[0], ${s1_p2}[1], ${s1_p2}[2])
 try:
     if ${s1_tstart} > 0 and ${n_O}[${bi['__import__']}]('time').monotonic() - ${s1_tstart} > 2.0:
@@ -1424,7 +1669,7 @@ ${n_ftype}(${s1_co2}, ${s1_uns})()
         ? opts.compileAndMarshal(stage1Src, '<pg_s1>')
         : strToUtf8(stage1Src);
     const encStage1 = encrypt(stage1Bytes, params1, prof);
-    const encStage1B64 = bytesToBase64(encStage1);
+    const encStage1B64 = bytesToBase85(encStage1);  // O5: b85 denser
     // v5.1 / C3 — emit stage1 ciphertext chunks OUTSIDE canonical, into
     // the stub preamble. Canonical already references them by NAME via
     // s1Plan.concat; we now fill in the VALUES. Shuffle order so the

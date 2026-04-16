@@ -427,22 +427,18 @@ def _xor_encode_string(s):
     key = bytes(random.randint(1, 255) for _ in range(key_len))
     xored = bytes(b ^ key[i % key_len] for i, b in enumerate(raw))
 
-    def _bytes_list_node(bs):
-        return ast.Call(
-            func=ast.Name(id='bytes', ctx=ast.Load()),
-            args=[ast.List(
-                elts=[ast.Constant(value=b) for b in bs],
-                ctx=ast.Load(),
-            )],
-            keywords=[],
-        )
-
-    # Build: _decode_func(bytes([x1,x2,...]), bytes([k1,k2,...]))
+    # O1: emit bytes LITERALS (b'\xHH\xHH...'), not bytes([int,int,...]).
+    # ast.unparse renders bytes constants as b'...' escape form, roughly
+    # 3 + 4n chars vs ~4n + 8 for the bytes([...]) form. Saves ~5 chars
+    # per short string plus defeats trivially-greppable `bytes([` patterns
+    # in static analysis (the interpreter goes from hundreds of those per
+    # module to zero).
+    # Build: _decode_func(b'...xored...', b'...key...')
     return ast.Call(
         func=ast.Name(id=_XOR_DECODE_FUNC_NAME, ctx=ast.Load()),
         args=[
-            _bytes_list_node(xored),
-            _bytes_list_node(key),
+            ast.Constant(value=xored),
+            ast.Constant(value=key),
         ],
         keywords=[],
     )
@@ -963,8 +959,23 @@ def obfuscate(src):
         # wraps them in scrypt-AEAD exec bodies that break raise/generator
         # semantics and crush perf. The interpreter gets plenty of other
         # hardening layers (CFF, MBA, string obfuscation, rename, etc.).
+        # obfuscate_strings=False: our StringEncoder (cache-backed
+        # _decode_func with compact bytes-literal arguments) is both
+        # smaller AND faster than transform_ast's per-byte XOR BinOp
+        # chains. Running both back-to-back is redundant and the second
+        # pass encodes already-encoded constants, inflating size.
+        # O4: skip _ConstantUnfolder + _MBAObfuscator on the interpreter.
+        # MBA on raw int constants (dispatch-table keys) only hides them
+        # from a surface-level dis.dis read; a partial evaluator folds
+        # `(a|b)-(a&b)` back in seconds. The passes inflate the shipped
+        # interpreter marshal by ~8 KB deflated per stub (measured on
+        # 2026-04-16) without raising attacker cost. User code still
+        # gets both passes — unknown-at-analysis-time dataflow means
+        # real MBA protection DOES apply there.
         tree = transform_ast_tree(tree, None, rename_identifiers=False,
-                                  rewrite_secret_gates=False)
+                                  rewrite_secret_gates=False,
+                                  obfuscate_strings=False,
+                                  int_obfuscation=False)
         ast.fix_missing_locations(tree)
     except Exception as e:
         print(f"[obfuscate_runtime] AST transforms skipped: {e}", file=sys.stderr)
@@ -995,7 +1006,15 @@ def obfuscate(src):
         tree.body.insert(insert_pos + j, node)
 
     # 4. Insert dead code
-    insert_dead_code(tree, n_funcs=12, n_methods_per_class=3)
+    # O2: dead functions exist to confuse static module-layout analysis,
+    # not to be an endless forest an attacker must read past. 4 module-level
+    # dead funcs + 1 dead method per class is plenty of noise for that
+    # purpose; previous 12+3 was cosmetic bloat inflating the interpreter
+    # from ~77 KB raw to ~190 KB raw (2.45x). Compare that against a truly
+    # lossy transform (identifier rename) — bloat does nothing to raise
+    # attacker cost once they've identified the interpreter as a ball of
+    # indirection.
+    insert_dead_code(tree, n_funcs=4, n_methods_per_class=1)
 
     # 5. Scramble method order in classes
     scramble_class_methods(tree)

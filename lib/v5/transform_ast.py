@@ -1607,6 +1607,453 @@ class _CallIndirector(ast.NodeTransformer):
 
 
 # ---------------------------------------------------------------------------
+# Local Slot Lifting (v6.0 / C6.B)
+# ---------------------------------------------------------------------------
+#
+# Rationale
+# ---------
+# Even after C1 attribute mangling and identifier renaming, each function's
+# locals still land in the IR string pool as distinct identifiers (renamed
+# to opaque tokens, but one token per variable). The IR tree also marks
+# every variable access as a Name node, which is a 1-to-1 proxy for "this
+# is variable X of function F." An analyst reading the IR can still
+# partition local-variable nodes per function and infer data flow.
+#
+# This pass collapses all locals of a function into a single list `_s`
+# indexed by small integers. Every Load/Store/Del of a local becomes a
+# Subscript(Name('_s'), Constant(idx)) node. The IR string pool no longer
+# carries per-variable names (only the single `_s` name per build-random
+# token); the IR node type for every variable access is uniformly
+# Subscript, not Name. Per-function variable identity dissolves into
+# positional slot references.
+#
+# Applied per-FunctionDef, before fusion (so fused branches each carry
+# their own slot table allocation and the fusion parameter-binding
+# prologue still works through the parameter-name bindings).
+#
+# Eligibility (conservative):
+#   - No yield / yield from     (slotting across yield is legal, but we
+#                                skip to keep the first implementation
+#                                small; can revisit)
+#   - No nested FunctionDef / AsyncFunctionDef / ClassDef / Lambda in body
+#                               (nested scopes read closures by name, and
+#                                lifting the outer's locals would break
+#                                the Inner's cell-variable binding)
+#   - No `nonlocal` declaration (same reason — the parent's slotted
+#                                local would not be visible as a cell)
+#   - No `del LOCAL_NAME`       (del on a list subscript shifts indices)
+#   - Exception handler's `except ... as NAME` where NAME is local:
+#                                left un-slotted (rewriting ExceptHandler
+#                                name attr to a subscript is invalid AST).
+#                                These names remain plain locals; they
+#                                don't leak anything meaningful.
+
+class _LocalSlotLifter(ast.NodeTransformer):
+    """Per-function: replace local Name references with `_s[idx]` subscripts."""
+
+    def __init__(self, ng):
+        self.ng = ng
+        # Per-build name for the slot list. ONE name used in every function.
+        # Rationale: using one name keeps the string pool pressure constant
+        # regardless of function count — all slot accesses share the token.
+        self._slot = ng.temp()
+        self.lifted_count = 0
+
+    def visit_Module(self, node):
+        self.generic_visit(node)
+        return node
+
+    def _is_eligible(self, fn):
+        # Reject generators
+        for n in ast.walk(fn):
+            if isinstance(n, (ast.Yield, ast.YieldFrom)):
+                return False
+        # Scan body (without descending into nested scopes) for hard cases
+        stack = list(fn.body)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef, ast.Lambda)):
+                return False
+            if isinstance(n, ast.Nonlocal):
+                return False
+            if isinstance(n, ast.Delete):
+                # If any target is a Name that would become a slot, reject.
+                # (Subscript targets, attr targets are fine.)
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        return False
+            stack.extend(ast.iter_child_nodes(n))
+        return True
+
+    def _collect_locals(self, fn):
+        """Return (slot_map, except_names) for this function.
+
+        - slot_map: {local_name: slot_index} for names we will rewrite.
+        - except_names: set of names used by `except ... as NAME:` — these
+          stay un-slotted (NAME is a string attr, not a Name node).
+        """
+        # Globals/nonlocals declared (excluded from slotting)
+        excluded = set()
+        # Parameter names (always local)
+        param_names = set()
+        for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs:
+            param_names.add(a.arg)
+        if fn.args.vararg:
+            param_names.add(fn.args.vararg.arg)
+        if fn.args.kwarg:
+            param_names.add(fn.args.kwarg.arg)
+
+        # Scan body, no nested-scope descent
+        stored = set()
+        except_names = set()
+        stack = list(fn.body)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef, ast.Lambda)):
+                continue  # opaque
+            if isinstance(n, ast.Global):
+                excluded.update(n.names)
+            elif isinstance(n, ast.Nonlocal):
+                excluded.update(n.names)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx,
+                                                        (ast.Store, ast.Del)):
+                stored.add(n.id)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                except_names.add(n.name)
+            elif isinstance(n, ast.arg):
+                # (nested arg objects — defensive)
+                param_names.add(n.arg)
+            stack.extend(ast.iter_child_nodes(n))
+
+        locals_ = (param_names | stored) - excluded - except_names
+        if not locals_:
+            return {}, except_names
+        # Deterministic-but-shuffled slot assignment per build.
+        ordered = sorted(locals_)
+        self.ng._rng.shuffle(ordered)
+        return {name: i for i, name in enumerate(ordered)}, except_names
+
+    def _sub(self, idx, ctx):
+        return ast.Subscript(
+            value=ast.Name(id=self._slot, ctx=ast.Load()),
+            slice=ast.Constant(value=idx),
+            ctx=ctx)
+
+    def _rewrite_body(self, body, slot_map, except_names):
+        """Walk `body` without descending into nested scopes; rewrite Name
+        references for slotted locals to Subscript(_s, idx)."""
+        slot_name = self._slot
+
+        class _Rewriter(ast.NodeTransformer):
+            def visit_FunctionDef(_self, node):
+                return node  # don't recurse
+            def visit_AsyncFunctionDef(_self, node):
+                return node
+            def visit_ClassDef(_self, node):
+                return node
+            def visit_Lambda(_self, node):
+                return node
+            def visit_Name(_self, node):
+                if node.id in slot_map:
+                    return ast.Subscript(
+                        value=ast.Name(id=slot_name, ctx=ast.Load()),
+                        slice=ast.Constant(value=slot_map[node.id]),
+                        ctx=node.ctx)
+                return node
+            def visit_Global(_self, node):
+                # Don't touch — names are strings; they reference module-scope.
+                return node
+            def visit_Nonlocal(_self, node):
+                return node
+
+        r = _Rewriter()
+        return [r.visit(s) for s in body]
+
+    def visit_FunctionDef(self, node):
+        # Don't recurse into nested functions from here — we still visit
+        # them separately via Module's generic_visit; but if THIS function
+        # is eligible, its body must not contain nested scopes (enforced
+        # by _is_eligible), so no inner rewriting needed.
+        if not self._is_eligible(node):
+            # Recurse so nested eligible fns get processed.
+            self.generic_visit(node)
+            return node
+
+        slot_map, except_names = self._collect_locals(node)
+        if len(slot_map) < 1:
+            return node
+        # Note: threshold = 1, not 2. Lifting trivial single-local functions
+        # too keeps the IR shape uniform across all eligible functions
+        # (every local access is a Subscript node). Non-uniformity would
+        # leak a discriminator: functions with >=2 locals slotted, <2 not.
+
+        new_body = self._rewrite_body(node.body, slot_map, except_names)
+
+        # Prologue: allocate _s and copy params into their slots.
+        prologue = []
+        prologue.append(ast.Assign(
+            targets=[ast.Name(id=self._slot, ctx=ast.Store())],
+            value=ast.List(elts=[ast.Constant(value=None)] * len(slot_map),
+                           ctx=ast.Load())))
+        # Copy parameters into their slots. Parameter references inside the
+        # body have been rewritten to subscripts, so we must also *seed*
+        # those slots from the Python-level parameter bindings.
+        all_params = list(node.args.posonlyargs) + list(node.args.args) + \
+                     list(node.args.kwonlyargs)
+        if node.args.vararg:
+            all_params.append(node.args.vararg)
+        if node.args.kwarg:
+            all_params.append(node.args.kwarg)
+        for a in all_params:
+            if a.arg in slot_map:
+                prologue.append(ast.Assign(
+                    targets=[self._sub(slot_map[a.arg], ast.Store())],
+                    value=ast.Name(id=a.arg, ctx=ast.Load())))
+
+        node.body = prologue + new_body
+        self.lifted_count += 1
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        # Treat the same as FunctionDef for eligibility — but we skip async
+        # entirely (safer; async adds await scope).
+        self.generic_visit(node)
+        return node
+
+
+# ---------------------------------------------------------------------------
+# Function Body Fusion (v6.0 / C6.A)
+# ---------------------------------------------------------------------------
+#
+# Rationale
+# ---------
+# Red-team audit (2026-04-16) flagged that v5's protection is too concentrated
+# in the container (encryption, integrity, anti-trace) while the *meaning* of
+# the user program remains recoverable: after an analyst dumps the IR, the
+# original function boundaries still survive as distinct IFunctionDef nodes,
+# each with a coherent body. Semantic normalisation — producing a short
+# faithful rewrite of the protected program — is therefore cheap even when
+# literal source strings are scrubbed.
+#
+# This pass attacks that shape directly. Eligible top-level user functions
+# have their *bodies* extracted and pasted as branches of a single module-
+# level dispatcher `_pg_F(_fid, _args)`. The original `def foo(a, b):` is
+# replaced with a trampoline of the same name and signature whose body is
+# a single `return _pg_F(FID_FOO, (a, b))` — preserving Python-level
+# reachability (decorators still apply; `_pg_D[K_foo]` still resolves).
+#
+# Impact on the IR: where v5 emitted N distinct IFunctionDef nodes each
+# with a meaningful body, v6 emits N trampolines (1-line bodies) plus one
+# giant IFunctionDef whose body is an if-chain keyed on an integer FID.
+# The call graph "add calls double, double calls print" collapses into a
+# single mega-dispatcher; recovering per-function structure requires the
+# analyst to reverse the FID→branch mapping, undo the parameter-binding
+# prologue, and then still face the per-branch CFF state machine.
+#
+# Eligibility (conservative — correctness over coverage):
+#   - Top-level FunctionDef only (not inside ClassDef, not nested)
+#   - No yield / yield from  (generators have suspension semantics)
+#   - No nonlocal             (breaks if the enclosing scope is the body)
+#   - No nested FunctionDef / AsyncFunctionDef / ClassDef / Lambda
+#     (closures would lose their enclosing scope)
+#   - Simple argument signature: no *args, no **kwargs, no kw-only,
+#     defaults must be ast.Constant (constant-folding guarantees this
+#     before the _ConstantUnfolder runs, since defaults are evaluated
+#     at function-definition time)
+#   - AsyncFunctionDef NOT eligible (await inside _pg_F would require
+#     _pg_F itself to be async, which pollutes all other branches)
+#
+# Decorators are preserved on the trampoline, so @memoize / @staticmethod
+# / user-defined decorators still apply at the same call site.
+#
+# `global NAME` declarations inside a fused body are re-declared inside
+# _pg_F so writes still target module globals.
+#
+# Placement in the pipeline:
+#   - AFTER CFF: per-function CFF is applied before fusion, so each fused
+#     branch is itself a `while True: if state==N:` state machine.
+#   - AFTER CallIndirector: indirection keys reference the trampoline by
+#     name, so `_pg_D[K_foo] = foo` still resolves correctly after the
+#     def-statement is replaced with a same-named trampoline.
+#   - BEFORE ConstantUnfolder: FID constants and parameter-index constants
+#     flow through unfolding into arithmetic chains, plus MBA expansion.
+#
+# Honest limits
+# -------------
+# This does NOT destroy the FID↔name correspondence — the trampoline emits
+# its FID as a literal integer (subsequently unfolded by the constant
+# unfolder / MBA pass). A determined analyst can still recover the mapping
+# by: (1) reading each trampoline's body to extract its FID, (2) locating
+# that FID's branch inside _pg_F, (3) unpacking the parameter-binding
+# prologue, (4) unflattening the inner CFF. The goal is not to make this
+# impossible; it is to make the "small faithful rewrite" attack require
+# work proportional to the number of functions, not free.
+
+class _FunctionFusion(ast.NodeTransformer):
+    """Fuse eligible top-level function bodies into a single dispatcher."""
+
+    def __init__(self, ng):
+        self.ng = ng
+        self._F = ng.temp()       # dispatcher name (_pg_F analog, opaque)
+        self._FID = ng.temp()     # dispatcher fid parameter name
+        self._A = ng.temp()       # dispatcher args parameter name
+        # fid -> (renamed_fn_name, original_args, body_stmts, globals_set)
+        self._fused = {}
+        self._used_fids = set()
+        # Telemetry: count of functions actually fused.
+        self.fused_count = 0
+
+    def _alloc_fid(self):
+        rng = self.ng._rng
+        while True:
+            k = rng.randint(10**6, 10**9)
+            if k not in self._used_fids:
+                self._used_fids.add(k)
+                return k
+
+    def _is_eligible(self, fn):
+        if not isinstance(fn, ast.FunctionDef):
+            return False
+        # Generator / nonlocal / nested-def scan
+        for n in ast.walk(fn):
+            if n is fn:
+                continue
+            if isinstance(n, (ast.Yield, ast.YieldFrom, ast.Nonlocal)):
+                return False
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef, ast.Lambda)):
+                return False
+        # Signature: reject *args, **kwargs, kw-only, non-constant defaults.
+        a = fn.args
+        if a.vararg is not None or a.kwarg is not None:
+            return False
+        if a.kwonlyargs:
+            return False
+        for d in a.defaults:
+            if not isinstance(d, ast.Constant):
+                return False
+        # posonlyargs are fine; we unify them with regular args.
+        return True
+
+    def _collect_globals(self, body):
+        """Return the set of names declared `global` anywhere in body."""
+        g = set()
+        for stmt in body:
+            for n in ast.walk(stmt):
+                if isinstance(n, ast.Global):
+                    g.update(n.names)
+        return g
+
+    def visit_Module(self, node):
+        new_body = []
+        self._all_globals = set()
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef) and self._is_eligible(stmt):
+                fid = self._alloc_fid()
+                globs = self._collect_globals(stmt.body)
+                self._fused[fid] = (stmt.name, stmt.args, stmt.body, globs)
+                self._all_globals.update(globs)
+                new_body.append(self._make_trampoline(stmt, fid))
+                self.fused_count += 1
+            else:
+                new_body.append(stmt)
+
+        if self.fused_count == 0:
+            return node
+
+        dispatcher = self._build_dispatcher()
+        # Dispatcher must be defined before any trampoline is *called*. Module-
+        # level code runs top-to-bottom, so placing it at the head is safe.
+        # (The trampoline defs themselves only reference `_F` by name; the
+        # lookup happens at call time, not def time.)
+        node.body = [dispatcher] + new_body
+        return node
+
+    def _make_trampoline(self, fn, fid):
+        """Replace fn with a same-name same-signature trampoline."""
+        # Collect the parameter names in positional order (posonly then args).
+        pos_names = [a.arg for a in fn.args.posonlyargs] + \
+                    [a.arg for a in fn.args.args]
+        tuple_elts = [ast.Name(id=n, ctx=ast.Load()) for n in pos_names]
+        args_tuple = ast.Tuple(elts=tuple_elts, ctx=ast.Load())
+        call = ast.Call(
+            func=ast.Name(id=self._F, ctx=ast.Load()),
+            args=[ast.Constant(value=fid), args_tuple],
+            keywords=[])
+        return ast.FunctionDef(
+            name=fn.name,
+            args=fn.args,
+            body=[ast.Return(value=call)],
+            decorator_list=fn.decorator_list,
+            returns=fn.returns,
+            type_comment=getattr(fn, 'type_comment', None))
+
+    def _build_dispatcher(self):
+        """Assemble the `def _F(_FID, _A):` dispatcher with all fused bodies."""
+        cases = []
+        for fid, (name, args, body, globs) in self._fused.items():
+            # No branch-local `global` declarations: Python requires globals
+            # to be declared at the top of the enclosing function, before any
+            # binding/use of the name. We hoist the union of all branch-level
+            # globals to the dispatcher's body prologue below.
+            prologue = []
+            all_params = list(args.posonlyargs) + list(args.args)
+            for i, a in enumerate(all_params):
+                prologue.append(ast.Assign(
+                    targets=[ast.Name(id=a.arg, ctx=ast.Store())],
+                    value=ast.Subscript(
+                        value=ast.Name(id=self._A, ctx=ast.Load()),
+                        slice=ast.Constant(value=i),
+                        ctx=ast.Load())))
+            case_body = prologue + list(body)
+            # Ensure the branch returns — if the body falls through (no
+            # explicit return / CFF's `break` exits the inner state loop),
+            # we must not fall through to sibling branches of the outer
+            # if-chain (different FIDs) or to the dispatcher's tail.
+            if not case_body or not isinstance(case_body[-1], ast.Return):
+                case_body.append(ast.Return(value=ast.Constant(value=None)))
+            test = _make_eq(self._FID, fid)
+            cases.append((test, case_body))
+
+        # Shuffle so FID order in the chain doesn't mirror source order.
+        self.ng._rng.shuffle(cases)
+        if_chain = _build_if_chain(cases)
+
+        dispatcher_args = ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg=self._FID), ast.arg(arg=self._A)],
+            vararg=None,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[])
+
+        # Hoist globals to the dispatcher prologue. Union of all branches'
+        # `global NAME` declarations. Python then treats each NAME as global
+        # throughout _pg_F, so reads and writes in every fused branch target
+        # the module dict consistently. Safe under identifier renaming: the
+        # renamer assigns each original source name a single canonical mangled
+        # name, so a fused branch's `global __yyy` refers to the module-level
+        # `__yyy` that would have been the module-level `counter` before
+        # renaming, and no other branch uses `__yyy` as a local (the renamer
+        # assigns each source identifier ONE name module-wide).
+        dispatcher_body = []
+        if self._all_globals:
+            dispatcher_body.append(ast.Global(names=sorted(self._all_globals)))
+        dispatcher_body.append(if_chain)
+        dispatcher_body.append(ast.Return(value=ast.Constant(value=None)))
+
+        return ast.FunctionDef(
+            name=self._F,
+            args=dispatcher_args,
+            body=dispatcher_body,
+            decorator_list=[],
+            returns=None)
+
+
+# ---------------------------------------------------------------------------
 # Secret-Gate Rewriter
 # ---------------------------------------------------------------------------
 #
@@ -2498,7 +2945,7 @@ def _build_if_chain(cases):
 # Public API
 # ---------------------------------------------------------------------------
 
-def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=True):
+def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=True, obfuscate_strings=True, int_obfuscation=True):
     """Apply all transforms in the correct order.
 
     Order matters:
@@ -2587,20 +3034,66 @@ def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=Tr
     tree = _FStringDeformer().visit(tree)
     ast.fix_missing_locations(tree)
 
+    # v6.0 / C6.B — lift per-function locals to `_s[idx]` subscripts BEFORE
+    # fusion. This dissolves per-variable Name identity in the IR: every
+    # local access becomes a uniform Subscript(Name('_s'), Constant(idx))
+    # node, the string pool carries only one slot-list name per build, and
+    # analysts can no longer partition locals by the Name they load from.
+    # Gated on rename_identifiers because un-renamed interpreter locals
+    # could collide with synthesized slot names.
+    if rename_identifiers:
+        tree = _LocalSlotLifter(ng).visit(tree)
+        ast.fix_missing_locations(tree)
+
+    # v6.0 / C6.A — fuse eligible top-level function bodies into a single
+    # mega-dispatcher BEFORE CFF. If we ran this after CFF, CFF would have
+    # already pushed top-level FunctionDefs inside its while-dispatcher
+    # branches, and visit_Module wouldn't see them. Running before CFF:
+    #   - dissolves per-function bodies into a single _pg_F branch chain,
+    #   - CFF then flattens _pg_F's giant dispatcher body, producing a
+    #     state-machine inside a state-machine,
+    #   - the trampoline defs become cheap wrappers that CFF also scrambles.
+    # Gated on `rename_identifiers` because fusion shares one function-scope
+    # namespace across all fused branches; without the renamer's unique-per-
+    # source-identifier mapping, two functions' identically-named locals
+    # would collide inside _pg_F. (Skipped for the interpreter source, which
+    # runs with rename_identifiers=False for self-obfuscation correctness.)
+    if rename_identifiers and isinstance(tree, ast.Module):
+        tree = _FunctionFusion(ng).visit(tree)
+        ast.fix_missing_locations(tree)
+
     tree = _CFFlattener(ng).visit(tree)
     ast.fix_missing_locations(tree)
 
     tree = _CallIndirector(ng).visit(tree)
     ast.fix_missing_locations(tree)
 
-    tree = _ConstantUnfolder(ng).visit(tree)
-    ast.fix_missing_locations(tree)
+    # O4 (2026-04-16): skip int-obfuscation passes on callers that don't
+    # benefit. For the interpreter, _ConstantUnfolder + _MBAObfuscator
+    # rewrite small ints into (a|b)-(a&b) chains that a partial
+    # evaluator folds back in seconds — MBA on raw int constants buys
+    # minimal anti-static-analysis cost against a determined reverser
+    # (the reduction rules are well-known) while inflating the
+    # marshal-shipped bytecode by ~8 KB deflated per stub. User code
+    # still gets these passes (unknown at analysis time, real variable
+    # dataflow makes folding harder).
+    if int_obfuscation:
+        tree = _ConstantUnfolder(ng).visit(tree)
+        ast.fix_missing_locations(tree)
 
-    tree = _MBAObfuscator(ng).visit(tree)
-    ast.fix_missing_locations(tree)
+        tree = _MBAObfuscator(ng).visit(tree)
+        ast.fix_missing_locations(tree)
 
-    tree = _StringObfuscator(ng).visit(tree)
-    ast.fix_missing_locations(tree)
+    # O3: caller (obfuscate_runtime.py for the interpreter source) can
+    # skip this pass when it owns its own string encoder. For the
+    # interpreter, `obfuscate_runtime.StringEncoder` emits a shared
+    # `_decode(b'xored', b'key')` helper whose ciphertext/keys are
+    # compact `bytes` literals — encoding is ~6x smaller than the
+    # per-byte-BinOp form `_StringObfuscator` produces, and the cached
+    # decoder is faster at runtime than re-XOR'ing every call site.
+    if obfuscate_strings:
+        tree = _StringObfuscator(ng).visit(tree)
+        ast.fix_missing_locations(tree)
 
     return tree
 
@@ -2616,7 +3109,8 @@ def transform_source(source, seed=None, rename_identifiers=True,
 
 
 def transform_ast_tree(tree, seed=None, rename_identifiers=True,
-                       rewrite_secret_gates=True):
+                       rewrite_secret_gates=True, obfuscate_strings=True,
+                       int_obfuscation=True):
     """Apply transforms to an already-parsed AST tree.
 
     Set rename_identifiers=False when the caller handles its own
@@ -2626,11 +3120,17 @@ def transform_ast_tree(tree, seed=None, rename_identifiers=True,
     itself — the rewriter mistakes `if op == 'IBreak':` dispatch branches
     for password gates and wraps them in scrypt-AEAD exec bodies that
     break generator/raise semantics.
+
+    Set obfuscate_strings=False when the caller has its own string
+    obfuscation pass (e.g. obfuscate_runtime.StringEncoder, which is
+    cache-backed and emits smaller bytes literals).
     """
     ng = _NameGen(seed)
     return _apply_transforms(tree, ng,
                              rename_identifiers=rename_identifiers,
-                             rewrite_secret_gates=rewrite_secret_gates)
+                             rewrite_secret_gates=rewrite_secret_gates,
+                             obfuscate_strings=obfuscate_strings,
+                             int_obfuscation=int_obfuscation)
 
 
 if __name__ == '__main__':
