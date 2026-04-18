@@ -112,6 +112,34 @@ class _Lifter:
             return _OP_CMP[cls]
         raise ValueError(f"unknown operator: {cls}")
 
+    def _drop_docstring(self, body):
+        """v6.5 / C16 — strip the leading Expr(Constant(str)) statement
+        from Module / FunctionDef / ClassDef bodies.
+
+        Docstrings survived every prior round of source concealment
+        (pre-IR string XOR-split doesn't touch them because they're
+        standalone expression statements, and the const pool stores them
+        verbatim after marshal.dumps). An attacker who defeats the
+        crypto — or exfiltrates the const pool via any future pivot —
+        recovers the docstring byte-for-byte, which often contains API
+        signatures, class purpose, and usage examples. Stripping them
+        at lift time makes that leak impossible regardless of where
+        crypto ends up. Honest limit: does NOT preserve \`__doc__\` at
+        runtime; callers relying on \`obj.__doc__\` get None.
+        """
+        if not body:
+            return body
+        first = body[0]
+        if type(first).__name__ != 'Expr':
+            return body
+        v = getattr(first, 'value', None)
+        if v is None or type(v).__name__ != 'Constant':
+            return body
+        val = getattr(v, 'value', None)
+        if isinstance(val, str):
+            return body[1:]
+        return body
+
     def lift(self, node):
         """Recursively lift an AST node to an IR dict."""
         if node is None:
@@ -123,7 +151,7 @@ class _Lifter:
 
         # ---- Module / top-level ----
         if cls == 'Module':
-            return {'op': 'Module', 'body': self.lift(node.body)}
+            return {'op': 'Module', 'body': self.lift(self._drop_docstring(node.body))}
 
         # ---- Statements ----
         if cls == 'Expr':
@@ -253,7 +281,7 @@ class _Lifter:
                 'op': 'FunctionDef',
                 'name': self.s(node.name),
                 'args': self.lift(node.args),
-                'body': self.lift(node.body),
+                'body': self.lift(self._drop_docstring(node.body)),
                 'decorator_list': self.lift(node.decorator_list),
                 'returns': self.lift(node.returns),
             }
@@ -262,7 +290,7 @@ class _Lifter:
                 'op': 'AsyncFunctionDef',
                 'name': self.s(node.name),
                 'args': self.lift(node.args),
-                'body': self.lift(node.body),
+                'body': self.lift(self._drop_docstring(node.body)),
                 'decorator_list': self.lift(node.decorator_list),
                 'returns': self.lift(node.returns),
             }
@@ -278,7 +306,7 @@ class _Lifter:
                 'name': self.s(node.name),
                 'bases': self.lift(node.bases),
                 'keywords': self.lift(node.keywords),
-                'body': self.lift(node.body),
+                'body': self.lift(self._drop_docstring(node.body)),
                 'decorator_list': self.lift(node.decorator_list),
             }
         if cls == 'arguments':
@@ -463,6 +491,34 @@ class _Lifter:
         raise NotImplementedError(f"v5 lifter: unsupported AST node {cls}")
 
 
+class _ImportManifestBuilder:
+    def __init__(self):
+        self.entries = []
+        self._by_pair = {}
+        self._used_ids = set()
+        self._counter = 0
+
+    def _next_id(self):
+        while True:
+            try:
+                ident = int.from_bytes(os.urandom(4), 'little')
+            except Exception:
+                self._counter += 1
+                ident = ((self._counter * 0x9E3779B1) ^ 0xA5A5A5A5) & 0xFFFFFFFF
+            if ident not in self._used_ids:
+                return ident
+
+    def add(self, module_path, attr):
+        key = (module_path, attr)
+        if key in self._by_pair:
+            return self._by_pair[key]
+        ident = self._next_id()
+        self._by_pair[key] = ident
+        self._used_ids.add(ident)
+        self.entries.append((ident, module_path, attr))
+        return ident
+
+
 def compile_to_ir(source):
     """Parse user Python source and emit a v5 IR dict.
 
@@ -500,7 +556,7 @@ def compile_to_ir(source):
 
 
 def compile_to_json(source):
-    """Return a JSON-serialisable LIST \`[strings, consts, tree]\`.
+    """Return \`(payload, manifest)\` for the build pipeline.
 
     v5.2 shape change: the top-level container is a list, not a dict.
     Attack 12 (tests/pentest/attack12_v5_frame_walk.py) fingerprints the
@@ -517,9 +573,11 @@ def compile_to_json(source):
 
     Constants that aren't naturally JSON-serialisable (bytes, complex,
     frozenset, ellipsis) get tagged so the runtime can rebuild them.
+    The static-import manifest is returned alongside the payload so stage2
+    can pre-resolve those imports before user code starts running.
     """
     ir = compile_to_ir(source)
-    lowered_tree = _lower_to_code(ir['tree'])
+    lowered_tree, manifest = _lower_to_code(ir['tree'], ir['strings'])
     # v8: consts now emitted positionally as lists, not dicts. Previous
     # \`{'t': type, 'v': value}\` shape gave attackers a stable structural
     # fingerprint they could match on every const wrapper. Positional
@@ -552,146 +610,234 @@ def compile_to_json(source):
             encoded_consts.append(['frozenset', [_enc(x) for x in v]])
         else:
             raise NotImplementedError(f"unsupported constant type: {type(v).__name__}")
-    return [ir['strings'], encoded_consts, lowered_tree]
+    return [ir['strings'], encoded_consts, lowered_tree], manifest
 
 
-def _lower_to_code(module_node):
+def _lower_to_code(module_node, strings):
     if not isinstance(module_node, dict) or module_node.get('op') != 'Module':
         raise ValueError('expected Module root')
-    return {'op': 'Code', 'instrs': [_lower_stmt(s) for s in module_node['body']]}
+    manifest = _ImportManifestBuilder()
+    instrs = []
+    for stmt in module_node['body']:
+        instrs.extend(_lower_stmt_list(stmt, manifest, strings))
+    return {'op': 'Code', 'instrs': instrs}, manifest.entries
 
 
-def _lower_stmt(node):
+def _lower_stmt_list(node, manifest, strings):
     op = node['op']
     if op == 'Expr':
-        return {'op': 'IExpr', 'value': node['value']}
+        return [{'op': 'IExpr', 'value': node['value']}]
     if op == 'Assign':
-        return {'op': 'IAssign', 'targets': node['targets'], 'value': node['value']}
+        return [{'op': 'IAssign', 'targets': node['targets'], 'value': node['value']}]
     if op == 'AugAssign':
-        return {'op': 'IAugAssign', 'target': node['target'], 'op2': node['op2'], 'value': node['value']}
+        return [{'op': 'IAugAssign', 'target': node['target'], 'op2': node['op2'], 'value': node['value']}]
     if op == 'AnnAssign':
-        return {
+        return [{
             'op': 'IAnnAssign',
             'target': node['target'],
             'annotation': node['annotation'],
             'value': node['value'],
             'simple': node['simple'],
-        }
+        }]
     if op == 'Return':
-        return {'op': 'IReturn', 'value': node['value']}
+        return [{'op': 'IReturn', 'value': node['value']}]
     if op == 'Raise':
-        return {'op': 'IRaise', 'exc': node['exc'], 'cause': node['cause']}
+        return [{'op': 'IRaise', 'exc': node['exc'], 'cause': node['cause']}]
     if op == 'Pass':
-        return {'op': 'IPass'}
+        return [{'op': 'IPass'}]
     if op == 'Break':
-        return {'op': 'IBreak'}
+        return [{'op': 'IBreak'}]
     if op == 'Continue':
-        return {'op': 'IContinue'}
+        return [{'op': 'IContinue'}]
     if op == 'Delete':
-        return {'op': 'IDelete', 'targets': node['targets']}
+        return [{'op': 'IDelete', 'targets': node['targets']}]
     if op == 'Global':
-        return {'op': 'IGlobal', 'names': node['names']}
+        return [{'op': 'IGlobal', 'names': node['names']}]
     if op == 'Nonlocal':
-        return {'op': 'INonlocal', 'names': node['names']}
+        return [{'op': 'INonlocal', 'names': node['names']}]
     if op == 'If':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        orelse = []
+        for stmt in node['orelse']:
+            orelse.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IIf',
             'test': node['test'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
-            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
-        }
+            'body': {'op': 'Code', 'instrs': body},
+            'orelse': {'op': 'Code', 'instrs': orelse},
+        }]
     if op == 'While':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        orelse = []
+        for stmt in node['orelse']:
+            orelse.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IWhile',
             'test': node['test'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
-            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
-        }
+            'body': {'op': 'Code', 'instrs': body},
+            'orelse': {'op': 'Code', 'instrs': orelse},
+        }]
     if op == 'For':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        orelse = []
+        for stmt in node['orelse']:
+            orelse.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IFor',
             'target': node['target'],
             'iter': node['iter'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
-            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
-        }
+            'body': {'op': 'Code', 'instrs': body},
+            'orelse': {'op': 'Code', 'instrs': orelse},
+        }]
     if op == 'AsyncFor':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        orelse = []
+        for stmt in node['orelse']:
+            orelse.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IAsyncFor',
             'target': node['target'],
             'iter': node['iter'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
-            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
-        }
+            'body': {'op': 'Code', 'instrs': body},
+            'orelse': {'op': 'Code', 'instrs': orelse},
+        }]
     if op == 'With':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IWith',
             'items': node['items'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
-        }
+            'body': {'op': 'Code', 'instrs': body},
+        }]
     if op == 'AsyncWith':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IAsyncWith',
             'items': node['items'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
-        }
+            'body': {'op': 'Code', 'instrs': body},
+        }]
     if op == 'Try':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        orelse = []
+        for stmt in node['orelse']:
+            orelse.extend(_lower_stmt_list(stmt, manifest, strings))
+        finalbody = []
+        for stmt in node['finalbody']:
+            finalbody.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'ITry',
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
-            'handlers': [_lower_handler(h) for h in node['handlers']],
-            'orelse': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['orelse']]},
-            'finalbody': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['finalbody']]},
-        }
+            'body': {'op': 'Code', 'instrs': body},
+            'handlers': [_lower_handler(h, manifest, strings) for h in node['handlers']],
+            'orelse': {'op': 'Code', 'instrs': orelse},
+            'finalbody': {'op': 'Code', 'instrs': finalbody},
+        }]
     if op == 'Import':
-        return {'op': 'IImport', 'names': node['names']}
+        binds = []
+        ids = []
+        fallback = []
+        for alias in node['names']:
+            name = alias['name']
+            asname = alias['asname']
+            mod_name = None if name is None or name < 0 else strings[name]
+            bind_name = asname if asname is not None and asname >= 0 else name
+            if mod_name and ('.' not in mod_name or (asname is not None and asname >= 0)):
+                binds.append(bind_name)
+                ids.append(manifest.add(mod_name, None))
+            else:
+                fallback.append(alias)
+        out = []
+        if binds:
+            out.append({'op': 'IImportLookup', 'binds': binds, 'ids': ids})
+        if fallback:
+            out.append({'op': 'IImport', 'names': fallback})
+        return out
     if op == 'ImportFrom':
-        return {
-            'op': 'IImportFrom',
-            'module': node['module'],
-            'names': node['names'],
-            'level': node['level'],
-        }
+        module = node['module']
+        module_name = None if module is None or module < 0 else strings[module]
+        level = node['level']
+        if level or not module_name or any(
+            (alias['name'] is None or alias['name'] < 0 or strings[alias['name']] == '*')
+            for alias in node['names']
+        ):
+            return [{
+                'op': 'IImportFrom',
+                'module': node['module'],
+                'names': node['names'],
+                'level': node['level'],
+            }]
+        binds = []
+        ids = []
+        for alias in node['names']:
+            name = strings[alias['name']]
+            bind = alias['asname'] if alias['asname'] is not None and alias['asname'] >= 0 else alias['name']
+            binds.append(bind)
+            ids.append(manifest.add(module_name, name))
+        return [{'op': 'IImportLookup', 'binds': binds, 'ids': ids}]
     if op == 'FunctionDef':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IFunctionDef',
             'name': node['name'],
             'args': node['args'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'body': {'op': 'Code', 'instrs': body},
             'decorator_list': node['decorator_list'],
             'returns': node['returns'],
             'is_async': False,
             'is_gen': _contains_yield_tree(node['body']),
-        }
+        }]
     if op == 'AsyncFunctionDef':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IFunctionDef',
             'name': node['name'],
             'args': node['args'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'body': {'op': 'Code', 'instrs': body},
             'decorator_list': node['decorator_list'],
             'returns': node['returns'],
             'is_async': True,
             'is_gen': False,
-        }
+        }]
     if op == 'ClassDef':
-        return {
+        body = []
+        for stmt in node['body']:
+            body.extend(_lower_stmt_list(stmt, manifest, strings))
+        return [{
             'op': 'IClassDef',
             'name': node['name'],
             'bases': node['bases'],
             'keywords': node['keywords'],
-            'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+            'body': {'op': 'Code', 'instrs': body},
             'decorator_list': node['decorator_list'],
-        }
+        }]
     raise NotImplementedError(f"statement lowering unsupported: {op}")
 
 
-def _lower_handler(node):
+def _lower_handler(node, manifest, strings):
+    body = []
+    for stmt in node['body']:
+        body.extend(_lower_stmt_list(stmt, manifest, strings))
     return {
         'op': 'IHandler',
         'type': node['type'],
         'name': node['name'],
-        'body': {'op': 'Code', 'instrs': [_lower_stmt(s) for s in node['body']]},
+        'body': {'op': 'Code', 'instrs': body},
     }
 
 
@@ -866,6 +1012,7 @@ _NODE_LAYOUTS = {
     'IAsyncWith': ('items', 'body'),
     'ITry': ('body', 'handlers', 'orelse', 'finalbody'),
     'IHandler': ('type', 'name', 'body'),
+    'IImportLookup': ('binds', 'ids'),
     'IImport': ('names',),
     'IImportFrom': ('module', 'names', 'level'),
     'IFunctionDef': ('name', 'args', 'body', 'decorator_list', 'returns', 'is_async', 'is_gen'),
@@ -1004,7 +1151,7 @@ def compile_to_compressed_bytes(source, schema_json=None):
     must first decrypt the schema to learn them.
     """
     import zlib
-    payload = compile_to_json(source)
+    payload, _manifest = compile_to_json(source)
     key_map, tag_map, mask, layouts = _schema_parts(schema_json)
     payload = _mask_payload(payload, mask)
     if key_map or tag_map:
@@ -1021,6 +1168,56 @@ def compile_to_compressed_bytes(source, schema_json=None):
 
     co = zlib.compressobj(9, zlib.DEFLATED, -15)
     return co.compress(packed) + co.flush()
+
+
+def _pack_manifest(entries):
+    buf = bytearray()
+    buf.extend(len(entries).to_bytes(4, 'little'))
+    for ident, module_path, attr in entries:
+        mb = module_path.encode('utf-8')
+        if len(mb) > 0xFFFF:
+            raise ValueError('manifest module path too long')
+        buf.extend((ident & 0xFFFFFFFF).to_bytes(4, 'little'))
+        buf.extend(len(mb).to_bytes(2, 'little'))
+        buf.extend(mb)
+        if attr is None:
+            buf.extend((0xFFFF).to_bytes(2, 'little'))
+        else:
+            ab = attr.encode('utf-8')
+            if len(ab) > 0xFFFF:
+                raise ValueError('manifest attr too long')
+            buf.extend(len(ab).to_bytes(2, 'little'))
+            buf.extend(ab)
+    return bytes(buf)
+
+
+def compile_to_artifacts(source, schema_json=None):
+    import zlib
+
+    payload, manifest = compile_to_json(source)
+    key_map, tag_map, mask, layouts = _schema_parts(schema_json)
+    payload = _mask_payload(payload, mask)
+    if key_map or tag_map:
+        payload = _apply_schema(payload, key_map, tag_map)
+    payload = _to_positional(payload, key_map, {v: k for k, v in tag_map.items()}, layouts)
+    packed = _pack_obj(payload)
+
+    bin_key, noise_schedule = _schema_bin_parts(schema_json)
+    if bin_key is not None:
+        packed = _rolling_xor(packed, bin_key)
+    if noise_schedule:
+        packed = _inject_noise(packed, noise_schedule)
+
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    compressed = co.compress(packed) + co.flush()
+
+    mo = zlib.compressobj(9, zlib.DEFLATED, -15)
+    manifest_bytes = _pack_manifest(manifest)
+    manifest_compressed = mo.compress(manifest_bytes) + mo.flush()
+    return {
+        'compressed': compressed,
+        'manifest': manifest_compressed,
+    }
 
 
 def _enc(v):

@@ -46,6 +46,8 @@ export interface V5IR {
     // zlib-deflated (raw, -15 wbits) JSON bytes. Obfuscate.ts encrypts
     // these as-is and the runtime stage2 decompresses after decryption.
     compressed: Uint8Array;
+    // zlib-deflated (raw, -15 wbits) static import manifest bytes.
+    manifest: Uint8Array;
     schema: V5Schema;
 }
 
@@ -64,10 +66,12 @@ export interface AssembleCipher {
     interpLabel: Uint8Array;
     irLabel: Uint8Array;
     schemaLabel: Uint8Array;
+    manifestLabel: Uint8Array;
     // pre-built chunked base64 ciphertexts
     interpChunks: ChunkedB64;   // encrypted+compressed MARSHALED interpreter code object
     irChunks: ChunkedB64;       // encrypted+compressed IR bytes
     schemaChunks: ChunkedB64;   // encrypted schema JSON
+    manifestChunks: ChunkedB64; // encrypted static import manifest bytes
     // internal variable names used in the stage2 source
     envCheckVar: string;    // sha256 of runtime env fingerprint
     interpCtVar: string;    // encrypted interpreter marshaled bytes
@@ -80,6 +84,7 @@ export interface AssembleCipher {
     interpFTVar: string;      // FunctionType recovered via `type(lambda:0)` — bypasses types.FunctionType hook (C7.1)
     schemaCtVar: string;
     irCtVar: string;
+    manifestCtVar: string;
     // v9: randomized bytes-key under which the interpreter module
     // registers its renamed `_pg_boot`. Stage2 indexes `interp_ns` by
     // this bytes object; no original name ("_pg_boot") is ever present.
@@ -131,12 +136,12 @@ export function buildV5Stage2Source(
 ): string {
     const { n_seed, n_kd, n_dec, n_tchk } = names;
     const {
-        interpLabel, irLabel, schemaLabel,
-        interpChunks, irChunks, schemaChunks,
+        interpLabel, irLabel, schemaLabel, manifestLabel,
+        interpChunks, irChunks, schemaChunks, manifestChunks,
         envCheckVar,
         interpCtVar, interpHashVar,
         interpSeedVar, interpPVar, interpMarshalVar, interpCodeVar, interpNsVar, interpFTVar,
-        schemaCtVar, irCtVar,
+        schemaCtVar, irCtVar, manifestCtVar,
         bootKeyBytes,
         pepBytes, profileBytes,
     } = cipher;
@@ -183,9 +188,53 @@ if ${n_tchk}():
     raise SystemExit(0)
 ${interpFTVar} = (lambda: 0).__class__
 ${envCheckVar} = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), ${interpFTVar}.__name__, str(${interpFTVar} is (lambda: None).__class__), ${interpFTVar}.__class__.__name__, ${interpFTVar}.__module__]).encode()).digest()
+_pg_bi_snap = dict(__builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__)
 ${interpChunks.decls}
 ${interpCtVar} = base64.b85decode(${interpChunks.concat})
 ${interpHashVar} = hashlib.sha256(${interpCtVar}).digest()
+${manifestChunks.decls}
+${manifestCtVar} = base64.b85decode(${manifestChunks.concat})
+_pg_manifest_seed = bytes(a ^ b ^ c for a, b, c in zip(hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(manifestLabel)})).digest(), ${interpHashVar}, ${envCheckVar}))
+_pg_manifest_p = ${n_kd}(_pg_manifest_seed)
+_pg_manifest_blob = zlib.decompress(${n_dec}(${manifestCtVar}, _pg_manifest_p[0], _pg_manifest_p[1], _pg_manifest_p[2]), -15)
+_pg_manifest_lut = {}
+_pg_manifest_mods = {}
+_pg_mod_type = type(sys)
+_pg_manifest_off = 0
+_pg_manifest_cnt = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 4], bytes([108, 105, 116, 116, 108, 101]).decode())
+_pg_manifest_off += 4
+for _ in range(_pg_manifest_cnt):
+    _pg_mid = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 4], bytes([108, 105, 116, 116, 108, 101]).decode())
+    _pg_manifest_off += 4
+    _pg_ml = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 2], bytes([108, 105, 116, 116, 108, 101]).decode())
+    _pg_manifest_off += 2
+    _pg_mod_name = _pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + _pg_ml].decode(bytes([117, 116, 102, 45, 56]).decode())
+    _pg_manifest_off += _pg_ml
+    _pg_al = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 2], bytes([108, 105, 116, 116, 108, 101]).decode())
+    _pg_manifest_off += 2
+    _pg_attr_name = None if _pg_al == 65535 else _pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + _pg_al].decode(bytes([117, 116, 102, 45, 56]).decode())
+    if _pg_al != 65535:
+        _pg_manifest_off += _pg_al
+    try:
+        _pg_mod = _pg_manifest_mods.get(_pg_mod_name)
+        if _pg_mod is None:
+            _pg_mod = sys.modules.get(_pg_mod_name)
+            if type(_pg_mod) is not _pg_mod_type:
+                sys.modules.pop(_pg_mod_name, None)
+                _pg_mod = _pg_bi_snap[bytes([95, 95, 105, 109, 112, 111, 114, 116, 95, 95]).decode()](_pg_mod_name, None, None, (bytes([95]).decode(),), 0)
+                _pg_live_mod = sys.modules.get(_pg_mod_name)
+                if type(_pg_live_mod) is _pg_mod_type:
+                    _pg_mod = _pg_live_mod
+            _pg_manifest_mods[_pg_mod_name] = _pg_mod
+        if _pg_attr_name is None:
+            _pg_manifest_lut[_pg_mid] = _pg_mod
+        else:
+            _pg_val = _pg_mod.__dict__.get(_pg_attr_name, _pg_manifest_mods)
+            if _pg_val is _pg_manifest_mods:
+                _pg_val = getattr(_pg_mod, _pg_attr_name)
+            _pg_manifest_lut[_pg_mid] = _pg_val
+    except BaseException as _pg_exc:
+        _pg_manifest_lut[_pg_mid] = _pg_exc
 ${interpSeedVar} = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(interpLabel)})).digest(), ${envCheckVar}))
 ${interpPVar} = ${n_kd}(${interpSeedVar})
 ${interpMarshalVar} = zlib.decompress(${n_dec}(${interpCtVar}, ${interpPVar}[0], ${interpPVar}[1], ${interpPVar}[2]), -15)
@@ -195,9 +244,9 @@ ${schemaChunks.decls}
 ${schemaCtVar} = base64.b85decode(${schemaChunks.concat})
 ${irChunks.decls}
 ${irCtVar} = base64.b85decode(${irChunks.concat})
-${interpNsVar}[bytes(${bootKeyLit})] = (${schemaCtVar}, bytes(${bytesArrayLit(schemaLabel)}), ${irCtVar}, bytes(${bytesArrayLit(irLabel)}), ${n_seed}, ${interpHashVar}, ${envCheckVar}, bytes(${pepLit}), bytes(${profileLit}), bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode())
+${interpNsVar}[bytes(${bootKeyLit})] = (${schemaCtVar}, bytes(${bytesArrayLit(schemaLabel)}), ${irCtVar}, bytes(${bytesArrayLit(irLabel)}), ${n_seed}, ${interpHashVar}, ${envCheckVar}, bytes(${pepLit}), bytes(${profileLit}), bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode(), _pg_bi_snap, _pg_manifest_lut)
 ${interpFTVar}(${interpCodeVar}, ${interpNsVar})()
-del ${interpMarshalVar}, ${interpCodeVar}, ${interpCtVar}
+del ${interpMarshalVar}, ${interpCodeVar}, ${interpCtVar}, _pg_manifest_blob, _pg_manifest_lut, _pg_manifest_mods
 `;
 }
 

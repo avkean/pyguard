@@ -221,9 +221,9 @@ export async function buildV5IR(source: string): Promise<V5IR> {
         py.globals.set('_pg_schema_json', JSON.stringify(schema));
         py.runPython(
             `import base64 as _pg_b64\n` +
-            `_pg_ir_b64 = _pg_b64.b64encode(` +
-            `compile_to_compressed_bytes(_pg_user_src, _pg_schema_json)` +
-            `).decode('ascii')\n`,
+            `_pg_art = compile_to_artifacts(_pg_user_src, _pg_schema_json)\n` +
+            `_pg_ir_b64 = _pg_b64.b64encode(_pg_art['compressed']).decode('ascii')\n` +
+            `_pg_manifest_b64 = _pg_b64.b64encode(_pg_art['manifest']).decode('ascii')\n`,
         );
     } catch (e) {
         const raw = e instanceof Error ? e.message : String(e);
@@ -231,9 +231,16 @@ export async function buildV5IR(source: string): Promise<V5IR> {
         throw new BuildIRError(message, kind);
     }
     const b64 = py.globals.get('_pg_ir_b64') as string;
+    const manifestB64 = py.globals.get('_pg_manifest_b64') as string;
     if (typeof b64 !== 'string') {
         throw new BuildIRError(
-            'Internal error: compile_to_compressed_bytes did not return a string',
+            'Internal error: compile_to_artifacts did not return IR bytes',
+            'internal',
+        );
+    }
+    if (typeof manifestB64 !== 'string') {
+        throw new BuildIRError(
+            'Internal error: compile_to_artifacts did not return a manifest',
             'internal',
         );
     }
@@ -241,5 +248,8 @@ export async function buildV5IR(source: string): Promise<V5IR> {
     const bin = atob(b64);
     const out = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return { compressed: out, schema };
+    const manifestBin = atob(manifestB64);
+    const manifest = new Uint8Array(manifestBin.length);
+    for (let i = 0; i < manifestBin.length; i++) manifest[i] = manifestBin.charCodeAt(i);
+    return { compressed: out, manifest, schema };
 }

@@ -19,6 +19,7 @@ import { execFileSync } from "child_process";
 import { obfuscatePythonCode } from "../lib/obfuscate";
 import { makeV5Schema } from "../lib/v5/schema";
 import { INTERPRETER_SRC_B64 } from "../lib/v5/interpreter_src";
+import type { V5IR } from "../lib/v5/assemble";
 
 const ROOT = path.resolve(__dirname, "..");
 const CASES_DIR = path.join(ROOT, "tests", "cases");
@@ -47,7 +48,7 @@ function runPython(file: string, timeoutMs = 15000): RunResult {
     }
 }
 
-function buildV5IR(source: string, schema: object): Uint8Array {
+function buildV5IR(source: string, schema: object): V5IR {
     const out = execFileSync("python3", [path.join(ROOT, "lib", "v5", "build_ir.py")], {
         input: source,
         encoding: "utf8",
@@ -55,7 +56,12 @@ function buildV5IR(source: string, schema: object): Uint8Array {
         maxBuffer: 32 * 1024 * 1024,
         env: { ...process.env, PYGUARD_V5_SCHEMA: JSON.stringify(schema) },
     }).trim();
-    return Uint8Array.from(Buffer.from(out, "base64"));
+    const parsed = JSON.parse(out);
+    return {
+        compressed: Uint8Array.from(Buffer.from(parsed.compressed, "base64")),
+        manifest: Uint8Array.from(Buffer.from(parsed.manifest, "base64")),
+        schema: schema as any,
+    };
 }
 
 // v7: stage1/stage2/interpreter are shipped as marshaled code objects,
@@ -105,7 +111,7 @@ function main() {
         const schema = makeV5Schema();
 
         const obf = obfuscatePythonCode(src, {
-            v5IR: { compressed: buildV5IR(src, schema), schema },
+            v5IR: buildV5IR(src, schema),
             compileAndMarshal,
             interpreterMarshalCompressed,
         });

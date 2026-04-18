@@ -57,6 +57,24 @@ class _NameGen:
                 return v
 
 
+# v6.5 / C17 — emit a bytes-constructor call that does NOT resolve through
+# the `bytes` Name at runtime. Instead we build `(b'').__class__(...)`:
+#   Constant(b'')       -> real bytes literal (no Name lookup)
+#   .__class__          -> C-slot Py_TYPE read on object header, returns
+#                          real bytes type even if builtins.bytes has been
+#                          replaced with a sitecustomize-planted subclass
+#   Call([...])         -> invokes real bytes constructor
+# The emitted AST never hits `getattr(builtins, 'bytes')`, so a `_SpyBytes`
+# subclass installed via `builtins.bytes = _SpyBytes` cannot intercept the
+# literal reconstruction path (string-pool decode, attr-name decode, etc).
+def _bytes_ctor(args_list):
+    return ast.Call(
+        func=ast.Attribute(
+            value=ast.Constant(value=b''),
+            attr='__class__', ctx=ast.Load()),
+        args=[args_list], keywords=[])
+
+
 # ---------------------------------------------------------------------------
 # Attribute Mangler (v5.1 / C1)
 # ---------------------------------------------------------------------------
@@ -307,12 +325,9 @@ class _AttributeMangler(ast.NodeTransformer):
     @staticmethod
     def _masked_bytes_node(b, mask):
         masked = bytes(c ^ mask[i & 15] for i, c in enumerate(b))
-        return ast.Call(
-            func=ast.Name(id='bytes', ctx=ast.Load()),
-            args=[ast.List(
-                elts=[ast.Constant(value=x) for x in masked],
-                ctx=ast.Load())],
-            keywords=[])
+        return _bytes_ctor(ast.List(
+            elts=[ast.Constant(value=x) for x in masked],
+            ctx=ast.Load()))
 
     def inject_prelude(self, tree, rng):
         """Prepend C1 (+ optional C2) helper definitions to module body.
@@ -342,12 +357,9 @@ class _AttributeMangler(ast.NodeTransformer):
         # _AM = bytes([...16 random...])
         prelude_body.append(ast.Assign(
             targets=[ast.Name(id=self.n_AM, ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Name(id='bytes', ctx=ast.Load()),
-                args=[ast.List(
-                    elts=[ast.Constant(value=b) for b in mask],
-                    ctx=ast.Load())],
-                keywords=[])))
+            value=_bytes_ctor(ast.List(
+                elts=[ast.Constant(value=b) for b in mask],
+                ctx=ast.Load()))))
 
         # _ATAB is required even if empty (in case only imports were
         # registered) — keep _gA/_sA/_dA definitions self-contained.
@@ -358,13 +370,18 @@ class _AttributeMangler(ast.NodeTransformer):
             targets=[ast.Name(id=self.n_ATAB, ctx=ast.Store())],
             value=ast.Tuple(elts=atab_entries, ctx=ast.Load())))
 
+        # v6.5 / C17 — use `(b'').__class__(...)` instead of `bytes(...)` so
+        # the attr-name decode path cannot be intercepted by a sitecustomize
+        # `builtins.bytes = _SpyBytes` hook. `b''.__class__` is a C-slot read
+        # on the bytes literal's object header and returns the real bytes type
+        # regardless of the builtins-module binding.
         attr_helpers_src = (
             f'def {self.n_gA}(_o, _k):\n'
-            f'    return getattr(_o, bytes(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode())\n'
+            f'    return getattr(_o, (b\'\').__class__(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode())\n'
             f'def {self.n_sA}(_o, _k, _v):\n'
-            f'    setattr(_o, bytes(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode(), _v)\n'
+            f'    setattr(_o, (b\'\').__class__(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode(), _v)\n'
             f'def {self.n_dA}(_o, _k):\n'
-            f'    delattr(_o, bytes(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode())\n'
+            f'    delattr(_o, (b\'\').__class__(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_ATAB}[_k])).decode())\n'
         )
         prelude_body.extend(ast.parse(attr_helpers_src).body)
 
@@ -383,7 +400,7 @@ class _AttributeMangler(ast.NodeTransformer):
             # modules but harmless when missing (fromlist is lenient).
             imp_src = (
                 f'def {self.n_imp}(_k):\n'
-                f'    return __import__(bytes(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_IMPT}[_k])).decode(), None, None, (\'_\',), 0)\n'
+                f'    return __import__((b\'\').__class__(_c ^ {self.n_AM}[_i & 15] for _i, _c in enumerate({self.n_IMPT}[_k])).decode(), None, None, (\'_\',), 0)\n'
             )
             prelude_body.extend(ast.parse(imp_src).body)
 
@@ -396,7 +413,7 @@ class _AttributeMangler(ast.NodeTransformer):
 # ---------------------------------------------------------------------------
 
 class _ImportConcealer(ast.NodeTransformer):
-    """Rewrite `import X` / `from X import Y` into opaque-key lookups.
+    """Rewrite only residual import shapes into opaque-key lookups.
 
     Shares state with _AttributeMangler:
       - Module paths are interned into `_IMPT` (mangler.add_mod_key)
@@ -404,16 +421,21 @@ class _ImportConcealer(ast.NodeTransformer):
         attribute access (mangler.add_attr_key), so a single table hides
         both surfaces.
 
-    Transforms:
-      import X                    →  X = _imp(k_X)            # k_X in _IMPT
-      import X as Y               →  Y = _imp(k_X)
-      import X.Y as Z             →  Z = _imp(k_XY)           # fromlist → submod
-      from X import Y             →  _t = _imp(k_X); Y = _gA(_t, k_Y)
-      from X import Y as Z        →  _t = _imp(k_X); Z = _gA(_t, k_Y)
-      from X import Y1, Y2        →  _t = _imp(k_X); Y1=_gA(_t,k1); Y2=_gA(_t,k2)
-      from X.Y import Z           →  _t = _imp(k_XY); Z = _gA(_t, k_Z)
+    v6.6 / C20: common static absolute imports are now left intact so the
+    build-IR layer can lift them into encrypted manifest-backed lookup ops.
+    That closes the `sys.modules` proxy leak at the runtime IR layer instead
+    of routing normal imports through `_imp(...)` / `_gA(...)` forever.
 
-    Not transformed (left structurally intact — rare / complex):
+    Still transformed here (residual / harder-to-freeze cases):
+      import X.Y as Z             →  Z = _imp(k_XY)           # fromlist → submod
+
+    Left structurally intact for downstream lowering / fallback:
+      import X
+      import X as Y
+      from X import Y
+      from X import Y as Z
+      from X import Y1, Y2
+      from X.Y import Z
       import X.Y                  (no asname; binds top-level X)
       from . import X             (relative; level > 0)
       from X import *             (star; __all__ semantics)
@@ -433,16 +455,17 @@ class _ImportConcealer(ast.NodeTransformer):
         out = []
         leftover = []
         for alias in node.names:
-            # asname present if the renamer tagged one (it does for all
-            # non-dotted imports), else we bind the original name.
             mod = alias.name
-            if '.' in mod and not alias.asname:
+            if not mod:
+                leftover.append(alias)
+                continue
+            if '.' not in mod:
+                leftover.append(alias)
+                continue
+            if not alias.asname:
                 # `import X.Y` with no asname binds `X` (top-level). Our
                 # `_imp` helper returns the deepest submodule (X.Y), which
                 # doesn't match that semantic. Leave this intact.
-                leftover.append(alias)
-                continue
-            if not mod:
                 leftover.append(alias)
                 continue
             local = alias.asname if alias.asname else mod
@@ -459,36 +482,7 @@ class _ImportConcealer(ast.NodeTransformer):
         return out if out else node
 
     def visit_ImportFrom(self, node):
-        # Relative imports: skip. `__import__` with level>0 needs the
-        # caller's __package__ and a valid globals dict; safer to leave
-        # them as plaintext.
-        if node.level and node.level > 0:
-            return node
-        if not node.module:
-            return node
-        # `from X import *`: __all__ semantics not worth replicating.
-        if any(a.name == '*' for a in node.names):
-            return node
-        mod_key = self.mangler.add_mod_key(node.module)
-        tname = self.ng.temp()
-        stmts = [ast.Assign(
-            targets=[ast.Name(id=tname, ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Name(id=self.mangler.n_imp, ctx=ast.Load()),
-                args=[ast.Constant(value=mod_key)],
-                keywords=[]))]
-        for alias in node.names:
-            name_key = self.mangler.add_attr_key(alias.name)
-            local = alias.asname if alias.asname else alias.name
-            stmts.append(ast.Assign(
-                targets=[ast.Name(id=local, ctx=ast.Store())],
-                value=ast.Call(
-                    func=ast.Name(id=self.mangler.n_gA, ctx=ast.Load()),
-                    args=[ast.Name(id=tname, ctx=ast.Load()),
-                          ast.Constant(value=name_key)],
-                    keywords=[])))
-            self.concealed += 1
-        return stmts
+        return node
 
 
 # ---------------------------------------------------------------------------
@@ -1362,10 +1356,7 @@ class _StringObfuscator(ast.NodeTransformer):
 
         return ast.Call(
             func=ast.Attribute(
-                value=ast.Call(
-                    func=ast.Name(id='bytes', ctx=ast.Load()),
-                    args=[ast.List(elts=all_elts, ctx=ast.Load())],
-                    keywords=[]),
+                value=_bytes_ctor(ast.List(elts=all_elts, ctx=ast.Load())),
                 attr='decode', ctx=ast.Load()),
             args=[ast.Constant(value='utf-8')], keywords=[])
 
@@ -2467,15 +2458,12 @@ class _SecretGateRewriter(ast.NodeTransformer):
     # -- AST emitters for the replacement gate --
 
     def _bytes_literal(self, data):
-        """Emit `bytes([b0, b1, ...])` — plain enough that downstream
-        transforms (MBA / constant unfold) can rewrite the individual ints
-        but the overall shape survives."""
-        return ast.Call(
-            func=ast.Name(id='bytes', ctx=ast.Load()),
-            args=[ast.List(
-                elts=[ast.Constant(value=b) for b in data],
-                ctx=ast.Load())],
-            keywords=[])
+        """Emit `(b'').__class__([b0, b1, ...])` — C17 bypass of
+        `builtins.bytes` name resolution. Downstream transforms can still
+        rewrite the individual ints; the overall shape survives."""
+        return _bytes_ctor(ast.List(
+            elts=[ast.Constant(value=b) for b in data],
+            ctx=ast.Load()))
 
     def _import_call(self, module_name):
         """Emit `__import__('modname')`."""
@@ -2558,31 +2546,28 @@ class _SecretGateRewriter(ast.NodeTransformer):
                 ],
                 orelse=[]),
         ]
-        plaintext = ast.Call(
-            func=ast.Name(id='bytes', ctx=ast.Load()),
-            args=[ast.GeneratorExp(
-                elt=ast.BinOp(
-                    left=ast.Name(id='a', ctx=ast.Load()),
-                    op=ast.BitXor(),
-                    right=ast.Name(id='b', ctx=ast.Load())),
-                generators=[ast.comprehension(
-                    target=ast.Tuple(
-                        elts=[ast.Name(id='a', ctx=ast.Store()),
-                              ast.Name(id='b', ctx=ast.Store())],
-                        ctx=ast.Store()),
-                    iter=ast.Call(
-                        func=ast.Name(id='zip', ctx=ast.Load()),
-                        args=[
-                            ast.Name(id=v_ct, ctx=ast.Load()),
-                            ast.Subscript(
-                                value=ast.Name(id=v_ks, ctx=ast.Load()),
-                                slice=ast.Slice(
-                                    lower=None, upper=_len(v_ct), step=None),
-                                ctx=ast.Load()),
-                        ],
-                        keywords=[]),
-                    ifs=[], is_async=0)])],
-            keywords=[])
+        plaintext = _bytes_ctor(ast.GeneratorExp(
+            elt=ast.BinOp(
+                left=ast.Name(id='a', ctx=ast.Load()),
+                op=ast.BitXor(),
+                right=ast.Name(id='b', ctx=ast.Load())),
+            generators=[ast.comprehension(
+                target=ast.Tuple(
+                    elts=[ast.Name(id='a', ctx=ast.Store()),
+                          ast.Name(id='b', ctx=ast.Store())],
+                    ctx=ast.Store()),
+                iter=ast.Call(
+                    func=ast.Name(id='zip', ctx=ast.Load()),
+                    args=[
+                        ast.Name(id=v_ct, ctx=ast.Load()),
+                        ast.Subscript(
+                            value=ast.Name(id=v_ks, ctx=ast.Load()),
+                            slice=ast.Slice(
+                                lower=None, upper=_len(v_ct), step=None),
+                            ctx=ast.Load()),
+                    ],
+                    keywords=[]),
+                ifs=[], is_async=0)]))
         return stmts, plaintext
 
     def _build_scrypt_assign(self, v_k, guess_expr, salt_expr):

@@ -214,8 +214,8 @@ const userSource = fs.readFileSync(args.src, 'utf-8');
 const schema = makeV5Schema();
 
 // Step 1: compile IR via python3 + build_ir.py.
-// build_ir's __main__ reads source from stdin and writes base64(zlib(JSON))
-// to stdout — the TS obfuscator treats these bytes as an opaque blob.
+// build_ir's __main__ reads source from stdin and writes a JSON envelope
+// carrying base64-encoded IR + import-manifest blobs.
 const py = spawnSync('python3', [path.join(root, 'lib/v5/build_ir.py')], {
     input: userSource,
     encoding: 'utf-8',
@@ -226,7 +226,7 @@ if (py.status !== 0) {
     console.error(py.stderr);
     process.exit(py.status || 1);
 }
-const irCompressedB64 = py.stdout.trim();
+const irArtifacts = JSON.parse(py.stdout.trim());
 
 // Step 2: call the TS obfuscator. We use tsx to run the TS directly.
 // To avoid process overhead, write a tiny driver script that imports
@@ -274,9 +274,10 @@ const interpMarshalRaw = compileAndMarshal(interpSrc, '<pg_interp>');
 const interpMarshalCompressed = Uint8Array.from(zlib.deflateRawSync(Buffer.from(interpMarshalRaw)));
 
 const userSource = fs.readFileSync(${JSON.stringify(args.src)}, 'utf-8');
-const compressed = Uint8Array.from(Buffer.from(${JSON.stringify(irCompressedB64)}, 'base64'));
+const compressed = Uint8Array.from(Buffer.from(${JSON.stringify(irArtifacts.compressed)}, 'base64'));
+const manifest = Uint8Array.from(Buffer.from(${JSON.stringify(irArtifacts.manifest)}, 'base64'));
 const stub = obfuscatePythonCode(userSource, {
-    v5IR: { compressed, schema: ${JSON.stringify(schema)} },
+    v5IR: { compressed, manifest, schema: ${JSON.stringify(schema)} },
     compileAndMarshal,
     interpreterMarshalCompressed: interpMarshalCompressed,
 });

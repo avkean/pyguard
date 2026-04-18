@@ -51,9 +51,9 @@ These make the original source literally unrecoverable byte-for-byte even if an 
 
 All attacks live in `tests/pentest/`. Run with `bash tests/pentest/run_scoreboard.sh`.
 
-Current status against 15 compatibility stubs with 26 attacks × 15 stubs = 390 cells:
+Current status against 15 compatibility stubs with 27 attacks × 15 stubs = 405 cells:
 
-- **375 HELD**
+- **390 HELD**
 - **15 CRASH(124)** — c9 gc-walk attack trips the 30 s scoreboard timeout on every stub (perf wall + seed divergence; dual HELD, not a regression).
 - **0 PWNED**
 

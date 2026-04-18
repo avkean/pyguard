@@ -809,6 +809,10 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_sg_acc   = ng.gen(); // C10 accumulator
     const n_sg_sig   = ng.gen(); // C10 signal module alias
     const n_sg_fh    = ng.gen(); // C10 faulthandler module alias
+    const n_io       = ng.gen(); // C12 stdio-pivot witness byte (v6.5)
+    const n_io_acc   = ng.gen(); // C12 accumulator
+    const n_bt       = ng.gen(); // C17 built-in-type identity witness (v6.5)
+    const n_bt_acc   = ng.gen(); // C17 accumulator
 
     // _kd internal names
     const k_seed     = ng.gen();
@@ -932,7 +936,7 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // NAMES (n_seed, n_h, n_pep, s1Plan.concat) and deterministic byte
     // literals. Does NOT embed seed or seed-derived ciphertext; those
     // are derived at runtime inside canonical via
-    //   ${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg}).digest()
+    //   ${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg} + ${n_io} + ${n_bt}).digest()
     // and consumed against the stage1 chunk names, whose values live in
     // the stub preamble (outside canonical).
     //
@@ -1038,6 +1042,90 @@ try:
 except Exception:
     pass
 ${n_sg} = bytes([${n_sg_acc} & 0xFF])
+${n_io_acc} = 0
+try:
+    if sys.stdout is not sys.__stdout__:
+        ${n_io_acc} |= 0x01
+except Exception:
+    pass
+try:
+    if sys.stderr is not sys.__stderr__:
+        ${n_io_acc} |= 0x02
+except Exception:
+    pass
+try:
+    if sys.displayhook is not sys.__displayhook__:
+        ${n_io_acc} |= 0x04
+except Exception:
+    pass
+try:
+    if sys.breakpointhook is not sys.__breakpointhook__:
+        ${n_io_acc} |= 0x08
+except Exception:
+    pass
+try:
+    if type(sys.stdout) is not type(sys.__stdout__):
+        ${n_io_acc} |= 0x10
+except Exception:
+    pass
+try:
+    if type(sys.stderr) is not type(sys.__stderr__):
+        ${n_io_acc} |= 0x20
+except Exception:
+    pass
+try:
+    if sys.stdin is not sys.__stdin__:
+        ${n_io_acc} |= 0x40
+except Exception:
+    pass
+try:
+    if type(sys.addaudithook).__name__ != 'builtin_function_or_method':
+        ${n_io_acc} |= 0x80
+except Exception:
+    pass
+${n_io} = bytes([${n_io_acc} & 0xFF])
+${n_bt_acc} = 0
+try:
+    if bytes is not (b'').__class__:
+        ${n_bt_acc} |= 0x01
+except Exception:
+    pass
+try:
+    if str is not (u'').__class__:
+        ${n_bt_acc} |= 0x02
+except Exception:
+    pass
+try:
+    if int is not (0).__class__:
+        ${n_bt_acc} |= 0x04
+except Exception:
+    pass
+try:
+    if bytearray is not bytearray().__class__:
+        ${n_bt_acc} |= 0x08
+except Exception:
+    pass
+try:
+    if tuple is not ().__class__:
+        ${n_bt_acc} |= 0x10
+except Exception:
+    pass
+try:
+    if list is not [].__class__:
+        ${n_bt_acc} |= 0x20
+except Exception:
+    pass
+try:
+    if dict is not {}.__class__:
+        ${n_bt_acc} |= 0x40
+except Exception:
+    pass
+try:
+    if type(b'') is not (b'').__class__:
+        ${n_bt_acc} |= 0x80
+except Exception:
+    pass
+${n_bt} = bytes([${n_bt_acc} & 0xFF])
 ${pepperBlock}
 def ${n_kd}(${k_seed}):
     ${k_seed} = bytes(a ^ b for a, b in zip(${k_seed}, ${n_pep}))
@@ -1244,11 +1332,11 @@ try:
 except Exception:
     pass
 try:
-    if hasattr(sys, '_audit_hooks') or any(v is not None for v in ${n_O}[${bi['getattr']}](sys, '_current_exceptions', lambda: {})().values()):
+    if type(sys.addaudithook).__name__ != 'builtin_function_or_method' or type(marshal.loads).__name__ != 'builtin_function_or_method':
         ${n_h} = bytes((b ^ ${prof.poison3}) for b in ${n_h})
 except Exception:
     pass
-${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg}).digest()
+${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg} + ${n_io} + ${n_bt}).digest()
 ${n_p1} = ${n_kd}(${n_vfy}(${n_seed}))
 ${n_S1} = base64.b85decode(${s1Plan.concat})
 ${n_pt1} = ${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2])
@@ -1256,6 +1344,8 @@ ${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed
 try:
     ${n_co} = marshal.loads(${n_pt1})
 except Exception:
+    sys.exit(0)
+if not isinstance(${n_co}, type((lambda: 0).__code__)):
     sys.exit(0)
 ${n_ftype}(${n_co}, ${n_ns})()
 ${END_MARKER}
@@ -1313,9 +1403,25 @@ ${END_MARKER}
     // excepthook-via-SIGUSR-interrupt-main traceback leak (c11).
     // Clean env = 0.
     //
-    // Build-side uses 0 for all three bytes so stubs ship keyed for the
-    // clean-environment case.
-    const seed = sha256(concatBytes(concatBytes(hashOut, pep), new Uint8Array([0, 0, 0])));
+    // v6.5 / C12 — `io` byte = stdio-pivot witness:
+    //   bit 0 = sys.stdout is not sys.__stdout__
+    //   bit 1 = sys.stderr is not sys.__stderr__
+    //   bit 2 = sys.displayhook is not sys.__displayhook__
+    //   bit 3 = sys.breakpointhook is not sys.__breakpointhook__
+    //   bit 4 = type(sys.stdout) is not type(sys.__stdout__)
+    //   bit 5 = type(sys.stderr) is not type(sys.__stderr__)
+    //   bit 6 = sys.stdin is not sys.__stdin__
+    //   bit 7 = type(sys.addaudithook) replaced (not builtin_function_or_method) [C18]
+    // Blocks post-decryption gc.get_objects heap walks pivoted off a
+    // sitecustomize-wrapped stdout proxy — the attacker's first print-
+    // triggered .write() hook requires stdout to be replaced, which flips
+    // bit 0 and poisons the seed before stage1 decrypts.
+    // Clean env = 0.
+    //
+    // Build-side uses 0 for all five bytes so stubs ship keyed for the
+    // clean-environment case. (mon, hk, sg, io, bt — 5 witness bytes after
+    // v6.5 / C17 added the built-in-type identity witness.)
+    const seed = sha256(concatBytes(concatBytes(hashOut, pep), new Uint8Array([0, 0, 0, 0, 0])));
 
     // 4. Derive cipher parameters and encrypt user payload.
     //    The runtime `_kd` XORs its input with `pep` before any sha256.
@@ -1387,6 +1493,7 @@ ${END_MARKER}
         const interpFTVar        = ng.gen();   // C7.1: FunctionType via type(lambda:0)
         const schemaCtVar        = ng.gen();
         const irCtVar            = ng.gen();
+        const manifestCtVar      = ng.gen();
 
         // v9: boot entry point indexed by a RANDOMIZED BYTES KEY, not by
         // the literal string "_pg_boot". The bytes come from
@@ -1506,6 +1613,15 @@ ${END_MARKER}
         const encSchemaB64 = bytesToBase85(encSchema);
         const schemaChunks = chunkB64(encSchemaB64, ng);
 
+        const manifestLabel = randomBytes(6);
+        const manifestSeedPre = sha256(concatBytes(seed, manifestLabel));
+        const manifestSeed = xor32(xor32(manifestSeedPre, interpHash), envCheckExpected);
+        const pepperedManifestSeed = xor32(manifestSeed, pep);
+        const paramsManifest = kdf(pepperedManifestSeed, prof);
+        const encManifest = encrypt(opts.v5IR.manifest, paramsManifest, prof);
+        const encManifestB64 = bytesToBase85(encManifest);
+        const manifestChunks = chunkB64(encManifestB64, ng);
+
         // ---- 3. Build + marshal stage2 -----------------------------------
         // v11: pack PolyProfile into 15 bytes for inline _k_derive inside
         // the interpreter. Layout must match the `_pg_boot` unpack in
@@ -1526,13 +1642,13 @@ ${END_MARKER}
             { n_seed, n_kd, n_dec, n_tchk },
             {
                 prof,
-                interpLabel, irLabel, schemaLabel,
-                interpChunks, irChunks, schemaChunks,
+                interpLabel, irLabel, schemaLabel, manifestLabel,
+                interpChunks, irChunks, schemaChunks, manifestChunks,
                 envCheckVar,
                 interpCtVar, interpHashVar,
                 interpSeedVar, interpPVar, interpMarshalVar,
                 interpCodeVar, interpNsVar, interpFTVar,
-                schemaCtVar, irCtVar,
+                schemaCtVar, irCtVar, manifestCtVar,
                 bootKeyBytes,
                 pepBytes, profileBytes,
             },

@@ -11,7 +11,104 @@ Stdlib-only. Compatible with Python 3.8+.
 """
 
 import builtins
+import struct as _pg_struct
 import sys
+
+
+# v6.5 / C17 — capture real built-in type objects via C-slot __class__ reads
+# on empty literals, at interpreter-module load time. These are unreachable
+# through Python-level hooks on `builtins.bytes` / `builtins.str` / `type()`:
+# `(b'').__class__` goes through the `tp_descr_get` slot of `object.__class__`
+# (a C-level getset descriptor on the immutable type `object`) which reads the
+# literal's `ob_type` pointer directly. A sitecustomize-planted
+# `builtins.bytes = _SpyBytes` subclass does not affect the ob_type of `b''`.
+# All interpreter-internal construction uses these captures instead of the
+# module-global names, so that a `builtins.bytes` / `builtins.str` spy never
+# sees the decoded string-pool / consts / IR-leaf bytes that the interpreter
+# materializes while running user code.
+_PGBT = (b'').__class__       # real bytes type
+_PGST = ('').__class__        # real str type
+
+
+# v6.5 / C18 — custom tagged binary codec for IR consts. Replaces
+# marshal.dumps/loads in `_build_accessor`. The accessor used to route
+# every const lookup through `marshal.loads(pt)`, which fires the
+# `marshal.loads` PEP 578 audit event with the plaintext bytes as the
+# first arg. A `sys.addaudithook()` installed from sitecustomize (before
+# stage0 runs) observed the stream and recovered user consts — including
+# the adjacent (byte^key, key) int pairs emitted by `_StringObfuscator`,
+# which XOR-pair trivially to plaintext user source literals.
+# The custom codec here is unobservable to audit hooks: the decode is
+# pure byte arithmetic, no stdlib audited call in the hot path.
+def _pg_pack_const(v):
+    t = type(v)
+    if v is None:     return b'\x00'
+    if v is True:     return b'\x01'
+    if v is False:    return b'\x02'
+    if v is Ellipsis: return b'\x0A'
+    if t is int:
+        n = (v.bit_length() // 8) + 1
+        b = v.to_bytes(n, 'little', signed=True)
+        return b'\x03' + len(b).to_bytes(4, 'little') + b
+    if t is float:
+        return b'\x04' + _pg_struct.pack('<d', v)
+    if t is complex:
+        return b'\x05' + _pg_struct.pack('<dd', v.real, v.imag)
+    if t is bytes:
+        return b'\x06' + len(v).to_bytes(4, 'little') + v
+    if t is str:
+        eb = v.encode('utf-8')
+        return b'\x07' + len(eb).to_bytes(4, 'little') + eb
+    if t is tuple:
+        parts = [_pg_pack_const(x) for x in v]
+        return b'\x08' + len(v).to_bytes(4, 'little') + b''.join(parts)
+    if t is frozenset:
+        vals = list(v)
+        parts = [_pg_pack_const(x) for x in vals]
+        return b'\x09' + len(vals).to_bytes(4, 'little') + b''.join(parts)
+    raise TypeError('unpackable const: ' + t.__name__)
+
+
+def _pg_unpack_const(buf, ofs=0):
+    tag = buf[ofs]
+    ofs += 1
+    if tag == 0x00: return None, ofs
+    if tag == 0x01: return True, ofs
+    if tag == 0x02: return False, ofs
+    if tag == 0x0A: return Ellipsis, ofs
+    if tag == 0x03:
+        n = int.from_bytes(buf[ofs:ofs+4], 'little'); ofs += 4
+        v = int.from_bytes(buf[ofs:ofs+n], 'little', signed=True); ofs += n
+        return v, ofs
+    if tag == 0x04:
+        v = _pg_struct.unpack('<d', buf[ofs:ofs+8])[0]; ofs += 8
+        return v, ofs
+    if tag == 0x05:
+        r, i = _pg_struct.unpack('<dd', buf[ofs:ofs+16]); ofs += 16
+        return complex(r, i), ofs
+    if tag == 0x06:
+        n = int.from_bytes(buf[ofs:ofs+4], 'little'); ofs += 4
+        v = _PGBT(buf[ofs:ofs+n]); ofs += n
+        return v, ofs
+    if tag == 0x07:
+        n = int.from_bytes(buf[ofs:ofs+4], 'little'); ofs += 4
+        v = buf[ofs:ofs+n].decode('utf-8'); ofs += n
+        return v, ofs
+    if tag == 0x08:
+        n = int.from_bytes(buf[ofs:ofs+4], 'little'); ofs += 4
+        vals = []
+        for _ in range(n):
+            x, ofs = _pg_unpack_const(buf, ofs)
+            vals.append(x)
+        return tuple(vals), ofs
+    if tag == 0x09:
+        n = int.from_bytes(buf[ofs:ofs+4], 'little'); ofs += 4
+        vals = []
+        for _ in range(n):
+            x, ofs = _pg_unpack_const(buf, ofs)
+            vals.append(x)
+        return frozenset(vals), ofs
+    raise ValueError('bad const tag')
 
 
 # --- sentinel exceptions used for control flow ---------------------------
@@ -34,10 +131,25 @@ _MISSING = object()
 
 # Internal schema storage — populated by run_blob(), not accessible as
 # _PG_* globals (those are wiped after copying to prevent frame-walk extraction).
+# These are ALSO scrubbed from module globals once interp.run() returns
+# (v6.5 / C13), so an atexit-registered gc walk finds nothing.
 _S_K = {}   # keys mapping
 _S_RT = {}  # reverse tags
 _S_M = b''  # XOR mask
 _S_L = {}   # field layouts
+
+# v6.5 / C19 — pinned builtins snapshot. Populated by `_pg_boot` from an
+# 11th arg supplied by stage2, which captures `dict(__builtins__)` after
+# stage2's envCheck snapshot and BEFORE stage2's `marshal.loads` — the
+# first post-envCheck audit-event opportunity an attacker can use to
+# swap `builtins.print`. `Scope.get` consults `_PG_BI` before falling
+# back to `getattr(builtins, name)`, so a post-boot `builtins.print = spy`
+# swap is invisible to user name resolution.
+_PG_BI = {}
+# Static import lookup table captured by stage2 before the interpreter code
+# object is unmarshaled. Maps manifest ids -> resolved module objects,
+# imported attributes, or deferred exceptions for re-raise at use time.
+_PG_IMP = {}
 
 
 def _pg_key(key):
@@ -58,8 +170,38 @@ def _pg_text(value):
         buf = bytearray(len(value))
         for i, b in enumerate(value):
             buf[i] = b ^ mask[i % len(mask)]
-        return bytes(buf).decode('utf-8')
+        return _PGBT(buf).decode('utf-8')
     return value
+
+
+def _pg_env_w():
+    """v6.5 / C12 — live environment witness byte.
+
+    Measured at boot-time inside `_build_accessor` and re-measured on every
+    accessor call. If any witnessed identity diverges post-boot (attacker
+    wraps sys.stdout / sys.stderr / sys.excepthook after the stage0 seed
+    gate has already accepted a clean env), the XOR delta folds into the
+    per-access decrypt key and the accessor returns garbage — preventing
+    post-decryption heap walks triggered via stdio hooks from recovering
+    plaintext strings and consts out of closure cells.
+
+    Stage0's envCheck already gates PRE-boot hook installation into the
+    seed; this function is the defense-in-depth that catches POST-boot
+    hook installation against the already-booted interpreter.
+    """
+    try:
+        w = 0
+        if sys.stdout is not sys.__stdout__: w |= 0x01
+        if sys.stderr is not sys.__stderr__: w |= 0x02
+        if sys.displayhook is not sys.__displayhook__: w |= 0x04
+        if sys.breakpointhook is not sys.__breakpointhook__: w |= 0x08
+        if type(sys.stdout) is not type(sys.__stdout__): w |= 0x10
+        if type(sys.stderr) is not type(sys.__stderr__): w |= 0x20
+        if sys.stdin is not sys.__stdin__: w |= 0x40
+        if sys.excepthook is not sys.__excepthook__: w |= 0x80
+        return w
+    except Exception:
+        return 0
 
 
 _NODE_POS = {
@@ -84,6 +226,7 @@ _NODE_POS = {
     'IAsyncWith': {'items': 1, 'body': 2},
     'ITry': {'body': 1, 'handlers': 2, 'orelse': 3, 'finalbody': 4},
     'IHandler': {'type': 1, 'name': 2, 'body': 3},
+    'IImportLookup': {'binds': 1, 'ids': 2},
     'IImport': {'names': 1},
     'IImportFrom': {'module': 1, 'names': 2, 'level': 3},
     'IFunctionDef': {'name': 1, 'args': 2, 'body': 3, 'decorator_list': 4, 'returns': 5, 'is_async': 6, 'is_gen': 7},
@@ -110,6 +253,7 @@ _NODE_POS = {
     'withitem': {'context_expr': 1, 'optional_vars': 2},
     'Try': {'body': 1, 'handlers': 2, 'orelse': 3, 'finalbody': 4},
     'ExceptHandler': {'type': 1, 'name': 2, 'body': 3},
+    'ImportLookup': {'binds': 1, 'ids': 2},
     'Import': {'names': 1},
     'ImportFrom': {'module': 1, 'names': 2, 'level': 3},
     'alias': {'name': 1, 'asname': 2},
@@ -217,6 +361,8 @@ class Scope:
         if name in self.global_names:
             if name in self.globals:
                 return self.globals[name]
+            if name in _PG_BI:
+                return _PG_BI[name]
             try:
                 return getattr(builtins, name)
             except AttributeError:
@@ -237,6 +383,8 @@ class Scope:
             p = p.parent
         if name in self.globals:
             return self.globals[name]
+        if name in _PG_BI:
+            return _PG_BI[name]
         try:
             return getattr(builtins, name)
         except AttributeError:
@@ -334,11 +482,22 @@ def _drive_sync(gen):
 class Interp:
     """Holds an opaque accessor closure instead of plain strings/consts
     tuples. Callers build `(_a)` where `_a(kind, idx)` is a closure holding
-    the encrypted/masked tables. The strings/consts never live as instance
-    attributes — only inside the closure cells of `_a`, which are not
-    addressable without first locating `_a` itself (and `_a` is a vanilla
-    function with no stable name across builds).
+    ENCRYPTED byte buffers (v6.5 / C17); the only handle on them is the
+    returned closure, which has no stable name across builds.
+
+    v6.5 / C14 — `__slots__` prevents `__dict__` creation on instances.
+    A gc.get_objects() walk that filters by `hasattr(o, '__dict__')` and
+    reads `o.__dict__['_a']` (the c12 pivot) finds nothing: slotted
+    instances have no __dict__, so the attack misses Interp entirely and
+    falls back to scanning for bare closures — which, thanks to C17,
+    hold ciphertext.
+
+    Also: the leaky `_str_cache` was dropped. Each access re-decrypts the
+    requested entry via the accessor; no plaintext accumulates anywhere
+    in Python-reachable memory across the lifetime of the interpreter.
     """
+
+    __slots__ = ('_a',)
 
     def __init__(self, *_args):
         # Vararg signature: `co_argcount == 1` (self), indistinguishable
@@ -354,16 +513,11 @@ class Interp:
         # `_a(0, idx)` returns raw (possibly mask-encoded) strings table entry.
         # `_a(1, idx)` returns the decoded const table entry.
         self._a = _args[0]
-        self._str_cache = {}
 
     def s(self, idx):
         if idx is None or idx < 0:
             return None
-        if idx in self._str_cache:
-            return self._str_cache[idx]
-        v = _pg_text(self._a(0, idx))
-        self._str_cache[idx] = v
-        return v
+        return _pg_text(self._a(0, idx))
 
     def k(self, idx):
         return self._a(1, idx)
@@ -419,6 +573,52 @@ class Interp:
             yield from self.exec_code(body, scope)
             return
         yield from self.step_block(body, scope)
+
+    def _bind_import_lookup(self, node, scope):
+        if False:
+            yield
+        for bind_idx, import_id in zip(_nf(node, 'binds'), _nf(node, 'ids')):
+            value = _PG_IMP[import_id]
+            if isinstance(value, BaseException):
+                raise value
+            scope.set(self.s(bind_idx), value)
+
+    def _bind_import(self, aliases, scope):
+        if False:
+            yield
+        for alias in aliases:
+            name = self.s(_nf(alias, 'name'))
+            asname = self.s(_nf(alias, 'asname'))
+            mod = __import__(name, scope.globals, None, (), 0)
+            if asname is not None:
+                target = mod
+                for p in name.split('.')[1:]:
+                    target = getattr(target, p)
+                scope.set(asname, target)
+            else:
+                scope.set(name.split('.')[0], mod)
+
+    def _bind_import_from(self, node, scope):
+        if False:
+            yield
+        module = self.s(_nf(node, 'module')) or ''
+        level = _nf(node, 'level')
+        fromlist = tuple(self.s(_nf(a, 'name')) for a in _nf(node, 'names'))
+        mod = __import__(module, scope.globals, None, fromlist, level)
+        for alias in _nf(node, 'names'):
+            name = self.s(_nf(alias, 'name'))
+            asname = self.s(_nf(alias, 'asname'))
+            bind = asname if asname is not None else name
+            if name == '*':
+                if hasattr(mod, '__all__'):
+                    for k in mod.__all__:
+                        scope.set(k, getattr(mod, k))
+                else:
+                    for k in dir(mod):
+                        if not k.startswith('_'):
+                            scope.set(k, getattr(mod, k))
+            else:
+                scope.set(bind, getattr(mod, name))
 
     def step_inst(self, node, scope):
         if False:
@@ -588,39 +788,16 @@ class Interp:
             yield from self._do_try(node, scope)
             return
 
+        if op == 'IImportLookup':
+            yield from self._bind_import_lookup(node, scope)
+            return
+
         if op == 'IImport':
-            for alias in _nf(node, 'names'):
-                name = self.s(_nf(alias, 'name'))
-                asname = self.s(_nf(alias, 'asname'))
-                mod = __import__(name, scope.globals, None, (), 0)
-                if asname is not None:
-                    target = mod
-                    for p in name.split('.')[1:]:
-                        target = getattr(target, p)
-                    scope.set(asname, target)
-                else:
-                    scope.set(name.split('.')[0], mod)
+            yield from self._bind_import(_nf(node, 'names'), scope)
             return
 
         if op == 'IImportFrom':
-            module = self.s(_nf(node, 'module')) or ''
-            level = _nf(node, 'level')
-            fromlist = tuple(self.s(_nf(a, 'name')) for a in _nf(node, 'names'))
-            mod = __import__(module, scope.globals, None, fromlist, level)
-            for alias in _nf(node, 'names'):
-                name = self.s(_nf(alias, 'name'))
-                asname = self.s(_nf(alias, 'asname'))
-                bind = asname if asname is not None else name
-                if name == '*':
-                    if hasattr(mod, '__all__'):
-                        for k in mod.__all__:
-                            scope.set(k, getattr(mod, k))
-                    else:
-                        for k in dir(mod):
-                            if not k.startswith('_'):
-                                scope.set(k, getattr(mod, k))
-                else:
-                    scope.set(bind, getattr(mod, name))
+            yield from self._bind_import_from(node, scope)
             return
 
         if op == 'IFunctionDef':
@@ -801,40 +978,16 @@ class Interp:
             yield from self._do_try(node, scope)
             return
 
+        if op == 'ImportLookup':
+            yield from self._bind_import_lookup(node, scope)
+            return
+
         if op == 'Import':
-            for alias in _nf(node, 'names'):
-                name = self.s(_nf(alias, 'name'))
-                asname = self.s(_nf(alias, 'asname'))
-                mod = __import__(name, scope.globals, None, (), 0)
-                if asname is not None:
-                    # for "import a.b as c", bind c=a.b
-                    target = mod
-                    for p in name.split('.')[1:]:
-                        target = getattr(target, p)
-                    scope.set(asname, target)
-                else:
-                    scope.set(name.split('.')[0], mod)
+            yield from self._bind_import(_nf(node, 'names'), scope)
             return
 
         if op == 'ImportFrom':
-            module = self.s(_nf(node, 'module')) or ''
-            level = _nf(node, 'level')
-            fromlist = tuple(self.s(_nf(a, 'name')) for a in _nf(node, 'names'))
-            mod = __import__(module, scope.globals, None, fromlist, level)
-            for alias in _nf(node, 'names'):
-                name = self.s(_nf(alias, 'name'))
-                asname = self.s(_nf(alias, 'asname'))
-                bind = asname if asname is not None else name
-                if name == '*':
-                    if hasattr(mod, '__all__'):
-                        for k in mod.__all__:
-                            scope.set(k, getattr(mod, k))
-                    else:
-                        for k in dir(mod):
-                            if not k.startswith('_'):
-                                scope.set(k, getattr(mod, k))
-                else:
-                    scope.set(bind, getattr(mod, name))
+            yield from self._bind_import_from(node, scope)
             return
 
         if op == 'FunctionDef' or op == 'AsyncFunctionDef':
@@ -1684,7 +1837,7 @@ def _decode_const(c):
     if t == 'int':      return int(c[1])
     if t == 'float':    return float(c[1])
     if t == 'str':      return _pg_text(c[1])
-    if t == 'bytes':    return bytes(c[1])
+    if t == 'bytes':    return _PGBT(c[1])
     if t == 'complex':  return complex(float(c[1]), float(c[2]))
     if t == 'ellipsis': return Ellipsis
     if t == 'tuple':    return tuple(_decode_const(x) for x in c[1])
@@ -1693,24 +1846,84 @@ def _decode_const(c):
 
 
 def _build_accessor(strings, consts):
-    """Construct the opaque (kind, idx) -> entry accessor passed to Interp.
+    """v6.5 / C12+C17 — construct the opaque (kind, idx) accessor.
 
-    `strings` is the raw strings tuple (entries may be plain str or mask-
-    encoded byte lists; Interp.s() applies _pg_text on each access).
-    `consts` is the already-decoded consts tuple of Python objects.
+    SECURITY MODEL (post-decryption leak defense):
 
-    Both are captured in this function's closure cells. They are never
-    exposed as attributes on Interp; the only handle on them is the
-    returned closure, which has no stable name across builds.
+    The legacy implementation captured raw `strings` and `consts` tuples
+    in the closure cells of a trivial `_a(kind, idx)` lookup. A
+    gc.get_objects() walk (triggered from a sitecustomize-installed
+    sys.stdout proxy on first user print, since stage0 didn't witness
+    stdio identity pre-v6.5) could directly read cell_contents and exfil
+    the entire decoded string pool and const pool plus the interpreter
+    module's _S_M / _S_K / _S_RT / _S_L globals.
+
+    This version keeps ONLY encrypted byte buffers + plaintext offset
+    tables in the closure. Each accessor call:
+      1. Measures the live environment witness byte (`_pg_env_w()`).
+      2. XORs it against the boot-time witness byte to get a delta.
+      3. Decrypts the requested slice with `static_key ^ delta`.
+    In a clean env, delta == 0 and decryption uses the static key
+    unchanged. If an attacker hooks any witnessed stdio identity after
+    boot (to pivot into a gc walk), the delta is non-zero and the
+    accessor returns garbage — interpreter processing of a corrupted
+    string table aborts before the first user print can fire any
+    attacker-installed write() hook.
+
+    The pre-boot pivot (attacker wraps stdout via sitecustomize before
+    stage0 runs) is caught upstream by stage0's `n_io` witness folding
+    into the master seed — decryption of stage1 fails silently and the
+    accessor is never constructed in that scenario.
     """
+    import os as _os
+    _xk = _os.urandom(32)
+    _xkl = len(_xk)
+    # Pack + encrypt strings. Tag byte distinguishes:
+    #   \x00 — plain UTF-8 str
+    #   \x01 — list-of-int (mask-encoded; _pg_text decodes via _S_M)
+    #   \x02 — any other object, custom-codec dumped (C18: no marshal)
+    _s_offs = []
+    _s_plain = bytearray()
+    for e in strings:
+        if isinstance(e, str):
+            b = b'\x00' + e.encode('utf-8')
+        elif isinstance(e, (list, tuple)):
+            b = b'\x01' + _PGBT(e)
+        else:
+            b = b'\x02' + _pg_pack_const(e)
+        _s_offs.append((len(_s_plain), len(b)))
+        _s_plain.extend(b)
+    _c_offs = []
+    _c_plain = bytearray()
+    for c in consts:
+        b = _pg_pack_const(c)
+        _c_offs.append((len(_c_plain), len(b)))
+        _c_plain.extend(b)
+    _s_ct = _PGBT(b ^ _xk[i % _xkl] for i, b in enumerate(_s_plain))
+    _c_ct = _PGBT(b ^ _xk[i % _xkl] for i, b in enumerate(_c_plain))
+    _s_offs_t = tuple(_s_offs)
+    _c_offs_t = tuple(_c_offs)
+    _bw = _pg_env_w()
+    # Scrub plaintext locals before closure is built.
+    del _s_plain, _c_plain, _s_offs, _c_offs, strings, consts
+
     def _a(kind, idx):
+        delta = _bw ^ _pg_env_w()
         if kind == 0:
-            return strings[idx]
+            start, length = _s_offs_t[idx]
+            pt = _PGBT(_s_ct[start + i] ^ _xk[(start + i) % _xkl] ^ delta
+                       for i in range(length))
+            tag = pt[:1]
+            if tag == b'\x00':
+                return pt[1:].decode('utf-8')
+            if tag == b'\x01':
+                return list(pt[1:])
+            return _pg_unpack_const(pt, 1)[0]
         if kind == 1:
-            return consts[idx]
-        # Unknown kind probe — return a sentinel that doesn't leak data
-        # but isn't None (a hooked _a returning None on probe is a tamper
-        # signal a future hardening round can verify).
+            start, length = _c_offs_t[idx]
+            pt = _PGBT(_c_ct[start + i] ^ _xk[(start + i) % _xkl] ^ delta
+                       for i in range(length))
+            return _pg_unpack_const(pt, 0)[0]
         raise LookupError(kind)
     return _a
 
@@ -1727,7 +1940,7 @@ def run_blob(blob, module_name='__main__'):
     # This prevents frame-walk attacks from extracting schema by known names.
     _S_K = dict(g.pop('_PG_KEYS', {}))
     _S_RT = dict(g.pop('_PG_RTAGS', {}))
-    _S_M = bytes(g.pop('_PG_MASK', ()))
+    _S_M = _PGBT(g.pop('_PG_MASK', ()))
     _S_L = dict(g.pop('_PG_LAYOUTS', {}))
     g.pop('_PG_TAGS', None)
     # --- undo noise injection + rolling XOR ---
@@ -1741,18 +1954,70 @@ def run_blob(blob, module_name='__main__'):
     # ------------------------------------------------
     loaded = _pg_parse_bin(blob)
     consts = tuple(_decode_const(c) for c in loaded[1])
-    interp = Interp(_build_accessor(loaded[0], consts))
+    _acc = _build_accessor(loaded[0], consts)
+    interp = Interp(_acc)
     tree = loaded[2]
     del loaded, blob, consts
-    interp.run(tree, module_name)
+    try:
+        interp.run(tree, module_name)
+    finally:
+        _pg_scrub_post_run(_acc, interp)
+        del _acc, interp, tree
+
+
+def _pg_scrub_post_run(_acc, _interp):
+    """v6.5 / C15 — post-run cleanup.
+
+    After the user program finishes (or raises), drop every Python-level
+    reference to decrypted interpreter state:
+      1. Scrub the accessor closure's cell contents — the encrypted byte
+         buffers and key material held inside `_build_accessor`'s closure.
+         Cell contents are writable on CPython 3.7+; assigning `None`
+         breaks the reference graph that an atexit-registered
+         gc.get_objects() walk would otherwise find.
+      2. Drop `_S_K / _S_RT / _S_M / _S_L` from the interpreter module's
+         globals. These are the per-build polymorphic schema dicts; the
+         legacy c12_attack exfiltrated them via `_a.__globals__`. After
+         scrub, the interpreter module dict contains none of them, so an
+         attacker's atexit hook walking sys.modules finds nothing.
+      3. Force a gc cycle so any reference cycles (Interp → accessor →
+         closure) release their memory before the main process's atexit
+         hooks fire.
+    """
+    try:
+        cl = getattr(_acc, '__closure__', None) or ()
+        for _cell in cl:
+            try:
+                _cell.cell_contents = None
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _g = globals()
+    for _n in ('_S_K', '_S_RT', '_S_M', '_S_L'):
+        _g.pop(_n, None)
+    try:
+        _PG_IMP.clear()
+    except Exception:
+        pass
+    try:
+        _PG_BI.clear()
+    except Exception:
+        pass
+    try:
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
 
 
 def _pg_boot(*_a):
     """PyGuard interpreter entry point.
 
-    Signature (9 or 10 inert-bytes positional args, no callables):
+    Signature (9..12 positional args, no stage2 callables):
       schema_ct, schema_label, ir_ct, ir_label, seed,
-      interp_hash, env_hash, pep, profile[, module_name='__main__']
+      interp_hash, env_hash, pep, profile[, module_name='__main__'
+      [, builtins_snapshot[, import_lut]]]
 
     All stage2-supplied "config" is inert bytes: a 32-byte `pep` pepper,
     and a 15-byte `profile` struct (rounds, rot_mod, sbx_nudge,
@@ -1764,6 +2029,8 @@ def _pg_boot(*_a):
     `co_argcount == 0` (vararg-only) defeats any structural fingerprint
     keyed on argument count.
     """
+    _bi_snap = None
+    _imp_lut = None
     if len(_a) == 9:
         (schema_ct, schema_label, ir_ct, ir_label, seed,
          interp_hash, env_hash, pep, profile) = _a
@@ -1771,18 +2038,31 @@ def _pg_boot(*_a):
     elif len(_a) == 10:
         (schema_ct, schema_label, ir_ct, ir_label, seed,
          interp_hash, env_hash, pep, profile, module_name) = _a
+    elif len(_a) == 11:
+        (schema_ct, schema_label, ir_ct, ir_label, seed,
+         interp_hash, env_hash, pep, profile, module_name, _bi_snap) = _a
+    elif len(_a) == 12:
+        (schema_ct, schema_label, ir_ct, ir_label, seed,
+         interp_hash, env_hash, pep, profile, module_name, _bi_snap, _imp_lut) = _a
     else:
-        raise TypeError("_pg_boot: expected 9 or 10 args, got " + str(len(_a)))
+        raise TypeError("_pg_boot: expected 9..12 args, got " + str(len(_a)))
     del _a
+    global _PG_BI, _PG_IMP
+    if isinstance(_bi_snap, dict):
+        _PG_BI = _bi_snap
+    if isinstance(_imp_lut, dict):
+        _PG_IMP = _imp_lut
+    del _bi_snap
+    del _imp_lut
 
     # Unpack the 15-byte profile struct (layout must match TS emission
     # in lib/obfuscate.ts / lib/v5/assemble.ts).
     _rounds = profile[0]
     _rot_mod = profile[1]
     _sbx_nudge = profile[2]
-    _rk_label = bytes(profile[3:7])
-    _rot_label = bytes(profile[7:11])
-    _sbx_label = bytes(profile[11:15])
+    _rk_label = _PGBT(profile[3:7])
+    _rot_label = _PGBT(profile[7:11])
+    _sbx_label = _PGBT(profile[11:15])
 
     global _S_K, _S_RT, _S_M, _S_L
     import hashlib as _h
@@ -1790,7 +2070,7 @@ def _pg_boot(*_a):
 
     # --- decrypt schema (v8: positional binary, not JSON) ---
     _schema_seed_pre = _h.sha256(seed + schema_label).digest()
-    _schema_seed = bytes(a ^ b ^ c for a, b, c in zip(
+    _schema_seed = _PGBT(a ^ b ^ c for a, b, c in zip(
         _schema_seed_pre, interp_hash, env_hash))
     _schema_p = _k_derive(_schema_seed, pep, _rounds, _rk_label,
                           _rot_label, _sbx_label, _rot_mod, _sbx_nudge)
@@ -1800,7 +2080,7 @@ def _pg_boot(*_a):
     _o = 0
     # mask
     _ml = _sb[_o]; _o += 1
-    _S_M = bytes(_sb[_o:_o + _ml]); _o += _ml
+    _S_M = _PGBT(_sb[_o:_o + _ml]); _o += _ml
     # bin_key
     _bk_lo = _sb[_o] | (_sb[_o+1] << 8) | (_sb[_o+2] << 16) | (_sb[_o+3] << 24); _o += 4
     _bk_hi = _sb[_o] | (_sb[_o+1] << 8) | (_sb[_o+2] << 16) | (_sb[_o+3] << 24); _o += 4
@@ -1851,7 +2131,7 @@ def _pg_boot(*_a):
 
     # --- decrypt IR bytes ---
     _ir_seed_pre = _h.sha256(seed + ir_label).digest()
-    _ir_seed = bytes(a ^ b ^ c for a, b, c in zip(
+    _ir_seed = _PGBT(a ^ b ^ c for a, b, c in zip(
         _ir_seed_pre, interp_hash, env_hash))
     _ir_p = _k_derive(_ir_seed, pep, _rounds, _rk_label,
                       _rot_label, _sbx_label, _rot_mod, _sbx_nudge)
@@ -1869,15 +2149,22 @@ def _pg_boot(*_a):
     # --- parse + run ---
     loaded = _pg_parse_bin(blob)
     _consts = tuple(_decode_const(c) for c in loaded[1])
-    # Build accessor closure here. The strings tuple (loaded[0]) and the
-    # decoded consts are captured in `_a`'s closure cells. They are not
-    # stored as Interp instance attributes, so a class-init hook on
-    # Interp captures only `_a` (an opaque function), not the underlying
-    # tables.
-    interp = Interp(_build_accessor(loaded[0], _consts))
+    # v6.5 / C17: _build_accessor packs and XOR-encrypts the strings +
+    # consts at this point. The closure cells of `_a` hold only
+    # ciphertext + offset tables; plaintext tuples never reach closure.
+    _acc = _build_accessor(loaded[0], _consts)
+    interp = Interp(_acc)
     tree = loaded[2]
     del loaded, blob, _consts
-    interp.run(tree, module_name)
+    try:
+        interp.run(tree, module_name)
+    finally:
+        # v6.5 / C15: post-run scrub. Nulls accessor closure cells, pops
+        # _S_K / _S_RT / _S_M / _S_L from module globals, and forces a gc
+        # cycle. An attacker's atexit hook walks gc.get_objects() after
+        # this and finds no decrypted state reachable.
+        _pg_scrub_post_run(_acc, interp)
+        del _acc, interp, tree
 
 
 def _k_derive(input_seed, pep, rounds, rk_label, rot_label, sbx_label, rot_mod, sbx_nudge):
@@ -1893,7 +2180,7 @@ def _k_derive(input_seed, pep, rounds, rk_label, rot_label, sbx_label, rot_mod, 
     encryption side used the same math and any drift breaks compat.
     """
     import hashlib as _h2
-    peppered = bytes(a ^ b for a, b in zip(input_seed, pep))
+    peppered = _PGBT(a ^ b for a, b in zip(input_seed, pep))
     rks = []
     h = peppered
     for _ in range(rounds):
@@ -1934,7 +2221,7 @@ def _c_dec(ct, rks, rotk, inv):
         b ^= prev
         out[i] = b
         prev = ct[i]
-    return bytes(out)
+    return _PGBT(out)
 
 
 def _rolling_xor(data, seed):
@@ -1947,7 +2234,7 @@ def _rolling_xor(data, seed):
     for i in range(len(data)):
         key = (key * _MULT + _INC) & _MASK64
         out[i] = data[i] ^ ((key >> 32) & 0xFF)
-    return bytes(out)
+    return _PGBT(out)
 
 
 def _strip_noise(data, noise_schedule):
@@ -1969,7 +2256,7 @@ def _strip_noise(data, noise_schedule):
         before_len = len(buf) - length
         actual = pos % (before_len + 1)
         del buf[actual:actual + length]
-    return bytes(buf)
+    return _PGBT(buf)
 
 
 def _pg_parse_bin(blob):
@@ -2057,7 +2344,7 @@ if __name__ == '__main__':
         tags = dict(schema.get('tags', {}).items())
         globals()['_PG_TAGS'] = tags
         globals()['_PG_RTAGS'] = {v: k for k, v in tags.items()}
-        globals()['_PG_MASK'] = bytes(schema.get('mask', []))
+        globals()['_PG_MASK'] = _PGBT(schema.get('mask', []))
         globals()['_PG_LAYOUTS'] = {
             k: {name: i + 1 for i, name in enumerate(v)}
             for k, v in dict(schema.get('layouts', {}).items()).items()

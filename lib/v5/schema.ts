@@ -8,11 +8,11 @@ export interface V5Schema {
 }
 
 const KEY_NAMES = [
-    "annotation", "arg", "args", "asname", "attr", "bases", "body",
+    "annotation", "arg", "args", "asname", "attr", "bases", "binds", "body",
     "cause", "comparators", "consts", "context_expr", "conversion",
     "decorator_list", "defaults", "elt", "elts", "exc", "finalbody",
     "format_spec", "func", "generators", "handlers", "i", "id", "idx",
-    "instrs", "is_async", "is_gen",
+    "ids", "instrs", "is_async", "is_gen",
     "ifs", "items", "iter", "key", "keys", "keywords", "kw_defaults",
     "kwarg", "kwonlyargs", "left", "level", "lower", "module", "name",
     "names", "op", "op2", "operand", "ops", "optional_vars", "orelse",
@@ -26,7 +26,7 @@ const TAG_NAMES = [
     "IExpr", "IAssign", "IAugAssign", "IAnnAssign", "IReturn", "IRaise",
     "IPass", "IBreak", "IContinue", "IDelete", "IGlobal", "INonlocal",
     "IIf", "IWhile", "IFor", "IAsyncFor", "IWith", "IAsyncWith",
-    "ITry", "IHandler", "IImport", "IImportFrom", "IFunctionDef", "IClassDef",
+    "ITry", "IHandler", "IImportLookup", "IImport", "IImportFrom", "IFunctionDef", "IClassDef",
     "Module", "Expression",
     "Assign", "AugAssign", "AnnAssign",
     "Expr", "Return", "Raise", "Pass", "Break", "Continue",
@@ -78,6 +78,7 @@ const NODE_LAYOUTS: Record<string, string[]> = {
     IAsyncWith: ["items", "body"],
     ITry: ["body", "handlers", "orelse", "finalbody"],
     IHandler: ["type", "name", "body"],
+    IImportLookup: ["binds", "ids"],
     IImport: ["names"],
     IImportFrom: ["module", "names", "level"],
     IFunctionDef: ["name", "args", "body", "decorator_list", "returns", "is_async", "is_gen"],
