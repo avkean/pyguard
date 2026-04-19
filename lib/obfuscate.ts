@@ -3,10 +3,9 @@
 // PyGuard — hardened Python obfuscator (current generation: v11).
 //
 // Caller provides a pre-built IR (from lib/v5/build_ir.py, run in Pyodide
-// or a subprocess) and a marshaled, compressed interpreter code object.
-// The user source is replaced with a stub that wraps the encrypted IR and
-// loads the interpreter via marshal.loads (no compile() of user source at
-// runtime). See lib/v5/assemble.ts for the stage2 architecture.
+// or a subprocess) and a tagged-marshaled, compressed interpreter blob.
+// The user source is replaced with a stub that never compile()s decrypted
+// stage text at runtime. See lib/v5/assemble.ts for the stage2 architecture.
 //
 // ============================================================================
 // Threat model: motivated humans AND adversarial LLMs.
@@ -720,7 +719,12 @@ function serializeSchemaBinary(schema: {
 
 // v5 imports — kept inline so non-v5 code paths don't pull in the
 // interpreter source string.
-import { buildV5Stage2Source, serializeIR } from './v5/assemble';
+import {
+    buildV5Stage2Source,
+    packV5BootBundle,
+    packV5Stage2Payload,
+    serializeIR,
+} from './v5/assemble';
 import type { V5IR } from './v5/assemble';
 import { INTERPRETER_SRC_B64, BOOT_KEY_BYTES } from './v5/interpreter_src';
 
@@ -731,17 +735,14 @@ export interface ObfuscateOpts {
     // never sees user source. Build the IR with lib/v5/build_ir.py
     // (in Pyodide for browser, or via subprocess for Node testing).
     v5IR?: V5IR;
-    // v7: compile Python source → bytecode → marshal.dumps bytes. Used
-    // for stage1 and stage2 (which remain small enough not to need
-    // compression). The Node driver shells out to python3; the browser
-    // driver uses Pyodide. Required when v5IR is present.
+    // Compile Python source to a tagged marshal blob:
+    //   b'PGM1' + <major byte> + <minor byte> + marshal.dumps(code)
+    // The runtime checks the 6-byte tag before marshal.loads so a stub
+    // fails closed on Python-version mismatch instead of falling back to
+    // runtime compile() and leaking stage source through audit hooks.
     compileAndMarshal?: (source: string, filename?: string) => Uint8Array;
-    // v7: zlib-raw-deflated (-15 wbits) marshal.dumps bytes for the
-    // interpreter module. The caller prepares this by decompressing
-    // INTERPRETER_SRC_B64, compiling with the Python version the stub
-    // will run against, marshaling, and re-compressing. Required when
-    // v5IR is present. Pushed to caller so obfuscate.ts stays
-    // browser-bundle-friendly (no node:zlib import).
+    // Zlib-raw-deflated (-15 wbits) tagged marshal blob for the
+    // interpreter module.
     interpreterMarshalCompressed?: Uint8Array;
 }
 
@@ -855,9 +856,13 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const s1_p2      = ng.gen();
     const s1_S2      = ng.gen();
     const s1_pt2     = ng.gen();
-    const s1_src2    = ng.gen();
     const s1_uns     = ng.gen();
     const s1_co2     = ng.gen();
+    const s1_pkg2    = ng.gen();
+    const s1_pkg2Off = ng.gen();
+    const s1_m2Len   = ng.gen();
+    const s1_boot2   = ng.gen();
+    const s2_bootVar = ng.gen();
 
     // _vfy (second-layer bytecode-integrity defence) names
     const n_vfy      = ng.gen();
@@ -897,11 +902,11 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // regex pattern. To match runtime, we first build the full canonical
     // region (below), compute its hash, then set `seed = sha256(h || pep)`.
     //
-    // Pre-allocate 32 stage-1-chunk names NOW. Canonical references them
+    // Pre-allocate the stage-1 chunk names NOW. Canonical references them
     // via `s1Plan.concat` (names only). Their VALUES (base64 ciphertext)
     // are injected into the stub preamble OUTSIDE canonical, after
     // encryption, via chunkB64Apply below.
-    const s1Plan = chunkB64Plan(ng, 32);
+    const s1Plan = chunkB64Plan(ng, opts && opts.v5IR ? 16 : 32);
 
     const realChain = [
         `${n_pepSeed} = bytes(${bytesArrayLit(pepSeedBytes)})`,
@@ -1342,7 +1347,12 @@ ${n_S1} = base64.b85decode(${s1Plan.concat})
 ${n_pt1} = ${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2])
 ${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, '__file__': ${n_path}}
 try:
-    ${n_co} = marshal.loads(${n_pt1})
+    if (${n_pt1}[:4] != bytes([80, 71, 77, 49]) or
+        len(${n_pt1}) < 6 or
+        ${n_pt1}[4] != sys.version_info[0] or
+        ${n_pt1}[5] != sys.version_info[1]):
+        sys.exit(0)
+    ${n_co} = marshal.loads(${n_pt1}[6:])
 except Exception:
     sys.exit(0)
 if not isinstance(${n_co}, type((lambda: 0).__code__)):
@@ -1443,58 +1453,28 @@ ${END_MARKER}
     const pepperedSeed2 = xor32(seed2, pep);
     const params2 = kdf(pepperedSeed2, prof);
 
-    // In v5/v6 this block built a stage2 *source* string, encrypted it, and
-    // let stage1 call compile() on the decrypted text. v7 replaces the
-    // source-round-trip with marshaled code objects so no `compile()` audit
-    // event ever sees the text of stage2 or the interpreter:
-    //
-    //   1. Decompress the interpreter source once, compile+marshal it on the
-    //      build machine via `opts.compileAndMarshal`, zlib-compress the
-    //      marshaled bytes, encrypt+base64+chunk that as `interpChunks`.
-    //   2. Build the stage2 *source* as before (only so we can compile+marshal
-    //      it ourselves) — then throw away the source; only the marshaled
-    //      bytecode is embedded.
-    //   3. Stage1 (see below) is likewise compiled+marshaled and the
-    //      canonical region does `marshal.loads` on it instead of `compile`.
-    //
-    // The attacker who installs an audit hook no longer sees stage1/stage2/
-    // interpreter source at any point — only marshaled bytecode, which
-    // requires a Python-version-specific decompiler pass to approach source
-    // fidelity.
+    // Stages and the interpreter are shipped as tagged marshal blobs:
+    //   b'PGM1' + major + minor + marshal.dumps(code)
+    // This keeps stage source out of runtime `compile()` audit events
+    // while still failing closed before marshal.loads on a Python-version
+    // mismatch.
     let payloadBytes: Uint8Array;
     if (opts && opts.v5IR) {
         if (!opts.compileAndMarshal) {
             throw new Error(
-                'v7 obfuscation requires opts.compileAndMarshal. ' +
-                'The Node driver (gen-v5-stub.mjs) and the browser driver ' +
-                '(pyodide_loader.ts) each supply one; callers that embed ' +
-                'the library directly must provide a callback that returns ' +
-                '`marshal.dumps(compile(source, filename, "exec"))` bytes.',
+                'v5IR obfuscation requires opts.compileAndMarshal. ' +
+                'The Node driver and the browser driver each supply one; ' +
+                'callers that embed the library directly must provide a ' +
+                'callback that returns a tagged marshal blob.',
             );
         }
         if (!opts.interpreterMarshalCompressed) {
             throw new Error(
-                'v7 obfuscation requires opts.interpreterMarshalCompressed — ' +
-                'zlib-deflated (raw, -15) marshal.dumps bytes for the ' +
-                'interpreter. Callers prepare this by decompressing ' +
-                'INTERPRETER_SRC_B64, compile+marshal+deflate in the target ' +
-                "Python. See build_ir.py's compile_and_marshal helper.",
+                'v5IR obfuscation requires opts.interpreterMarshalCompressed ' +
+                '— raw-deflate (-15) bytes of the tagged interpreter ' +
+                'marshal blob.',
             );
         }
-        // Fresh names used inside stage2's Python source.
-        const envCheckVar        = ng.gen();
-        const interpCtVar        = ng.gen();
-        const interpHashVar      = ng.gen();
-        const interpSeedVar      = ng.gen();
-        const interpPVar         = ng.gen();
-        const interpMarshalVar   = ng.gen();
-        const interpCodeVar      = ng.gen();
-        const interpNsVar        = ng.gen();
-        const interpFTVar        = ng.gen();   // C7.1: FunctionType via type(lambda:0)
-        const schemaCtVar        = ng.gen();
-        const irCtVar            = ng.gen();
-        const manifestCtVar      = ng.gen();
-
         // v9: boot entry point indexed by a RANDOMIZED BYTES KEY, not by
         // the literal string "_pg_boot". The bytes come from
         // interpreter_src.ts (generated by gen-interpreter-src.mjs,
@@ -1561,10 +1541,9 @@ ${END_MARKER}
         );
 
         // ---- 1. Encrypt the pre-marshaled interpreter --------------------
-        // The caller has already decompressed INTERPRETER_SRC_B64, compiled
-        // the interpreter in the target Python, marshaled, and re-compressed.
-        // We just encrypt + chunk. (Zlib work is pushed to the caller so
-        // obfuscate.ts doesn't need node:zlib in the browser bundle.)
+        // The caller supplies raw-deflated tagged marshal bytes. We just
+        // encrypt them; v12 no longer re-encodes the resulting ciphertext
+        // as stage2 source literals.
         const interpMarshalCompressed = opts.interpreterMarshalCompressed;
 
         // Interpreter cipher: derived from seed + interpLabel + envCheck.
@@ -1576,13 +1555,6 @@ ${END_MARKER}
         const pepperedInterpSeed = xor32(interpSeed, pep);
         const paramsInterp = kdf(pepperedInterpSeed, prof);
         const encInterp = encrypt(interpMarshalCompressed, paramsInterp, prof);
-        // O5: base85 is ~6.25% denser than base64 (5 chars/4 bytes vs
-        // 4 chars/3 bytes). Python decodes via base64.b85decode(), no
-        // new imports. Across the 4 stage2-embedded blobs (interp/IR/
-        // schema + the outer stage1 chunks + userChunks), this saves
-        // ~14 KB per stub on top of O4.
-        const encInterpB64 = bytesToBase85(encInterp);
-        const interpChunks = chunkB64(encInterpB64, ng);
 
         // ---- 2. Interp-hash binding for schema + IR ----------------------
         // The schema and IR keys XOR in the hash of the *encrypted*
@@ -1599,8 +1571,6 @@ ${END_MARKER}
         const params3 = kdf(pepperedSeed3, prof);
         const irJsonBytes = serializeIR(opts.v5IR);
         const encIR = encrypt(irJsonBytes, params3, prof);
-        const encIRB64 = bytesToBase85(encIR);
-        const irChunks = chunkB64(encIRB64, ng);
 
         // Schema cipher: same pattern.
         const schemaLabel = randomBytes(6);
@@ -1610,8 +1580,6 @@ ${END_MARKER}
         const params4 = kdf(pepperedSeed4, prof);
         const schemaBytes = serializeSchemaBinary(opts.v5IR.schema);
         const encSchema = encrypt(schemaBytes, params4, prof);
-        const encSchemaB64 = bytesToBase85(encSchema);
-        const schemaChunks = chunkB64(encSchemaB64, ng);
 
         const manifestLabel = randomBytes(6);
         const manifestSeedPre = sha256(concatBytes(seed, manifestLabel));
@@ -1619,8 +1587,6 @@ ${END_MARKER}
         const pepperedManifestSeed = xor32(manifestSeed, pep);
         const paramsManifest = kdf(pepperedManifestSeed, prof);
         const encManifest = encrypt(opts.v5IR.manifest, paramsManifest, prof);
-        const encManifestB64 = bytesToBase85(encManifest);
-        const manifestChunks = chunkB64(encManifestB64, ng);
 
         // ---- 3. Build + marshal stage2 -----------------------------------
         // v11: pack PolyProfile into 15 bytes for inline _k_derive inside
@@ -1640,24 +1606,26 @@ ${END_MARKER}
         const pepBytes = pep;
         const stage2Src = buildV5Stage2Source(
             { n_seed, n_kd, n_dec, n_tchk },
-            {
-                prof,
-                interpLabel, irLabel, schemaLabel, manifestLabel,
-                interpChunks, irChunks, schemaChunks, manifestChunks,
-                envCheckVar,
-                interpCtVar, interpHashVar,
-                interpSeedVar, interpPVar, interpMarshalVar,
-                interpCodeVar, interpNsVar, interpFTVar,
-                schemaCtVar, irCtVar, manifestCtVar,
-                bootKeyBytes,
-                pepBytes, profileBytes,
-            },
+            { bootBundleVar: s2_bootVar },
         );
-        // Marshal stage2 to bytecode. The bytes we embed (and that stage1
-        // will `marshal.loads`) are version-locked to the Python that ran
-        // `opts.compileAndMarshal`, i.e. the same Python the end user will
-        // use to run the stub. No `compile()` call happens at stub runtime.
-        payloadBytes = opts.compileAndMarshal(stage2Src, '<pg_s2>');
+        const stage2Marshal = opts.compileAndMarshal(stage2Src, '<pg_s2>');
+        const bootBundle = packV5BootBundle({
+            interpLabel,
+            irLabel,
+            schemaLabel,
+            manifestLabel,
+            interpCiphertext: encInterp,
+            irCiphertext: encIR,
+            schemaCiphertext: encSchema,
+            manifestCiphertext: encManifest,
+            bootKeyBytes,
+            pepBytes,
+            profileBytes,
+        });
+        payloadBytes = packV5Stage2Payload(
+            stage2Marshal,
+            bootBundle,
+        );
     } else {
         payloadBytes = strToUtf8(input);
     }
@@ -1733,15 +1701,35 @@ except Exception:
     pass
 ${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None, 'marshal': marshal${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
 try:
-    ${s1_co2} = marshal.loads(${s1_pt2})
+${opts && opts.v5IR ? `    if (${s1_pt2}[:4] != bytes([80, 71, 83, 50]) or len(${s1_pt2}) < 8):
+        sys.exit(0)
+    ${s1_pkg2Off} = 4
+    ${s1_m2Len} = int.from_bytes(${s1_pt2}[${s1_pkg2Off}:${s1_pkg2Off} + 4], 'little')
+    ${s1_pkg2Off} += 4
+    if ${s1_pkg2Off} + ${s1_m2Len} > len(${s1_pt2}):
+        sys.exit(0)
+    ${s1_pkg2} = ${s1_pt2}[${s1_pkg2Off}:${s1_pkg2Off} + ${s1_m2Len}]
+    ${s1_pkg2Off} += ${s1_m2Len}
+    ${s1_boot2} = ${s1_pt2}[${s1_pkg2Off}:]
+    if (${s1_pkg2}[:4] != bytes([80, 71, 77, 49]) or
+        len(${s1_pkg2}) < 6 or
+        ${s1_pkg2}[4] != sys.version_info[0] or
+        ${s1_pkg2}[5] != sys.version_info[1]):
+        sys.exit(0)
+    ${s1_uns}[${JSON.stringify(s2_bootVar)}] = ${s1_boot2}
+    ${s1_co2} = marshal.loads(${s1_pkg2}[6:])` : `    if (${s1_pt2}[:4] != bytes([80, 71, 77, 49]) or
+        len(${s1_pt2}) < 6 or
+        ${s1_pt2}[4] != sys.version_info[0] or
+        ${s1_pt2}[5] != sys.version_info[1]):
+        sys.exit(0)
+    ${s1_co2} = marshal.loads(${s1_pt2}[6:])`}
 except Exception:
     sys.exit(0)
 ${n_ftype}(${s1_co2}, ${s1_uns})()
 `;
 
-    // v7: stage1 itself is marshaled (compile+marshal.dumps) so that the
-    // outer canonical region's `marshal.loads` consumes bytecode directly.
-    // No `compile()` audit event fires for stage1 source at runtime.
+    // Stage1 is likewise marshaled at build time so the outer canonical
+    // region never compile()s decrypted stage text at runtime.
     const stage1Bytes = opts && opts.v5IR && opts.compileAndMarshal
         ? opts.compileAndMarshal(stage1Src, '<pg_s1>')
         : strToUtf8(stage1Src);

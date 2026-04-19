@@ -73,14 +73,12 @@ export async function getPyodide(): Promise<PyodideInstance> {
         // Pipe build_ir.py into Pyodide's main namespace once so subsequent
         // calls only need to invoke compile_to_json(src).
         py.runPython(BUILD_IR_SRC);
-        // v7+: install the compile_and_marshal helper so the browser side
-        // can produce marshaled code-object bytes (same primitive the Node
-        // driver shells out to python3 for). Pyodide ships marshal/zlib in
-        // its stdlib, so this is a one-line definition with no extras.
+        // Install helpers for browser-side compile+marshal and raw-deflate.
         py.runPython(
-            `import marshal as _pg_marshal, zlib as _pg_zlib, base64 as _pg_b64\n` +
+            `import marshal as _pg_marshal, zlib as _pg_zlib, base64 as _pg_b64, sys as _pg_sys\n` +
             `def _pg_compile_marshal_b64(src, filename):\n` +
-            `    return _pg_b64.b64encode(_pg_marshal.dumps(compile(src, filename, 'exec'))).decode('ascii')\n` +
+            `    tag = b'PGM1' + bytes([_pg_sys.version_info.major & 255, _pg_sys.version_info.minor & 255])\n` +
+            `    return _pg_b64.b64encode(tag + _pg_marshal.dumps(compile(src, filename, 'exec'))).decode('ascii')\n` +
             `def _pg_raw_deflate_b64(blob_b64):\n` +
             `    raw = _pg_b64.b64decode(blob_b64)\n` +
             `    co = _pg_zlib.compressobj(9, _pg_zlib.DEFLATED, -15)\n` +
@@ -131,9 +129,6 @@ function b64ToBytes(b64: string): Uint8Array {
     return out;
 }
 
-// v7+: synchronous compile-and-marshal via the already-loaded Pyodide.
-// Caller MUST have awaited getPyodide() once first; otherwise the helper
-// throws because Pyodide's runPython is itself sync but loading is async.
 function compileAndMarshalViaPyodide(
     py: PyodideInstance,
     source: string,
@@ -146,22 +141,20 @@ function compileAndMarshalViaPyodide(
     return b64ToBytes(b64);
 }
 
-// v7+: pre-compute interpreterMarshalCompressed once per session.
-// The interpreter source is the same across user inputs, so we cache
-// the marshal+raw-deflate result. ~50 ms first call, free thereafter.
+// Cache the interpreter's compressed tagged marshal blob across builds —
+// the input is constant per load, so we only pay compile+marshal+deflate once.
 let interpMarshalCompressedCache: Uint8Array | null = null;
 async function getInterpreterMarshalCompressed(
     py: PyodideInstance,
 ): Promise<Uint8Array> {
     if (interpMarshalCompressedCache) return interpMarshalCompressedCache;
-    // Decompress the embedded interpreter source (raw-deflate base64).
     py.globals.set('_pg_iSrcB64', INTERPRETER_SRC_B64);
     py.runPython(
         `_pg_iSrc = _pg_zlib.decompress(_pg_b64.b64decode(_pg_iSrcB64), -15).decode('utf-8')\n` +
-        `_pg_iMarshalRawB64 = _pg_b64.b64encode(_pg_marshal.dumps(compile(_pg_iSrc, '<pg_interp>', 'exec'))).decode('ascii')\n` +
-        `_pg_iMarshalCompressedB64 = _pg_raw_deflate_b64(_pg_iMarshalRawB64)\n`,
+        `_pg_iMarshalRawB64 = _pg_compile_marshal_b64(_pg_iSrc, '<pg_interp>')\n` +
+        `_pg_iCompressedB64 = _pg_raw_deflate_b64(_pg_iMarshalRawB64)\n`,
     );
-    const compressedB64 = py.globals.get('_pg_iMarshalCompressedB64') as string;
+    const compressedB64 = py.globals.get('_pg_iCompressedB64') as string;
     interpMarshalCompressedCache = b64ToBytes(compressedB64);
     return interpMarshalCompressedCache;
 }
@@ -187,7 +180,7 @@ export async function obfuscatePythonInBrowser(source: string): Promise<string> 
     } catch (e) {
         const raw = e instanceof Error ? e.message : String(e);
         throw new BuildIRError(
-            `Failed to prepare interpreter bytecode: ${raw}`,
+            `Failed to prepare interpreter marshal blob: ${raw}`,
             'internal',
         );
     }

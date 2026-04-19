@@ -64,9 +64,6 @@ function buildV5IR(source: string, schema: object): V5IR {
     };
 }
 
-// v7: stage1/stage2/interpreter are shipped as marshaled code objects,
-// so the harness shells out to python3 to do compile+marshal.dumps and
-// pre-computes the interpreter's marshaled+zlib blob once per run.
 function compileAndMarshal(source: string, filename?: string): Uint8Array {
     const out = execFileSync("python3", [path.join(ROOT, "lib", "v5", "build_ir.py")], {
         input: source,

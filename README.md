@@ -2,6 +2,8 @@
 
 Python source code obfuscator. Transforms source into a protected stub that runs identically but resists casual reverse-engineering.
 
+PyGuard v5 is a pure-Python **friction system**, not a confidential-execution system. The release goal is to avoid trivial one-run recovery paths and to raise per-build analyst cost, not to promise secrecy after one successful run in an attacker-controlled Python process.
+
 **Website:** [pyguard.avkean.com](https://pyguard.avkean.com)
 
 ## How it works
@@ -12,7 +14,7 @@ PyGuard never compiles user source at runtime. Instead it:
 2. **Randomizes the schema** -- every stub gets a unique per-build schema that remaps all field names, op tags, and field orderings to random tokens. String literals are XOR-masked. Nothing in the shipped blob has stable labels.
 3. **Packs to binary** -- the IR is serialized into a custom binary format (not JSON), then zlib-compressed.
 4. **Encrypts in layers** -- the packed IR and schema are independently encrypted with derived keys (KDF + XOR pepper + AES-CTR). The schema is only reconstructed after the interpreter loads.
-5. **Embeds an interpreter** -- a generic AST-walking interpreter (`runtime_interp.py`) is deflate-compressed and shipped as marshaled bytecode (no `compile()` audit event fires at runtime). It parses the binary IR into opaque `_PGMap` wrappers and positional tuples, never plain dicts/lists.
+5. **Embeds an interpreter** -- a generic AST-walking interpreter (`runtime_interp.py`) is deflate-compressed and shipped as **tagged** marshaled bytecode. The runtime checks the tag before `marshal.loads`, so incompatible Python minors fail closed instead of falling back to source compilation. It parses the binary IR into opaque `_PGMap` wrappers and positional tuples, never plain dicts/lists.
 6. **Wraps in a 3-stage launcher**:
    - **Stage 0**: integrity checks (code-object digest, file hash, recompilation detection) and env-witness probing
    - **Stage 1**: anti-trace (clears `settrace`/`setprofile`, walks `f_trace` pointers via traceback frames, checks `gettrace`/`getprofile`), decrypts stage 2
@@ -47,6 +49,17 @@ These make the original source literally unrecoverable byte-for-byte even if an 
 - **Constant unfolding + MBA rewriting** on numeric literals in user code.
 - **CFG flattening** and **opaque predicates** on control flow.
 
+## Release gate
+
+Primary gate:
+
+- `npx tsx tests/run_disclosure_checks.ts` -- blocks the shortest known one-run disclosure paths (currently compile-audit leakage of stage text and import-proxy recovery of `from X import Y` fingerprints).
+
+Secondary gates:
+
+- `npx tsx tests/run_tests.ts` -- compatibility suite.
+- `bash tests/pentest/run_scoreboard.sh` -- regression dashboard, not the north star.
+
 ## Attack scoreboard
 
 All attacks live in `tests/pentest/`. Run with `bash tests/pentest/run_scoreboard.sh`.
@@ -64,6 +77,7 @@ Current status against 15 compatibility stubs with 27 attacks × 15 stubs = 405 
 PyGuard is an obfuscator, not an encryptor. The stub must eventually hand data to CPython to execute, so:
 
 - A fully symbolic emulator of the decryptor chain recovers the same bytes the runtime does — in a clean env the witnesses all evaluate to known constants and the canonical hash is computable statically. The defense is that the chain is large, multi-stage, and schema-randomized per build, raising the cost of emulation.
+- Build artifacts are tied to the CPython minor that produced their tagged marshal blobs. A mismatched runtime exits before `marshal.loads`; PyGuard does not try to paper over that by recompiling decrypted stages from source.
 - `from X import Y` leaks `Y` through Python's import system regardless of concealment; the import-concealment defense reduces the surface but cannot eliminate it.
 - Runtime VALUES (e.g. what the program prints) are never protected — capturing stdout is equivalent to running the program.
 - If you need cryptographic guarantees, use native compilation, a server-side API, or a hardware enclave.
@@ -86,6 +100,7 @@ node --import tsx scripts/gen-v5-stub.mjs <source.py> -o out.py
 
 Run tests:
 ```bash
+npx tsx tests/run_disclosure_checks.ts      # primary one-run disclosure gate
 npx tsx tests/run_tests.ts                  # compat suite
 bash tests/pentest/run_scoreboard.sh        # attack scoreboard
 ```

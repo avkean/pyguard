@@ -228,20 +228,14 @@ if (py.status !== 0) {
 }
 const irArtifacts = JSON.parse(py.stdout.trim());
 
-// Step 2: call the TS obfuscator. We use tsx to run the TS directly.
-// To avoid process overhead, write a tiny driver script that imports
-// obfuscate, calls it, and prints the result.
+// Step 2: call the TS obfuscator via a tsx driver.
 // Note: static imports of .ts files break under Node 24's native type
 // stripping (the re-export graph ends up empty). Dynamic import via tsx
-// works correctly, so we use that instead.
+// works correctly.
 //
-// v7: the driver pre-computes `interpreterMarshalCompressed` (decompress
-// the bundled interpreter source, shell out to python3 to compile+marshal
-// it, then raw-deflate the marshal.dumps bytes) and exposes a synchronous
-// `compileAndMarshal` callback (another python3 spawnSync) so that
-// obfuscate.ts can marshal stage1 and stage2 at build time. No compile()
-// happens at stub runtime — only marshal.loads on pre-compiled bytecode.
-const buildIrPath = path.join(root, 'lib/v5/build_ir.py').replace(/\\/g, '\\\\');
+// Build tagged marshal blobs for stage1/stage2/interpreter. The runtime
+// checks the tag before marshal.loads so incompatible Python minors fail
+// closed without falling back to source compilation.
 const driver = `
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
@@ -250,7 +244,7 @@ const { INTERPRETER_SRC_B64 } = await import('./lib/v5/interpreter_src.ts');
 const fs = await import('node:fs');
 
 function compileAndMarshal(source, filename) {
-    const r = spawnSync('python3', [${JSON.stringify(buildIrPath)}], {
+    const r = spawnSync('python3', [${JSON.stringify(path.join(root, 'lib/v5/build_ir.py').replace(/\\/g, '\\\\'))}], {
         input: source,
         encoding: 'utf-8',
         env: {
@@ -263,14 +257,11 @@ function compileAndMarshal(source, filename) {
     if (r.status !== 0) {
         throw new Error('compile_and_marshal subprocess failed: ' + r.stderr);
     }
-    // build_ir.py __main__ writes base64(marshal.dumps(...)) to stdout.
     return Uint8Array.from(Buffer.from(r.stdout.trim(), 'base64'));
 }
 
-// Pre-compute interpreterMarshalCompressed.
 const interpSrcBytes = zlib.inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, 'base64'));
-const interpSrc = interpSrcBytes.toString('utf-8');
-const interpMarshalRaw = compileAndMarshal(interpSrc, '<pg_interp>');
+const interpMarshalRaw = compileAndMarshal(interpSrcBytes.toString('utf-8'), '<pg_interp>');
 const interpMarshalCompressed = Uint8Array.from(zlib.deflateRawSync(Buffer.from(interpMarshalRaw)));
 
 const userSource = fs.readFileSync(${JSON.stringify(args.src)}, 'utf-8');

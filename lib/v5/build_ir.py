@@ -569,7 +569,9 @@ def compile_to_json(source):
     Constants that aren't naturally JSON-serialisable (bytes, complex,
     frozenset, ellipsis) get tagged so the runtime can rebuild them.
     The static-import manifest is returned alongside the payload so stage2
-    can pre-resolve those imports before user code starts running.
+    can resolve imports into opaque `(id, value)` pairs before the
+    interpreter marshal.loads event fires, without retaining plaintext
+    module/attr names after stage2 completes.
     """
     ir = compile_to_ir(source)
     lowered_tree, manifest = _lower_to_code(ir['tree'], ir['strings'])
@@ -1233,30 +1235,32 @@ def _enc(v):
     raise NotImplementedError(f"unsupported nested constant: {type(v).__name__}")
 
 
-# v7: compile Python source to bytecode at build time and serialize via
-# marshal. The stub then does `marshal.loads(bytes)` + `FunctionType(code, ns)()`
-# at runtime — this eliminates the `compile()` audit events that used to
-# dump stage1/stage2/interpreter sources verbatim via PEP 578. The attacker
-# now only gets marshaled bytecode (version-locked to the build Python),
-# which requires a decompiler pass before anything resembling source
-# appears. The caller is responsible for compressing + encrypting the
-# bytes for transport.
+_MARSHAL_TAG = b'PGM1'
+
+
 def compile_and_marshal(source, filename='<pg>'):
     import marshal
+    import sys
+
     code = compile(source, filename, 'exec')
-    return marshal.dumps(code)
+    tag = _MARSHAL_TAG + bytes([
+        sys.version_info.major & 0xFF,
+        sys.version_info.minor & 0xFF,
+    ])
+    return tag + marshal.dumps(code)
 
 
-# Self-test entry point — used by Node-side smoke tests and the
-# scripts/gen-v5-stub.mjs subprocess driver. Reads Python source from
-# stdin and writes the zlib-compressed IR bytes to stdout as base64, so
-# the driver can hand them straight to the TS obfuscator.
+# Self-test entry point — used by the build drivers.
 #
-# v7: PYGUARD_MODE=marshal switches to compile_and_marshal() for the
-# marshaled-code-object pipeline. Default remains the IR compile path.
+# Default mode reads Python source from stdin and writes the zlib-compressed
+# IR artifacts to stdout as JSON so the TS layer can pipe them straight into
+# encryption. `PYGUARD_MODE=marshal` instead emits a tagged marshal blob for
+# stage1 / stage2 / interpreter packaging. The 6-byte header lets the runtime
+# fail closed on Python-version mismatch before calling marshal.loads.
 if __name__ == '__main__':
     import base64
     import sys
+
     src = sys.stdin.read()
     mode = os.environ.get('PYGUARD_MODE', 'ir')
     if mode == 'marshal':

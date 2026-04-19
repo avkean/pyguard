@@ -1,42 +1,27 @@
 // lib/v5/assemble.ts
 //
-// PyGuard stage2-source assembler (current generation: v11).
+// PyGuard stage2-source assembler (current generation: v12).
 //
-// ARCHITECTURAL HISTORY (v5/v6 → v7+):
+// ARCHITECTURE:
 //
-// v5/v6's weakness was that stage2 was embedded as a Python SOURCE string and
-// stage1 called `compile(stage2_src, ...)` on it. Every PEP 578 audit hook
-// installed via sitecustomize.py received that source verbatim — the most
-// recent successful attack captured all three stages (stage1, stage2,
-// interpreter) purely by listening to `compile` audit events. The same attack
-// grabbed `exec(interpreter_source, globals())` because exec on a string
-// implicitly compiles.
+// Stage2 source is assembled here, marshaled at build time, and then
+// packed with a binary boot bundle by lib/obfuscate.ts. At stub runtime
+// the outer canonical region decrypts stage1, stage1 decrypts the stage2
+// payload package, and stage2 decrypts the interpreter as a TAGGED
+// marshal blob:
+//   b'PGM1' + major + minor + marshal.dumps(code)
 //
-// v7 eliminates source compilation at runtime:
+// The 6-byte header lets runtime fail closed before marshal.loads on
+// interpreter-version mismatch, instead of reverting to compile() on stage
+// source and handing audit hooks the whole launcher.
 //
-//   * The interpreter is shipped as a *marshaled code object* — the build side
-//     does `marshal.dumps(compile(src, ...))` and the stub does
-//     `marshal.loads(bytes)` + `FunctionType(code, ns)()`. No `compile` audit.
-//   * Stage2 is likewise marshaled: stage1 does `marshal.loads` to get a code
-//     object and runs it in an isolated namespace. No `compile` audit.
-//   * Schema (_PG_KEYS / _PG_TAGS / _PG_MASK / _PG_LAYOUTS / _PG_BIN_KEY /
-//     _PG_NOISE_SCHEDULE) is NEVER written to any globals dict. It is decrypted
-//     *inside* the interpreter's own namespace by a `_pg_boot` entry point and
-//     captured as frame locals of the boot function, which hands them to
-//     Interp as constructor arguments.
-//   * `run_blob` is not aliased back to globals. The entry point is reachable
-//     only via `_interp_ns['_pg_boot']` (which itself has a randomized name).
-//
-// Net effect on the known attack chain:
-//   - Audit capture no longer yields any stage source
-//   - Profile-hook on the old top-level run_blob frame finds nothing: there is
-//     no such frame; the decryption lives inside the interpreter's _pg_boot
-//     and the schema is local there, not global.
-//   - Offline replay still needs interpreter bytecode + per-build polymorphic
-//     schema + encrypted-envelope plaintext, which requires decompilation
-//     of marshaled bytecode (much harder than reading source).
+// v12 packaging change: stage2 no longer embeds encrypted interpreter /
+// IR / schema / manifest blobs as Python source literals. Those payloads
+// now travel once, in a binary boot bundle passed from stage1 to the
+// marshaled stage2 launcher. This removes the largest fixed-size cost in
+// every stub and avoids re-encoding the same payload structure as nested
+// source text.
 
-import type { PolyProfile, ChunkedB64 } from './types';
 import type { V5Schema } from './schema';
 
 // v5.2: the IR is built into a compressed byte blob by the Python side
@@ -60,120 +45,133 @@ export interface AssembleNames {
 }
 
 // Runtime cipher primitives — must match encrypt() in lib/obfuscate.ts.
-export interface AssembleCipher {
-    prof: PolyProfile;
-    // per-build labels mixed into the runtime key derivation
+export interface V5BootBundle {
+    // Per-build labels mixed into runtime key derivation.
     interpLabel: Uint8Array;
     irLabel: Uint8Array;
     schemaLabel: Uint8Array;
     manifestLabel: Uint8Array;
-    // pre-built chunked base64 ciphertexts
-    interpChunks: ChunkedB64;   // encrypted+compressed MARSHALED interpreter code object
-    irChunks: ChunkedB64;       // encrypted+compressed IR bytes
-    schemaChunks: ChunkedB64;   // encrypted schema JSON
-    manifestChunks: ChunkedB64; // encrypted static import manifest bytes
-    // internal variable names used in the stage2 source
-    envCheckVar: string;    // sha256 of runtime env fingerprint
-    interpCtVar: string;    // encrypted interpreter marshaled bytes
-    interpHashVar: string;  // sha256 of encrypted interpreter blob
-    interpSeedVar: string;
-    interpPVar: string;
-    interpMarshalVar: string; // decrypted marshal bytes
-    interpCodeVar: string;    // marshal.loads result (code object)
-    interpNsVar: string;      // isolated namespace for interpreter exec
-    interpFTVar: string;      // FunctionType recovered via `type(lambda:0)` — bypasses types.FunctionType hook (C7.1)
-    schemaCtVar: string;
-    irCtVar: string;
-    manifestCtVar: string;
-    // v9: randomized bytes-key under which the interpreter module
-    // registers its renamed `_pg_boot`. Stage2 indexes `interp_ns` by
-    // this bytes object; no original name ("_pg_boot") is ever present.
+    // Encrypted runtime payloads. These are opaque until stage2 decrypts
+    // them inside the proper runtime context.
+    interpCiphertext: Uint8Array;
+    irCiphertext: Uint8Array;
+    schemaCiphertext: Uint8Array;
+    manifestCiphertext: Uint8Array;
+    // Randomized bytes-key under which the interpreter module registers
+    // its renamed `_pg_boot`.
     bootKeyBytes: Uint8Array;
-    // v11: inert-bytes versions of the crypto profile, handed to
-    // _pg_boot instead of stage1's `_kd` / `_dec` closures. The
-    // interpreter has its own inline `_k_derive` / `_c_dec` helpers
-    // which consume these bytes. Removing the callables from the args
-    // tuple defeats the v10 `boot_args_sniff` attack (wrap `dec` →
-    // log plaintexts) since there is nothing callable to wrap.
+    // Inert-bytes versions of the crypto profile, handed to `_pg_boot`
+    // instead of stage1's `_kd` / `_dec` closures.
     pepBytes: Uint8Array;       // 32-byte pepper (= obfuscate.ts `pep`)
-    profileBytes: Uint8Array;   // 15-byte packed PolyProfile:
-                                //   [0] rounds
-                                //   [1] rotMod
-                                //   [2] sbxNudge
-                                //   [3..7]  rkLabel (4B)
-                                //   [7..11] rotLabel (4B)
-                                //   [11..15] sbxLabel (4B)
+    profileBytes: Uint8Array;   // 15-byte packed PolyProfile
 }
 
-function bytesArrayLit(b: Uint8Array): string {
-    return '[' + Array.from(b).join(', ') + ']';
+export interface AssembleStage2 {
+    bootBundleVar: string;
+}
+
+function concatBytes(...arrs: Uint8Array[]): Uint8Array {
+    let total = 0;
+    for (const a of arrs) total += a.length;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const a of arrs) {
+        out.set(a, off);
+        off += a.length;
+    }
+    return out;
+}
+
+function u32le(n: number): Uint8Array {
+    return new Uint8Array([
+        n & 0xff,
+        (n >>> 8) & 0xff,
+        (n >>> 16) & 0xff,
+        (n >>> 24) & 0xff,
+    ]);
+}
+
+const BOOT_BUNDLE_MAGIC = new Uint8Array([80, 71, 66, 49]);    // PGB1
+const STAGE2_PAYLOAD_MAGIC = new Uint8Array([80, 71, 83, 50]); // PGS2
+
+export function packV5BootBundle(bundle: V5BootBundle): Uint8Array {
+    if (bundle.interpLabel.length !== 6 ||
+        bundle.irLabel.length !== 6 ||
+        bundle.schemaLabel.length !== 6 ||
+        bundle.manifestLabel.length !== 6) {
+        throw new Error('packV5BootBundle: expected 6-byte labels');
+    }
+    if (bundle.bootKeyBytes.length !== 12) {
+        throw new Error('packV5BootBundle: expected 12-byte boot key');
+    }
+    if (bundle.pepBytes.length !== 32) {
+        throw new Error('packV5BootBundle: expected 32-byte pepper');
+    }
+    if (bundle.profileBytes.length !== 15) {
+        throw new Error('packV5BootBundle: expected 15-byte profile');
+    }
+    return concatBytes(
+        BOOT_BUNDLE_MAGIC,
+        u32le(bundle.interpCiphertext.length),
+        u32le(bundle.manifestCiphertext.length),
+        u32le(bundle.schemaCiphertext.length),
+        u32le(bundle.irCiphertext.length),
+        bundle.interpLabel,
+        bundle.manifestLabel,
+        bundle.schemaLabel,
+        bundle.irLabel,
+        bundle.bootKeyBytes,
+        bundle.pepBytes,
+        bundle.profileBytes,
+        bundle.interpCiphertext,
+        bundle.manifestCiphertext,
+        bundle.schemaCiphertext,
+        bundle.irCiphertext,
+    );
+}
+
+export function packV5Stage2Payload(
+    stage2Marshal: Uint8Array,
+    bootBundle: Uint8Array,
+): Uint8Array {
+    return concatBytes(
+        STAGE2_PAYLOAD_MAGIC,
+        u32le(stage2Marshal.length),
+        stage2Marshal,
+        bootBundle,
+    );
 }
 
 // Build the stage2 source — the Python source string that the obfuscator
-// will compile-and-marshal, then encrypt and wrap inside stage1.
+// will compile+marshal at build time, then encrypt + wrap inside stage1.
 //
 // When executed (via FunctionType(marshaled_code, isolated_ns)), this code:
 //   1. Trace/profile nullification + env-integrity hash
-//   2. base64-decode + decrypt the *marshaled* interpreter code object
-//   3. base64-decode the encrypted schema + IR blobs (ciphertexts only — no
-//      decryption happens in stage2)
-//   4. Pre-seed the boot argument tuple into `interp_ns[bytes(bootKey)]`
-//      BEFORE running the interpreter module body.
-//   5. marshal.loads + FunctionType(code, interp_ns)() — the interpreter
-//      module body itself reads the pre-seeded tuple, deletes the slot, and
-//      calls `_pg_boot(*args)` inline. No external `interp_ns[bytes(k)](...)`
-//      call ever happens — an attacker hooking FunctionType sees either
-//      (a) pre-body: a raw args tuple at a random bytes key with no callable
-//      named `_pg_boot` anywhere in globals, or (b) post-body: the slot
-//      deleted and all decrypted state gone.
+//   2. Unpack the binary boot bundle supplied by stage1
+//   3. Decrypt the encrypted manifest blob and resolve it into opaque
+//      `(id, value)` pairs BEFORE the interpreter marshal.loads event fires
+//   4. Decrypt the tagged interpreter marshal blob and version-check it
+//   5. Pre-seed the boot argument tuple into `interp_ns[bootKey]`
+//   6. marshal.loads() + FunctionType(code, interp_ns)()
 //
 // The schema is NEVER written to any globals dict outside the boot frame.
 // `run_blob` is NEVER assigned to a globals name. Profile-hooking stage2's
 // frame yields only encrypted ciphertexts and hash material.
 export function buildV5Stage2Source(
     names: AssembleNames,
-    cipher: AssembleCipher,
+    stage2: AssembleStage2,
 ): string {
     const { n_seed, n_kd, n_dec, n_tchk } = names;
-    const {
-        interpLabel, irLabel, schemaLabel, manifestLabel,
-        interpChunks, irChunks, schemaChunks, manifestChunks,
-        envCheckVar,
-        interpCtVar, interpHashVar,
-        interpSeedVar, interpPVar, interpMarshalVar, interpCodeVar, interpNsVar, interpFTVar,
-        schemaCtVar, irCtVar, manifestCtVar,
-        bootKeyBytes,
-        pepBytes, profileBytes,
-    } = cipher;
+    const { bootBundleVar } = stage2;
 
-    // v9: `bootKeyLit` is the bytes-object literal used to index interp_ns.
-    // The interpreter module's final statement is
-    //     globals()[bytes([...these bytes...])] = <renamed_pg_boot>
-    // so stage2 retrieves the boot fn via `interp_ns[bytes([...])]`.
-    const bootKeyLit = bytesArrayLit(bootKeyBytes);
-    const pepLit = bytesArrayLit(pepBytes);
-    const profileLit = bytesArrayLit(profileBytes);
-
-    // Stage2 source (marshaled before shipping):
-    //   - no user source is compile()d here — the interpreter is
-    //     marshal.loads'd so no PEP-578 compile audit event fires
-    //   - the schema is decrypted inside the interpreter's own boot
-    //     frame, never in stage2 globals (no settrace-at-globals leak)
-    //   - FunctionType is recovered via (lambda: 0).__class__ — a C-slot
-    //     read on object.__class__ (Py_TYPE) that routes around both
-    //     'from types import FunctionType' (rebindable module attr) and
-    //     'type(lambda: 0)' (rebindable builtins.type). Mutating
-    //     FT.__name__/__module__ is possible but the envCheck witnesses
-    //     fold those attributes into the key, silently poisoning the seed.
-    //   - envCheck witnesses below include type-identity checks on every
-    //     trace-surface builtin (settrace/setprofile/gettrace/getprofile/
-    //     exec/marshal.loads/hashlib.scrypt) against zlib.decompress, so
-    //     any Python-level wrapper flips the 'function' vs
-    //     'builtin_function_or_method' discriminator.
-    // Keep this Python code-only — no # comments in the emitted stub.
+    // Stage2 source (compiled+marshaled at build time):
+    //   - stage2 reads one binary boot bundle from its globals dict, then
+    //     deletes that slot before touching the interpreter
+    //   - the schema is decrypted inside the interpreter's own boot frame,
+    //     never in stage2 globals
+    //   - FunctionType is recovered via (lambda: 0).__class__
     return `import sys
 import hashlib
-import base64
 import zlib
 import marshal
 try:
@@ -186,20 +184,39 @@ except Exception:
     pass
 if ${n_tchk}():
     raise SystemExit(0)
-${interpFTVar} = (lambda: 0).__class__
-${envCheckVar} = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), ${interpFTVar}.__name__, str(${interpFTVar} is (lambda: None).__class__), ${interpFTVar}.__class__.__name__, ${interpFTVar}.__module__]).encode()).digest()
+_pg_ft = (lambda: 0).__class__
+_pg_env = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), _pg_ft.__name__, str(_pg_ft is (lambda: None).__class__), _pg_ft.__class__.__name__, _pg_ft.__module__]).encode()).digest()
 _pg_bi_snap = dict(__builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__)
-${interpChunks.decls}
-${interpCtVar} = base64.b85decode(${interpChunks.concat})
-${interpHashVar} = hashlib.sha256(${interpCtVar}).digest()
-${manifestChunks.decls}
-${manifestCtVar} = base64.b85decode(${manifestChunks.concat})
-_pg_manifest_seed = bytes(a ^ b ^ c for a, b, c in zip(hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(manifestLabel)})).digest(), ${interpHashVar}, ${envCheckVar}))
+_pg_pkg = ${bootBundleVar}
+del ${bootBundleVar}
+if len(_pg_pkg) < 103 or _pg_pkg[:4] != bytes([80, 71, 66, 49]):
+    raise SystemExit(0)
+_pg_o = 4
+_pg_interp_len = int.from_bytes(_pg_pkg[_pg_o:_pg_o + 4], 'little'); _pg_o += 4
+_pg_manifest_len = int.from_bytes(_pg_pkg[_pg_o:_pg_o + 4], 'little'); _pg_o += 4
+_pg_schema_len = int.from_bytes(_pg_pkg[_pg_o:_pg_o + 4], 'little'); _pg_o += 4
+_pg_ir_len = int.from_bytes(_pg_pkg[_pg_o:_pg_o + 4], 'little'); _pg_o += 4
+_pg_interp_label = _pg_pkg[_pg_o:_pg_o + 6]; _pg_o += 6
+_pg_manifest_label = _pg_pkg[_pg_o:_pg_o + 6]; _pg_o += 6
+_pg_schema_label = _pg_pkg[_pg_o:_pg_o + 6]; _pg_o += 6
+_pg_ir_label = _pg_pkg[_pg_o:_pg_o + 6]; _pg_o += 6
+_pg_boot_key = _pg_pkg[_pg_o:_pg_o + 12]; _pg_o += 12
+_pg_pep = _pg_pkg[_pg_o:_pg_o + 32]; _pg_o += 32
+_pg_profile = _pg_pkg[_pg_o:_pg_o + 15]; _pg_o += 15
+if _pg_o + _pg_interp_len + _pg_manifest_len + _pg_schema_len + _pg_ir_len != len(_pg_pkg):
+    raise SystemExit(0)
+_pg_interp_ct = _pg_pkg[_pg_o:_pg_o + _pg_interp_len]; _pg_o += _pg_interp_len
+_pg_manifest_ct = _pg_pkg[_pg_o:_pg_o + _pg_manifest_len]; _pg_o += _pg_manifest_len
+_pg_schema_ct = _pg_pkg[_pg_o:_pg_o + _pg_schema_len]; _pg_o += _pg_schema_len
+_pg_ir_ct = _pg_pkg[_pg_o:_pg_o + _pg_ir_len]
+_pg_interp_hash = hashlib.sha256(_pg_interp_ct).digest()
+_pg_manifest_seed = bytes(a ^ b ^ c for a, b, c in zip(hashlib.sha256(${n_seed} + _pg_manifest_label).digest(), _pg_interp_hash, _pg_env))
 _pg_manifest_p = ${n_kd}(_pg_manifest_seed)
-_pg_manifest_blob = zlib.decompress(${n_dec}(${manifestCtVar}, _pg_manifest_p[0], _pg_manifest_p[1], _pg_manifest_p[2]), -15)
-_pg_manifest_lut = {}
+_pg_manifest_blob = zlib.decompress(${n_dec}(_pg_manifest_ct, _pg_manifest_p[0], _pg_manifest_p[1], _pg_manifest_p[2]), -15)
+_pg_manifest_pairs = []
 _pg_manifest_mods = {}
 _pg_mod_type = type(sys)
+_pg_mod_dict = _pg_mod_type.__dict__.get(bytes([95, 95, 100, 105, 99, 116, 95, 95]).decode())
 _pg_manifest_off = 0
 _pg_manifest_cnt = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 4], bytes([108, 105, 116, 116, 108, 101]).decode())
 _pg_manifest_off += 4
@@ -227,26 +244,37 @@ for _ in range(_pg_manifest_cnt):
                     _pg_mod = _pg_live_mod
             _pg_manifest_mods[_pg_mod_name] = _pg_mod
         if _pg_attr_name is None:
-            _pg_manifest_lut[_pg_mid] = _pg_mod
+            _pg_val = _pg_mod
         else:
-            _pg_val = _pg_mod.__dict__.get(_pg_attr_name, _pg_manifest_mods)
+            _pg_val = _pg_manifest_mods
+            if _pg_mod_dict is not None and type(_pg_mod) is _pg_mod_type:
+                try:
+                    _pg_dict = _pg_mod_dict.__get__(_pg_mod)
+                except Exception:
+                    _pg_dict = None
+                if isinstance(_pg_dict, dict):
+                    _pg_val = _pg_dict.get(_pg_attr_name, _pg_manifest_mods)
             if _pg_val is _pg_manifest_mods:
                 _pg_val = getattr(_pg_mod, _pg_attr_name)
-            _pg_manifest_lut[_pg_mid] = _pg_val
+        _pg_manifest_pairs.append((_pg_mid, _pg_val))
     except BaseException as _pg_exc:
-        _pg_manifest_lut[_pg_mid] = _pg_exc
-${interpSeedVar} = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + bytes(${bytesArrayLit(interpLabel)})).digest(), ${envCheckVar}))
-${interpPVar} = ${n_kd}(${interpSeedVar})
-${interpMarshalVar} = zlib.decompress(${n_dec}(${interpCtVar}, ${interpPVar}[0], ${interpPVar}[1], ${interpPVar}[2]), -15)
-${interpCodeVar} = marshal.loads(${interpMarshalVar})
-${interpNsVar} = {bytes([95, 95, 98, 117, 105, 108, 116, 105, 110, 115, 95, 95]).decode(): __builtins__, bytes([95, 95, 110, 97, 109, 101, 95, 95]).decode(): bytes([60, 112, 103, 95, 105, 62]).decode()}
-${schemaChunks.decls}
-${schemaCtVar} = base64.b85decode(${schemaChunks.concat})
-${irChunks.decls}
-${irCtVar} = base64.b85decode(${irChunks.concat})
-${interpNsVar}[bytes(${bootKeyLit})] = (${schemaCtVar}, bytes(${bytesArrayLit(schemaLabel)}), ${irCtVar}, bytes(${bytesArrayLit(irLabel)}), ${n_seed}, ${interpHashVar}, ${envCheckVar}, bytes(${pepLit}), bytes(${profileLit}), bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode(), _pg_bi_snap, _pg_manifest_lut)
-${interpFTVar}(${interpCodeVar}, ${interpNsVar})()
-del ${interpMarshalVar}, ${interpCodeVar}, ${interpCtVar}, _pg_manifest_blob, _pg_manifest_lut, _pg_manifest_mods
+        _pg_manifest_pairs.append((_pg_mid, _pg_exc))
+_pg_manifest_pairs = tuple(_pg_manifest_pairs)
+_pg_interp_seed = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + _pg_interp_label).digest(), _pg_env))
+_pg_interp_p = ${n_kd}(_pg_interp_seed)
+_pg_interp_m = zlib.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2]), -15)
+if (_pg_interp_m[:4] != bytes([80, 71, 77, 49]) or len(_pg_interp_m) < 6 or _pg_interp_m[4] != sys.version_info[0] or _pg_interp_m[5] != sys.version_info[1]):
+    raise SystemExit(0)
+_pg_interp_code = marshal.loads(_pg_interp_m[6:])
+for _pg_mod_name, _pg_mod in _pg_manifest_mods.items():
+    try:
+        sys.modules[_pg_mod_name] = _pg_mod
+    except Exception:
+        pass
+_pg_interp_ns = {bytes([95, 95, 98, 117, 105, 108, 116, 105, 110, 115, 95, 95]).decode(): __builtins__, bytes([95, 95, 110, 97, 109, 101, 95, 95]).decode(): bytes([60, 112, 103, 95, 105, 62]).decode()}
+_pg_interp_ns[_pg_boot_key] = (_pg_schema_ct, _pg_schema_label, _pg_ir_ct, _pg_ir_label, ${n_seed}, _pg_interp_hash, _pg_env, _pg_pep, _pg_profile, bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode(), _pg_bi_snap, _pg_manifest_pairs)
+_pg_ft(_pg_interp_code, _pg_interp_ns)()
+del _pg_pkg, _pg_interp_ct, _pg_manifest_ct, _pg_schema_ct, _pg_ir_ct, _pg_manifest_blob, _pg_manifest_mods, _pg_manifest_pairs
 `;
 }
 

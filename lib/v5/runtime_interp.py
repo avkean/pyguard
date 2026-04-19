@@ -146,9 +146,9 @@ _S_L = {}   # field layouts
 # back to `getattr(builtins, name)`, so a post-boot `builtins.print = spy`
 # swap is invisible to user name resolution.
 _PG_BI = {}
-# Static import lookup table captured by stage2 before the interpreter code
-# object is unmarshaled. Maps manifest ids -> resolved module objects,
-# imported attributes, or deferred exceptions for re-raise at use time.
+# Static import lookup table resolved inside `_pg_boot` from the encrypted
+# manifest blob. Maps manifest ids -> resolved module objects, imported
+# attributes, or deferred exceptions for re-raise at use time.
 _PG_IMP = {}
 
 
@@ -202,7 +202,6 @@ def _pg_env_w():
         return w
     except Exception:
         return 0
-
 
 _NODE_POS = {
     'Code': {'instrs': 1},
@@ -2015,9 +2014,9 @@ def _pg_boot(*_a):
     """PyGuard interpreter entry point.
 
     Signature (9..12 positional args, no stage2 callables):
-      schema_ct, schema_label, ir_ct, ir_label, seed,
-      interp_hash, env_hash, pep, profile[, module_name='__main__'
-      [, builtins_snapshot[, import_lut]]]
+      schema_ct, schema_label, ir_ct, ir_label, seed, interp_hash,
+      env_hash, pep, profile[, module_name='__main__'[, builtins_snapshot
+      [, import_pairs]]]
 
     All stage2-supplied "config" is inert bytes: a 32-byte `pep` pepper,
     and a 15-byte `profile` struct (rounds, rot_mod, sbx_nudge,
@@ -2052,6 +2051,11 @@ def _pg_boot(*_a):
         _PG_BI = _bi_snap
     if isinstance(_imp_lut, dict):
         _PG_IMP = _imp_lut
+    elif isinstance(_imp_lut, (tuple, list)):
+        try:
+            _PG_IMP = {k: v for k, v in _imp_lut}
+        except Exception:
+            _PG_IMP = {}
     del _bi_snap
     del _imp_lut
 
