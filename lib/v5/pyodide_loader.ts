@@ -77,8 +77,10 @@ export async function getPyodide(): Promise<PyodideInstance> {
         py.runPython(
             `import marshal as _pg_marshal, zlib as _pg_zlib, base64 as _pg_b64, sys as _pg_sys\n` +
             `def _pg_compile_marshal_b64(src, filename):\n` +
-            `    tag = b'PGM1' + bytes([_pg_sys.version_info.major & 255, _pg_sys.version_info.minor & 255])\n` +
-            `    return _pg_b64.b64encode(tag + _pg_marshal.dumps(compile(src, filename, 'exec'))).decode('ascii')\n` +
+            `    mb = _pg_marshal.dumps(compile(src, filename, 'exec'))\n` +
+            `    L = len(mb)\n` +
+            `    entry = bytes([_pg_sys.version_info.major & 255, _pg_sys.version_info.minor & 255, L & 255, (L >> 8) & 255, (L >> 16) & 255, (L >> 24) & 255]) + mb\n` +
+            `    return _pg_b64.b64encode(b'PGMV' + bytes([1]) + entry).decode('ascii')\n` +
             `def _pg_raw_deflate_b64(blob_b64):\n` +
             `    raw = _pg_b64.b64decode(blob_b64)\n` +
             `    co = _pg_zlib.compressobj(9, _pg_zlib.DEFLATED, -15)\n` +

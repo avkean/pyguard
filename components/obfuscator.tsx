@@ -3,8 +3,36 @@
 import { useState, useEffect, useCallback } from "react"
 import CodeEditor from "./code-editor"
 import { Copy, Check, AlertCircle, CornerDownLeft } from "lucide-react"
-import { obfuscatePythonInBrowser, BuildIRError } from "@/lib/v5/pyodide_loader"
 import { cn } from "@/lib/utils"
+
+class BuildIRError extends Error {
+  kind: "syntax" | "python" | "internal"
+  constructor(message: string, kind: "syntax" | "python" | "internal") {
+    super(message)
+    this.name = "BuildIRError"
+    this.kind = kind
+  }
+}
+
+async function obfuscateViaServer(source: string): Promise<string> {
+  const res = await fetch("/api/obfuscate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source }),
+  })
+  if (!res.ok) {
+    let payload: { error?: string; kind?: "syntax" | "python" | "internal" } = {}
+    try {
+      payload = await res.json()
+    } catch {
+      // non-JSON error (e.g. HTML error page from middleware)
+    }
+    const kind = payload.kind ?? "internal"
+    const message = payload.error ?? `HTTP ${res.status}`
+    throw new BuildIRError(message, kind)
+  }
+  return await res.text()
+}
 
 const SAMPLE = `def greet(name):
     """Greet the given person."""
@@ -56,7 +84,7 @@ export default function Obfuscator() {
     setOutputCode("")
 
     try {
-      const obfuscated = await obfuscatePythonInBrowser(inputCode)
+      const obfuscated = await obfuscateViaServer(inputCode)
       setOutputCode(obfuscated)
       setTab("output")
     } catch (e) {
@@ -121,7 +149,7 @@ export default function Obfuscator() {
           can&rsquo;t read.
         </p>
         <p className="mt-4 text-[12px] text-ink-dim font-sans tracking-wide">
-          Runs entirely in your browser &middot; nothing leaves this tab
+          Stubs target Python 3.9&ndash;3.14 &middot; built server-side for multi-version support
         </p>
       </section>
 
@@ -290,8 +318,7 @@ export default function Obfuscator() {
 
       {/* Small caption under the panel */}
       <p className="text-[11.5px] text-ink-dim mt-5 text-center font-sans">
-        First run downloads Pyodide (~10&nbsp;MB). Subsequent runs reuse the cached
-        runtime.
+        Your source is sent to the server for obfuscation and returned as a single self-contained stub.
       </p>
     </div>
   )

@@ -15,6 +15,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { discoverPythons as discoverPythonsHelper } from './multi_marshal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
@@ -213,10 +214,31 @@ const args = parseArgs(process.argv);
 const userSource = fs.readFileSync(args.src, 'utf-8');
 const schema = makeV5Schema();
 
-// Step 1: compile IR via python3 + build_ir.py.
+// Discover Python build toolchains. Each stub embeds per-minor marshal
+// blobs for every (major, minor) found here, wrapped in a PGMV multi-
+// version container. The runtime scans the container for its own
+// sys.version_info and fails closed (silent exit) if no entry matches.
+//
+// Priority order:
+//   1. PYGUARD_PYTHON_BINS env var (':'-separated list of python binaries)
+//   2. Auto-discovery across homebrew / system / ~/.local paths for
+//      CPython minors 3.9..3.14.
+// The discovered set is deduplicated by (major, minor); the first binary
+// reporting a given minor wins.
+const pythons = discoverPythonsHelper();
+if (pythons.length === 0) {
+    console.error('gen-v5-stub: no Python build toolchains discovered');
+    process.exit(3);
+}
+console.error(`gen-v5-stub: embedding marshal blobs for Python ${pythons.map((p) => `${p.major}.${p.minor}`).join(', ')}`);
+// Any of the discovered Pythons is fine for the IR JSON step — the IR is
+// marshal-independent (plain JSON). Pick the first.
+const buildIrPython = pythons[0].bin;
+
+// Step 1: compile IR via build_ir.py.
 // build_ir's __main__ reads source from stdin and writes a JSON envelope
 // carrying base64-encoded IR + import-manifest blobs.
-const py = spawnSync('python3', [path.join(root, 'lib/v5/build_ir.py')], {
+const py = spawnSync(buildIrPython, [path.join(root, 'lib/v5/build_ir.py')], {
     input: userSource,
     encoding: 'utf-8',
     env: { ...process.env, PYGUARD_V5_SCHEMA: JSON.stringify(schema) },
@@ -233,9 +255,19 @@ const irArtifacts = JSON.parse(py.stdout.trim());
 // stripping (the re-export graph ends up empty). Dynamic import via tsx
 // works correctly.
 //
-// Build tagged marshal blobs for stage1/stage2/interpreter. The runtime
-// checks the tag before marshal.loads so incompatible Python minors fail
-// closed without falling back to source compilation.
+// Build tagged multi-version marshal blobs (PGMV) for stage1 / stage2 /
+// interpreter. Each PGMV bundle contains per-minor marshal payloads for
+// every Python build toolchain discovered above. At runtime the stub
+// scans the bundle for a (major, minor) entry matching the executing
+// CPython and silently exits if no entry matches.
+//
+// Format:
+//   b'PGMV' + <1-byte entry count> +
+//       N × (major:1 + minor:1 + len:4LE + marshal_bytes)
+//
+// marshal_bytes is raw `marshal.dumps(compile(source, filename, 'exec'))`
+// for that minor — no nested tag. Audit hooks still observe exactly one
+// `marshal.loads` event per stage, on the matching entry's bytes only.
 const driver = `
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
@@ -243,8 +275,11 @@ const { obfuscatePythonCode } = await import('./lib/obfuscate.ts');
 const { INTERPRETER_SRC_B64 } = await import('./lib/v5/interpreter_src.ts');
 const fs = await import('node:fs');
 
-function compileAndMarshal(source, filename) {
-    const r = spawnSync('python3', [${JSON.stringify(path.join(root, 'lib/v5/build_ir.py').replace(/\\/g, '\\\\'))}], {
+const PYTHON_BUILDS = ${JSON.stringify(pythons.map((p) => ({ bin: p.bin, major: p.major, minor: p.minor })))};
+const BUILD_IR_PATH = ${JSON.stringify(path.join(root, 'lib/v5/build_ir.py').replace(/\\/g, '\\\\'))};
+
+function compileAndMarshalOne(pythonBin, source, filename) {
+    const r = spawnSync(pythonBin, [BUILD_IR_PATH], {
         input: source,
         encoding: 'utf-8',
         env: {
@@ -255,9 +290,53 @@ function compileAndMarshal(source, filename) {
         maxBuffer: 64 * 1024 * 1024,
     });
     if (r.status !== 0) {
-        throw new Error('compile_and_marshal subprocess failed: ' + r.stderr);
+        throw new Error('compile_and_marshal subprocess (' + pythonBin + ') failed: ' + r.stderr);
     }
-    return Uint8Array.from(Buffer.from(r.stdout.trim(), 'base64'));
+    const buf = Buffer.from(r.stdout.trim(), 'base64');
+    // build_ir outputs b'PGM1' + major + minor + marshal.dumps(code).
+    // Validate and strip the 6-byte tag; PGMV stores raw marshal bytes.
+    if (buf.length < 6 || buf[0] !== 0x50 || buf[1] !== 0x47 || buf[2] !== 0x4d || buf[3] !== 0x31) {
+        throw new Error('compile_and_marshal: missing PGM1 tag from ' + pythonBin);
+    }
+    return { major: buf[4], minor: buf[5], bytes: Uint8Array.from(buf.subarray(6)) };
+}
+
+function packPGMV(entries) {
+    // entries: [{major, minor, bytes}]
+    if (entries.length === 0 || entries.length > 255) {
+        throw new Error('packPGMV: invalid entry count ' + entries.length);
+    }
+    let total = 5;
+    for (const e of entries) total += 6 + e.bytes.length;
+    const out = new Uint8Array(total);
+    out[0] = 0x50; out[1] = 0x47; out[2] = 0x4d; out[3] = 0x56; // 'PGMV'
+    out[4] = entries.length;
+    let off = 5;
+    for (const e of entries) {
+        out[off] = e.major; out[off+1] = e.minor;
+        const L = e.bytes.length;
+        out[off+2] = L & 0xff;
+        out[off+3] = (L >>> 8) & 0xff;
+        out[off+4] = (L >>> 16) & 0xff;
+        out[off+5] = (L >>> 24) & 0xff;
+        off += 6;
+        out.set(e.bytes, off);
+        off += e.bytes.length;
+    }
+    return out;
+}
+
+function compileAndMarshal(source, filename) {
+    const entries = [];
+    const seen = new Set();
+    for (const b of PYTHON_BUILDS) {
+        const entry = compileAndMarshalOne(b.bin, source, filename);
+        const key = entry.major + '.' + entry.minor;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push(entry);
+    }
+    return packPGMV(entries);
 }
 
 const interpSrcBytes = zlib.inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, 'base64'));

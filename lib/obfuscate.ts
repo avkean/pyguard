@@ -864,6 +864,53 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const s1_boot2   = ng.gen();
     const s2_bootVar = ng.gen();
 
+    // Fast bulk-decrypt injected at stage1 (marshaled, so tight loop is
+    // fine — no source-visible cipher to flatten). Produces byte-identical
+    // output to stage0's flattened `_dec` but runs ~40x faster via
+    // bytes.translate per round + int-XOR bulk keystream. Stage1 rebinds
+    // `${n_dec}` to this fast function before decrypting the main user
+    // blob and before passing its globals to stage2, so stage2's existing
+    // `${n_dec}(...)` calls pick up the fast path automatically.
+    const f_ct   = ng.gen();
+    const f_rks  = ng.gen();
+    const f_rotk = ng.gen();
+    const f_inv  = ng.gen();
+    const f_L    = ng.gen();
+    const f_N    = ng.gen();
+    const f_buf  = ng.gen();
+    const f_r    = ng.gen();
+    const f_k    = ng.gen();
+    const f_tbl  = ng.gen();
+    const f_rk   = ng.gen();
+    const f_nf   = ng.gen();
+    const f_kb   = ng.gen();
+    const f_ib   = ng.gen();
+    const f_ik   = ng.gen();
+    const f_out  = ng.gen();
+    const f_i    = ng.gen();
+    const f_prev = ng.gen();
+    const f_b    = ng.gen();
+
+    // PGMV multi-version blob scan — outer canonical region
+    const n_pv_n     = ng.gen();
+    const n_pv_i     = ng.gen();
+    const n_pv_mj    = ng.gen();
+    const n_pv_mn    = ng.gen();
+    const n_pv_a     = ng.gen();
+    const n_pv_b     = ng.gen();
+    const n_pv_l     = ng.gen();
+    const n_pv_bytes = ng.gen();
+
+    // PGMV multi-version blob scan — stage1 body (matches stage2 payload)
+    const s1_pv_n     = ng.gen();
+    const s1_pv_i     = ng.gen();
+    const s1_pv_mj    = ng.gen();
+    const s1_pv_mn    = ng.gen();
+    const s1_pv_a     = ng.gen();
+    const s1_pv_b     = ng.gen();
+    const s1_pv_l     = ng.gen();
+    const s1_pv_bytes = ng.gen();
+
     // _vfy (second-layer bytecode-integrity defence) names
     const n_vfy      = ng.gen();
     const v_in       = ng.gen();
@@ -1151,102 +1198,28 @@ def ${n_kd}(${k_seed}):
         ${k_inv}[${k_sbox}[${k_i}]] = ${k_i}
     return ${k_rks}, ${k_rotk}, ${k_inv}
 def ${n_dec}(${d_ct}, ${d_rks}, ${d_rotk}, ${d_inv}):
-    ${d_out} = bytearray(len(${d_ct}))
     ${d_N} = ${prof.rounds}
-    ${d_i} = 0
-    ${d_r} = 0
+    ${d_i} = len(${d_ct})
+    ${d_b} = bytes(${d_ct})
+    ${d_r} = ${d_N} - 1
+    while ${d_r} >= 0:
+        ${d_k} = ${d_rotk}[${d_r}]
+        ${d_st} = bytes(${d_inv}[((${d_tmp} >> ${d_k}) | (${d_tmp} << (8 - ${d_k}))) & 0xFF] for ${d_tmp} in range(256))
+        ${d_b} = ${d_b}.translate(${d_st})
+        if ${d_i} > 0:
+            ${d_acc} = ${d_rks}[${d_r}]
+            ${d_chk} = (${d_acc} * ((${d_i} + 31) // 32))[:${d_i}]
+            ${d_p2} = int.from_bytes(${d_b}, 'big')
+            ${d_m} = int.from_bytes(${d_chk}, 'big')
+            ${d_b} = (${d_p2} ^ ${d_m}).to_bytes(${d_i}, 'big')
+        ${d_r} -= 1
+    ${d_out} = bytearray(${d_i})
     ${d_prev} = 0
-    ${d_b} = 0
-    ${d_acc} = 0
-    ${d_tmp} = 0
-    ${d_chk} = 0
-    ${d_p2} = 0
-    ${d_m} = 0xFF
-    ${d_st} = ${st.sCheck}
-    while True:
-        if ${d_st} == ${st.sEnd}:
-            break
-        if ${d_st} == ${st.sCheck}:
-            if ${d_i} >= len(${d_ct}):
-                ${d_st} = ${st.sEnd}
-            else:
-                ${d_st} = ${st.sLoad}
-            continue
-        if ${d_st} == ${st.sLoad}:
-            ${d_b} = ${d_ct}[${d_i}]
-            ${d_tmp} = ${d_b}
-            ${d_st} = ${st.sRoundInit}
-            continue
-        if ${d_st} == ${st.sRoundInit}:
-            ${d_r} = ${d_N} - 1
-            ${d_acc} = (${d_acc} + ${d_b}) & 0xFF
-            ${d_st} = ${st.sRoundCk}
-            continue
-        if ${d_st} == ${st.sRoundCk}:
-            if ${d_r} < 0:
-                ${d_st} = ${st.sCbc}
-            else:
-                ${d_st} = ${st.sRotate}
-            continue
-        if ${d_st} == ${st.sRotate}:
-            ${d_k} = ${d_rotk}[${d_r}]
-            ${d_b} = ((${d_b} >> ${d_k}) | (${d_b} << (8 - ${d_k}))) & 0xFF
-            ${d_st} = ${st.sSbox}
-            continue
-        if ${d_st} == ${st.sSbox}:
-            ${d_b} = ${d_inv}[${d_b}]
-            ${d_chk} = (${d_chk} ^ ${d_b}) & 0xFF
-            ${d_st} = ${st.sXorKey}
-            continue
-        if ${d_st} == ${st.sXorKey}:
-            ${d_b} ^= ${d_rks}[${d_r}][${d_i} % 32]
-            ${d_r} -= 1
-            ${d_st} = ${st.sRoundCk}
-            continue
-        if ${d_st} == ${st.sCbc}:
-            ${d_b} ^= ${d_prev}
-            ${d_out}[${d_i}] = ${d_b}
-            ${d_st} = ${st.sAdv}
-            continue
-        if ${d_st} == ${st.sAdv}:
-            ${d_prev} = ${d_ct}[${d_i}]
-            ${d_i} += 1
-            ${d_p2} = (${d_p2} + 1) & ${d_m}
-            ${d_st} = ${st.sCheck}
-            continue
-        if ${d_st} == ${st.d0}:
-            ${d_tmp} = (${d_tmp} * 31 + ${d_acc}) & 0xFF
-            ${d_st} = ${st.d1}
-            continue
-        if ${d_st} == ${st.d1}:
-            ${d_chk} = (${d_chk} + ${d_tmp}) & 0xFF
-            if ${d_p2} > 0:
-                ${d_st} = ${st.d2}
-            else:
-                ${d_st} = ${st.sCheck}
-            continue
-        if ${d_st} == ${st.d2}:
-            ${d_acc} ^= ${d_inv}[${d_chk}]
-            ${d_p2} = (${d_p2} - 1) & ${d_m}
-            ${d_st} = ${st.d3}
-            continue
-        if ${d_st} == ${st.d3}:
-            ${d_tmp} = (${d_tmp} ^ ${d_rks}[0][${d_p2} % 32]) & 0xFF
-            ${d_st} = ${st.d4}
-            continue
-        if ${d_st} == ${st.d4}:
-            ${d_k} = ${d_rotk}[${d_p2} % ${d_N}]
-            ${d_b} = ((${d_acc} >> ${d_k}) | (${d_acc} << (8 - ${d_k}))) & 0xFF
-            ${d_st} = ${st.d5}
-            continue
-        if ${d_st} == ${st.d5}:
-            ${d_chk} = (${d_chk} ^ ${d_b} ^ ${d_prev}) & 0xFF
-            ${d_st} = ${st.d6}
-            continue
-        if ${d_st} == ${st.d6}:
-            ${d_acc} = (${d_acc} + ${d_chk}) & 0xFF
-            ${d_st} = ${st.sCheck}
-            continue
+    ${d_r} = 0
+    while ${d_r} < ${d_i}:
+        ${d_out}[${d_r}] = ${d_b}[${d_r}] ^ ${d_prev}
+        ${d_prev} = ${d_ct}[${d_r}]
+        ${d_r} += 1
     return bytes(${d_out})
 def ${n_cod}(${n_cod_c}):
     ${n_cod_h} = hashlib.sha256()
@@ -1347,12 +1320,30 @@ ${n_S1} = base64.b85decode(${s1Plan.concat})
 ${n_pt1} = ${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2])
 ${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, '__file__': ${n_path}}
 try:
-    if (${n_pt1}[:4] != bytes([80, 71, 77, 49]) or
-        len(${n_pt1}) < 6 or
-        ${n_pt1}[4] != sys.version_info[0] or
-        ${n_pt1}[5] != sys.version_info[1]):
+    if ${n_pt1}[:4] != bytes([80, 71, 77, 86]) or len(${n_pt1}) < 5:
         sys.exit(0)
-    ${n_co} = marshal.loads(${n_pt1}[6:])
+    ${n_pv_n} = ${n_pt1}[4]
+    ${n_pv_i} = 5
+    ${n_pv_mj} = sys.version_info[0]
+    ${n_pv_mn} = sys.version_info[1]
+    ${n_pv_bytes} = None
+    while ${n_pv_n} > 0:
+        ${n_pv_n} -= 1
+        if ${n_pv_i} + 6 > len(${n_pt1}):
+            sys.exit(0)
+        ${n_pv_a} = ${n_pt1}[${n_pv_i}]
+        ${n_pv_b} = ${n_pt1}[${n_pv_i}+1]
+        ${n_pv_l} = int.from_bytes(${n_pt1}[${n_pv_i}+2:${n_pv_i}+6], 'little')
+        ${n_pv_i} += 6
+        if ${n_pv_i} + ${n_pv_l} > len(${n_pt1}):
+            sys.exit(0)
+        if ${n_pv_a} == ${n_pv_mj} and ${n_pv_b} == ${n_pv_mn}:
+            ${n_pv_bytes} = ${n_pt1}[${n_pv_i}:${n_pv_i}+${n_pv_l}]
+            break
+        ${n_pv_i} += ${n_pv_l}
+    if ${n_pv_bytes} is None:
+        sys.exit(0)
+    ${n_co} = marshal.loads(${n_pv_bytes})
 except Exception:
     sys.exit(0)
 if not isinstance(${n_co}, type((lambda: 0).__code__)):
@@ -1689,13 +1680,38 @@ try:
     ${s1_tstart} = ${n_O}[${bi['__import__']}]('time').monotonic()
 except Exception:
     ${s1_tstart} = 0
+def ${n_dec}(${f_ct}, ${f_rks}, ${f_rotk}, ${f_inv}):
+    ${f_L} = len(${f_ct})
+    ${f_N} = len(${f_rks})
+    ${f_buf} = bytes(${f_ct})
+    ${f_r} = ${f_N} - 1
+    while ${f_r} >= 0:
+        ${f_k} = ${f_rotk}[${f_r}]
+        ${f_tbl} = bytes(${f_inv}[((${f_b} >> ${f_k}) | (${f_b} << (8 - ${f_k}))) & 255] for ${f_b} in range(256))
+        ${f_buf} = ${f_buf}.translate(${f_tbl})
+        ${f_rk} = ${f_rks}[${f_r}]
+        if ${f_L} > 0:
+            ${f_nf} = (${f_L} + 31) // 32
+            ${f_kb} = (${f_rk} * ${f_nf})[:${f_L}]
+            ${f_ib} = int.from_bytes(${f_buf}, 'big')
+            ${f_ik} = int.from_bytes(${f_kb}, 'big')
+            ${f_buf} = (${f_ib} ^ ${f_ik}).to_bytes(${f_L}, 'big')
+        ${f_r} -= 1
+    ${f_out} = bytearray(${f_L})
+    ${f_prev} = 0
+    ${f_i} = 0
+    while ${f_i} < ${f_L}:
+        ${f_out}[${f_i}] = ${f_buf}[${f_i}] ^ ${f_prev}
+        ${f_prev} = ${f_ct}[${f_i}]
+        ${f_i} += 1
+    return bytes(${f_out})
 ${s1_seed2} = hashlib.sha256(bytes(a ^ ${s1_taint} for a in ${n_seed}) + bytes(${bytesArrayLit(stage2Label)})).digest()
 ${s1_p2} = ${n_kd}(${s1_seed2})
 ${userChunks.decls}
 ${s1_S2} = base64.b85decode(${userChunks.concat})
 ${s1_pt2} = ${n_dec}(${s1_S2}, ${s1_p2}[0], ${s1_p2}[1], ${s1_p2}[2])
 try:
-    if ${s1_tstart} > 0 and ${n_O}[${bi['__import__']}]('time').monotonic() - ${s1_tstart} > 2.0:
+    if ${s1_tstart} > 0 and ${n_O}[${bi['__import__']}]('time').monotonic() - ${s1_tstart} > 30.0:
         ${s1_pt2} = ${s1_pt2}[::-1]
 except Exception:
     pass
@@ -1711,18 +1727,54 @@ ${opts && opts.v5IR ? `    if (${s1_pt2}[:4] != bytes([80, 71, 83, 50]) or len($
     ${s1_pkg2} = ${s1_pt2}[${s1_pkg2Off}:${s1_pkg2Off} + ${s1_m2Len}]
     ${s1_pkg2Off} += ${s1_m2Len}
     ${s1_boot2} = ${s1_pt2}[${s1_pkg2Off}:]
-    if (${s1_pkg2}[:4] != bytes([80, 71, 77, 49]) or
-        len(${s1_pkg2}) < 6 or
-        ${s1_pkg2}[4] != sys.version_info[0] or
-        ${s1_pkg2}[5] != sys.version_info[1]):
+    if ${s1_pkg2}[:4] != bytes([80, 71, 77, 86]) or len(${s1_pkg2}) < 5:
+        sys.exit(0)
+    ${s1_pv_n} = ${s1_pkg2}[4]
+    ${s1_pv_i} = 5
+    ${s1_pv_mj} = sys.version_info[0]
+    ${s1_pv_mn} = sys.version_info[1]
+    ${s1_pv_bytes} = None
+    while ${s1_pv_n} > 0:
+        ${s1_pv_n} -= 1
+        if ${s1_pv_i} + 6 > len(${s1_pkg2}):
+            sys.exit(0)
+        ${s1_pv_a} = ${s1_pkg2}[${s1_pv_i}]
+        ${s1_pv_b} = ${s1_pkg2}[${s1_pv_i}+1]
+        ${s1_pv_l} = int.from_bytes(${s1_pkg2}[${s1_pv_i}+2:${s1_pv_i}+6], 'little')
+        ${s1_pv_i} += 6
+        if ${s1_pv_i} + ${s1_pv_l} > len(${s1_pkg2}):
+            sys.exit(0)
+        if ${s1_pv_a} == ${s1_pv_mj} and ${s1_pv_b} == ${s1_pv_mn}:
+            ${s1_pv_bytes} = ${s1_pkg2}[${s1_pv_i}:${s1_pv_i}+${s1_pv_l}]
+            break
+        ${s1_pv_i} += ${s1_pv_l}
+    if ${s1_pv_bytes} is None:
         sys.exit(0)
     ${s1_uns}[${JSON.stringify(s2_bootVar)}] = ${s1_boot2}
-    ${s1_co2} = marshal.loads(${s1_pkg2}[6:])` : `    if (${s1_pt2}[:4] != bytes([80, 71, 77, 49]) or
-        len(${s1_pt2}) < 6 or
-        ${s1_pt2}[4] != sys.version_info[0] or
-        ${s1_pt2}[5] != sys.version_info[1]):
+    ${s1_co2} = marshal.loads(${s1_pv_bytes})` : `    if ${s1_pt2}[:4] != bytes([80, 71, 77, 86]) or len(${s1_pt2}) < 5:
         sys.exit(0)
-    ${s1_co2} = marshal.loads(${s1_pt2}[6:])`}
+    ${s1_pv_n} = ${s1_pt2}[4]
+    ${s1_pv_i} = 5
+    ${s1_pv_mj} = sys.version_info[0]
+    ${s1_pv_mn} = sys.version_info[1]
+    ${s1_pv_bytes} = None
+    while ${s1_pv_n} > 0:
+        ${s1_pv_n} -= 1
+        if ${s1_pv_i} + 6 > len(${s1_pt2}):
+            sys.exit(0)
+        ${s1_pv_a} = ${s1_pt2}[${s1_pv_i}]
+        ${s1_pv_b} = ${s1_pt2}[${s1_pv_i}+1]
+        ${s1_pv_l} = int.from_bytes(${s1_pt2}[${s1_pv_i}+2:${s1_pv_i}+6], 'little')
+        ${s1_pv_i} += 6
+        if ${s1_pv_i} + ${s1_pv_l} > len(${s1_pt2}):
+            sys.exit(0)
+        if ${s1_pv_a} == ${s1_pv_mj} and ${s1_pv_b} == ${s1_pv_mn}:
+            ${s1_pv_bytes} = ${s1_pt2}[${s1_pv_i}:${s1_pv_i}+${s1_pv_l}]
+            break
+        ${s1_pv_i} += ${s1_pv_l}
+    if ${s1_pv_bytes} is None:
+        sys.exit(0)
+    ${s1_co2} = marshal.loads(${s1_pv_bytes})`}
 except Exception:
     sys.exit(0)
 ${n_ftype}(${s1_co2}, ${s1_uns})()

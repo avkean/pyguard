@@ -1095,6 +1095,19 @@ class Interp:
                 if cls_v is not None and self_v is not None:
                     return builtins.super(cls_v, self_v)
                 return builtins.super()
+            # Intercept builtins.globals() / builtins.locals() so they
+            # return the user's simulated scope dicts, not the interpreter
+            # module's native Python globals. Needed because _SecretGate
+            # emits `FunctionType(co, globals())()`: without this intercept
+            # the compiled code writes into the interpreter's globals dict
+            # instead of scope.globals, and later user-level name lookups
+            # miss the assignment.
+            if (func is builtins.globals
+                    and not _nf(node, 'args') and not _nf(node, 'keywords')):
+                return scope.globals
+            if (func is builtins.locals
+                    and not _nf(node, 'args') and not _nf(node, 'keywords')):
+                return scope.vars
             args = []
             for a in _nf(node, 'args'):
                 if _pg_tag(a[0]) == 'Starred':
@@ -2205,26 +2218,28 @@ def _k_derive(input_seed, pep, rounds, rk_label, rot_label, sbx_label, rot_mod, 
 
 
 def _c_dec(ct, rks, rotk, inv):
-    """Inline cipher decrypt — canonical (unflattened) version of the
-    state machine stage1 generates as source. Equivalent semantics,
-    ~20x less code. Stage1's flattened version is retained for its own
-    use (where extraction resistance matters); the interpreter's copy
-    runs after FunctionType has already latched the code object, so
-    flattening buys no additional protection here.
-    """
+    L = len(ct)
     N = len(rks)
-    out = bytearray(len(ct))
+    buf = bytes(ct)
+    r = N - 1
+    while r >= 0:
+        k = rotk[r]
+        tbl = bytes(inv[((b >> k) | (b << (8 - k))) & 255] for b in range(256))
+        buf = buf.translate(tbl)
+        rk = rks[r]
+        if L > 0:
+            kb = (rk * ((L + 31) // 32))[:L]
+            ib = int.from_bytes(buf, 'big')
+            ik = int.from_bytes(kb, 'big')
+            buf = (ib ^ ik).to_bytes(L, 'big')
+        r -= 1
+    out = bytearray(L)
     prev = 0
-    for i in range(len(ct)):
-        b = ct[i]
-        for r in range(N - 1, -1, -1):
-            k = rotk[r]
-            b = ((b >> k) | (b << (8 - k))) & 0xFF
-            b = inv[b]
-            b ^= rks[r][i % 32]
-        b ^= prev
-        out[i] = b
+    i = 0
+    while i < L:
+        out[i] = buf[i] ^ prev
         prev = ct[i]
+        i += 1
     return _PGBT(out)
 
 

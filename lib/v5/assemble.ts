@@ -263,9 +263,30 @@ _pg_manifest_pairs = tuple(_pg_manifest_pairs)
 _pg_interp_seed = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + _pg_interp_label).digest(), _pg_env))
 _pg_interp_p = ${n_kd}(_pg_interp_seed)
 _pg_interp_m = zlib.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2]), -15)
-if (_pg_interp_m[:4] != bytes([80, 71, 77, 49]) or len(_pg_interp_m) < 6 or _pg_interp_m[4] != sys.version_info[0] or _pg_interp_m[5] != sys.version_info[1]):
+if _pg_interp_m[:4] != bytes([80, 71, 77, 86]) or len(_pg_interp_m) < 5:
     raise SystemExit(0)
-_pg_interp_code = marshal.loads(_pg_interp_m[6:])
+_pg_pv_n = _pg_interp_m[4]
+_pg_pv_i = 5
+_pg_pv_mj = sys.version_info[0]
+_pg_pv_mn = sys.version_info[1]
+_pg_pv_bytes = None
+while _pg_pv_n > 0:
+    _pg_pv_n -= 1
+    if _pg_pv_i + 6 > len(_pg_interp_m):
+        raise SystemExit(0)
+    _pg_pv_a = _pg_interp_m[_pg_pv_i]
+    _pg_pv_b = _pg_interp_m[_pg_pv_i+1]
+    _pg_pv_l = int.from_bytes(_pg_interp_m[_pg_pv_i+2:_pg_pv_i+6], 'little')
+    _pg_pv_i += 6
+    if _pg_pv_i + _pg_pv_l > len(_pg_interp_m):
+        raise SystemExit(0)
+    if _pg_pv_a == _pg_pv_mj and _pg_pv_b == _pg_pv_mn:
+        _pg_pv_bytes = _pg_interp_m[_pg_pv_i:_pg_pv_i+_pg_pv_l]
+        break
+    _pg_pv_i += _pg_pv_l
+if _pg_pv_bytes is None:
+    raise SystemExit(0)
+_pg_interp_code = marshal.loads(_pg_pv_bytes)
 for _pg_mod_name, _pg_mod in _pg_manifest_mods.items():
     try:
         sys.modules[_pg_mod_name] = _pg_mod

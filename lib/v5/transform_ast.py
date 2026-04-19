@@ -833,29 +833,11 @@ class _CFFlattener(ast.NodeTransformer):
             # Orelse runs when loop exits normally (not via break)
             blocks.append(_Block(orelse_state, node.orelse, _CFF_EXIT))
         else:
-            cond_stmts = [ast.If(
-                test=node.test,
-                body=[_make_assign(sv, body_state)],
-                orelse=[_make_assign(sv, -1)]  # placeholder, resolved later
-            )]
-            blocks = [_Block(cond_state, cond_stmts, _CFF_BRANCH)]
-            # Mark the else branch to resolve to loop exit
-            # We'll use a special state that gets resolved
-            cond_stmts[0].orelse = [_make_assign_exit_marker(sv)]
-            blocks[0] = _Block(cond_state,
-                               [ast.If(
-                                   test=node.test,
-                                   body=[_make_assign(sv, body_state)],
-                                   orelse=[]  # empty means fall through to exit
-                               )], _CFF_EXIT)
-            # Actually simpler: just use an if that either goes to body or exits
-            blocks = [_Block(cond_state, [], None)]
-            blocks[0].stmts = [ast.If(
+            blocks = [_Block(cond_state, [ast.If(
                 test=node.test,
                 body=[_make_assign(sv, body_state)],
                 orelse=[_make_assign_marker(sv, '__EXIT__')]
-            )]
-            blocks[0].next_state = _CFF_BRANCH
+            )], _CFF_BRANCH)]
 
         # Body: execute then go back to condition
         body_stmts = self._transform_loop_stmts(node.body, sv, cond_state)
@@ -2660,33 +2642,37 @@ class _SecretGateRewriter(ast.NodeTransformer):
 
     def _marshal_exec_tail(self, v_pt):
         """Common tail for both inline and call-site bodies:
-            _co = marshal.loads(_pt)
+            _co = compile(_pt.decode('utf-8'), '<pg_gate>', 'exec')
             types.FunctionType(_co, globals())()
         Returns a list of two statements.
 
-        v12.4: we emit `FunctionType(co, globals())()` instead of
-        `exec(co, globals(), locals())`. Both run the code object in the
-        enclosing scope's globals, but FunctionType dodges the
-        `builtins.exec = _hook` interception that A6 uses. The locals()
-        argument is dropped: the true-branch body is guaranteed by
-        _sg_is_exec_safe() to not rebind locals (no FunctionDef /
-        ClassDef / Global / Nonlocal), so running it through a fresh
-        function frame is semantically equivalent for the restricted
-        statement set we allow. The co_consts of the code object
-        (including FLAG literals) never flow through any builtins
-        attribute an attacker can monkey-patch from the outside.
+        Gate payload is Python source text (not marshaled bytecode) so the
+        same stub runs correctly on every target CPython minor. See the
+        matching build-side comment in visit_If().
+
+        FunctionType(co, globals())() is retained over exec(co, globals()):
+        it dodges `builtins.exec = _hook` interception, and _sg_is_exec_safe
+        guarantees the body has no FunctionDef/ClassDef/Global/Nonlocal, so
+        running in a fresh function frame is semantically equivalent.
         """
         ng = self.ng
         v_co = ng.temp()
-        marshal_imp = self._import_call('marshal')
         types_imp = self._import_call('types')
         return [
             ast.Assign(
                 targets=[ast.Name(id=v_co, ctx=ast.Store())],
                 value=ast.Call(
-                    func=ast.Attribute(
-                        value=marshal_imp, attr='loads', ctx=ast.Load()),
-                    args=[ast.Name(id=v_pt, ctx=ast.Load())],
+                    func=ast.Name(id='compile', ctx=ast.Load()),
+                    args=[
+                        ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id=v_pt, ctx=ast.Load()),
+                                attr='decode', ctx=ast.Load()),
+                            args=[ast.Constant(value='utf-8')],
+                            keywords=[]),
+                        ast.Constant(value='<pg_gate>'),
+                        ast.Constant(value='exec'),
+                    ],
                     keywords=[])),
             ast.Expr(value=ast.Call(
                 func=ast.Call(
@@ -2785,42 +2771,8 @@ class _SecretGateRewriter(ast.NodeTransformer):
         # v12.6: fragment every string constant in the true branch into
         # randomly-cut pieces joined with `+`. After `compile()`, the
         # code object's `co_consts` tuple holds the fragments separately,
-        # not the whole secret. An attacker who bypasses v12.4's env
-        # check (e.g., hooking types.FunctionType post-env-check) and
-        # dumps co_consts sees a handful of short pieces per line —
-        # substring-grep for the full FLAG fails. This runs BEFORE
-        # compile() so the bytecode's LOAD_CONST / BUILD_STRING ops
-        # reference the fragments directly.
+        # not the whole secret.
         inlined_body = self._fragment_string_constants(inlined_body)
-
-        # Compile the true-branch to a code object. Use a marker filename
-        # so compile-audit hooks that dump filenames don't leak user paths.
-        tb_module = ast.Module(body=inlined_body, type_ignores=[])
-        ast.fix_missing_locations(tb_module)
-        try:
-            code_obj = compile(tb_module, '<pg_gate>', 'exec')
-        except SyntaxError:
-            # Inlining produced something compile() rejects — leave the
-            # gate alone rather than breaking the build.
-            return node
-        payload = marshal.dumps(code_obj)
-
-        # Random salt + nonce per gate. Seeded off the build RNG so two
-        # builds with the same build seed produce identical stubs (useful
-        # for reproducible builds); otherwise os.urandom would do.
-        # v12.5: jitter salt / nonce length per gate within the declared
-        # ranges. The lengths are implicit in the emitted byte literals
-        # (gate reads len(salt) / len(nonce) from its own body), so no
-        # extra metadata has to leak out.
-        salt_len = self._rng.randint(self.SALT_LEN_MIN, self.SALT_LEN_MAX)
-        nonce_len = self._rng.randint(self.NONCE_LEN_MIN, self.NONCE_LEN_MAX)
-        salt = bytes(self._rng.randint(0, 255) for _ in range(salt_len))
-        nonce = bytes(self._rng.randint(0, 255) for _ in range(nonce_len))
-        key = hashlib.scrypt(
-            pw.encode('utf-8', 'replace'),
-            salt=salt, n=self.KDF_N, r=self.KDF_R, p=self.KDF_P,
-            maxmem=1073741824, dklen=32)
-        ct_and_tag = _sg_seal(key, nonce, payload)
 
         # Track which const names we're now responsible for (so a later
         # pruning pass can drop their module-level assignments).
@@ -2830,6 +2782,15 @@ class _SecretGateRewriter(ast.NodeTransformer):
         self._fired += 1
         # Emit a placeholder Try — .body is filled later by
         # finalize_gates() once we know whether to inline or extract.
+        # Encryption is DEFERRED until after _apply_transforms has run
+        # identifier renaming on the outer tree: the gate body references
+        # user variables (e.g. `comp`) that the renamer mangles to
+        # `__xyzN` everywhere *outside* an already-ciphertext blob. By
+        # unparsing+encrypting at visit_If time, the ciphertext bakes in
+        # the ORIGINAL names while the surrounding code uses renamed
+        # ones, producing NameError at runtime. We now stash `inlined_body`
+        # as raw AST in `_pending` and let `finalize_gates(renamer=…)`
+        # apply the same renamer to the gate body, unparse, and encrypt.
         placeholder = ast.Try(
             body=[ast.Pass()],  # filler, replaced by finalize_gates
             handlers=[ast.ExceptHandler(
@@ -2838,30 +2799,96 @@ class _SecretGateRewriter(ast.NodeTransformer):
                 body=(list(node.orelse) if node.orelse else [ast.Pass()]))],
             orelse=[], finalbody=[])
         self._pending.append(
-            (placeholder, guess_expr, salt, nonce, ct_and_tag))
+            (placeholder, guess_expr, pw, inlined_body))
         return ast.copy_location(placeholder, node)
 
     # -- Finalize: decide inline vs helper based on gate count --
 
-    def finalize_gates(self, module):
+    def _seal_pending(self, renamer=None):
+        """Apply `renamer` to each pending gate body, unparse, and encrypt.
+
+        Returns a list of (placeholder, guess_expr, salt, nonce, ct) tuples
+        ready for finalize_gates() to dispatch between inline/call-site
+        emission. Entries whose gate body fails to compile (post-rename)
+        are dropped and the placeholder body is reset to Pass(), which
+        causes the handler's else branch to run — the same safety net the
+        pre-deferred code relied on.
+        """
+        sealed = []
+        for (node, guess_expr, pw, body) in self._pending:
+            if renamer is not None:
+                # Walk the stored body AST through the renamer so names
+                # baked into the ciphertext match post-rename names in
+                # the outer tree. The renamer's `_map` has already been
+                # populated by its run over the outer module, so any
+                # user-defined name reused in the gate body (e.g.
+                # `comp = "scissors"`) maps to the same mangled token
+                # as the outer code's `if comp == …` comparisons.
+                body = [renamer.visit(stmt) for stmt in body]
+                # guess_expr was captured from the original If's left
+                # operand (typically `Name(id='user')`) and stashed before
+                # rename ran — so the outer rename pass never saw it.
+                # Without this visit, the scrypt call at runtime reads
+                # `Name('user')` which was renamed to `__xyzN` in the
+                # outer tree, raising NameError and silently running the
+                # else branch.
+                guess_expr = renamer.visit(guess_expr)
+            tb_module = ast.Module(body=body, type_ignores=[])
+            ast.fix_missing_locations(tb_module)
+            try:
+                source = ast.unparse(tb_module)
+                compile(source, '<pg_gate>', 'exec')
+            except Exception:
+                node.body = [ast.Pass()]
+                continue
+            payload = source.encode('utf-8', 'replace')
+
+            salt_len  = self._rng.randint(
+                self.SALT_LEN_MIN, self.SALT_LEN_MAX)
+            nonce_len = self._rng.randint(
+                self.NONCE_LEN_MIN, self.NONCE_LEN_MAX)
+            salt  = bytes(self._rng.randint(0, 255) for _ in range(salt_len))
+            nonce = bytes(self._rng.randint(0, 255) for _ in range(nonce_len))
+            key = hashlib.scrypt(
+                pw.encode('utf-8', 'replace'),
+                salt=salt, n=self.KDF_N, r=self.KDF_R, p=self.KDF_P,
+                maxmem=1073741824, dklen=32)
+            ct_and_tag = _sg_seal(key, nonce, payload)
+            sealed.append((node, guess_expr, salt, nonce, ct_and_tag))
+        return sealed
+
+    def finalize_gates(self, module, renamer=None):
         """Fill in the placeholder Try bodies recorded by visit_If().
 
         Strategy:
-          * 1 gate  -> inline the scrypt+AEAD body (smaller, faster boot
-            because there's no FunctionDef creation or call through the
-            obfuscated interpreter).
-          * 2+ gates -> install a shared module-level helper and emit a
-            per-gate call site (amortises body across gates).
+          * 1 gate  -> inline the scrypt+AEAD body.
+          * 2+ gates -> install a shared module-level helper.
+
+        `renamer`, if supplied, is an already-visited _IdentifierRenamer
+        whose `_map` is propagated to gate bodies so cipher names match
+        the renamed outer code.
         """
         if not self._pending:
             return
-        if len(self._pending) >= 2:
+        # Propagate rename mappings into tracking sets so the post-pass
+        # prune() can still find module-level const assignments (whose
+        # target Names were mangled by the renamer after we recorded
+        # them under their pre-rename keys).
+        if renamer is not None:
+            m = renamer._map
+            self._const_strs = {m.get(k, k): v
+                                for k, v in self._const_strs.items()}
+            self._consumed_pw = {m.get(k, k) for k in self._consumed_pw}
+        sealed = self._seal_pending(renamer=renamer)
+        if not sealed:
+            return
+        if len(sealed) >= 2:
             self._install_helper(module)
-            for (node, guess_expr, salt, nonce, ct) in self._pending:
+            for (node, guess_expr, salt, nonce, ct) in sealed:
                 node.body = self._build_callsite_body(
                     guess_expr, salt, nonce, ct)
         else:
-            (node, guess_expr, salt, nonce, ct) = self._pending[0]
+            (node, guess_expr, salt, nonce, ct) = sealed[0]
             node.body = self._build_inline_body(
                 guess_expr, salt, nonce, ct)
         # After this, consumers should re-run ast.fix_missing_locations.
@@ -2965,23 +2992,43 @@ def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=Tr
          bytes into K ≥ 2 XOR'd fragments.
     """
     # Step 0: Secret-gate rewrite. Must run on an ast.Module.
+    # We record gate bodies as raw AST via sgr.visit(tree) but DEFER the
+    # unparse+encrypt step until after identifier renaming (step 1) so
+    # that names inside the cipher blob match the renamed outer code.
+    sgr = None
     if rewrite_secret_gates and isinstance(tree, ast.Module):
         sgr = _SecretGateRewriter(ng)
         sgr.prepare(tree)
         tree = sgr.visit(tree)
-        if sgr._fired > 0:
-            # Two-phase emission: visit_If() recorded placeholder Try
-            # nodes; finalize_gates() now fills their bodies, inlining
-            # for a single gate or extracting to a shared helper for
-            # 2+ gates. Then prune dead module-level const assignments.
-            sgr.finalize_gates(tree)
-            sgr.prune(tree)
         ast.fix_missing_locations(tree)
 
     if rename_identifiers:
         renamer = _IdentifierRenamer(ng)
+        # prepare() collects attr + kwarg names used as "skip" hints for
+        # renaming. Include gate-body AST subtrees so attributes used only
+        # inside an encrypted gate (e.g. `obj.secret_method()`) are still
+        # excluded from outer renaming. sgr._pending holds (node, g, pw,
+        # body) tuples when gates fired.
         renamer.prepare(tree)
+        if sgr is not None and sgr._pending:
+            for (_n, _g, _pw, gbody) in sgr._pending:
+                for stmt in gbody:
+                    for sub in ast.walk(stmt):
+                        if isinstance(sub, ast.Attribute):
+                            renamer._attr_names.add(sub.attr)
+                        if isinstance(sub, ast.keyword) and sub.arg:
+                            renamer._kwarg_names.add(sub.arg)
         tree = renamer.visit(tree)
+        ast.fix_missing_locations(tree)
+    else:
+        renamer = None
+
+    # Step 0 (cont.): now that the renamer has populated its name map,
+    # seal each pending gate body with the same map, then fill the
+    # placeholder Try bodies.
+    if sgr is not None and sgr._fired > 0:
+        sgr.finalize_gates(tree, renamer=renamer)
+        sgr.prune(tree)
         ast.fix_missing_locations(tree)
 
     # v5.1 / C1: mangle attribute access into _gA/_sA/_dA calls keyed by
