@@ -1,24 +1,43 @@
-# Ignore node modules
+# Node / build output
 node_modules
-
-# Ignore build output
 .next
+out
 
-# Ignore logs
+# Tests + their generated stubs (the runner doesn't need them)
+tests/out
+tests/out_v5
+tests/out_v5_pentest
+
+# Python caches
+**/__pycache__
+*.pyc
+*.pyo
+
+# Research testbed — not shipped
+lib/v5/v13
+
+# Docs, logs, env
+docs
 *.log
-
-# Ignore environment variables files
 .env
-.env.local
-.env.development
-.env.test
-.env.production
+.env.*
 
-# Ignore version control
+# Version control / editor
 .git
 .github
 .gitignore
+.vscode
+.idea
 
-# Ignore Docker files (optional)
+# Docker meta (don't recursively copy)
 Dockerfile
 docker-compose.yml
+.dockerignore
+
+# CLAUDE working files
+.claude
+CLAUDE.md
+NOW.md
+
+# TS incremental cache
+*.tsbuildinfo

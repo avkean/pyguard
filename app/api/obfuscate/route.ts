@@ -5,18 +5,52 @@ import path from "node:path";
 import { obfuscatePythonCode } from "@/lib/obfuscate";
 import { makeV5Schema } from "@/lib/v5/schema";
 import { INTERPRETER_SRC_B64 } from "@/lib/v5/interpreter_src";
-import { discoverPythons, createCompileAndMarshal } from "@/scripts/multi_marshal.mjs";
+import {
+    discoverPythons,
+    createCompileAndMarshal,
+} from "@/scripts/multi_marshal.mjs";
+
+// ---------------------------------------------------------------------------
+// Route config
+// ---------------------------------------------------------------------------
+
+export const runtime = "nodejs";
+export const maxDuration = 60;
+
+/** Refuse pathologically large inputs upfront (both to avoid DoS and because
+ *  the obfuscator's own complexity becomes quadratic above this). */
+const MAX_SOURCE_BYTES = 1_000_000;
+
+const BUILD_IR_PATH = path.join(process.cwd(), "lib/v5/build_ir.py");
+
+const LZMA_COMPRESS_SNIPPET = [
+    "import sys, lzma",
+    "sys.stdout.buffer.write(",
+    "    lzma.compress(sys.stdin.buffer.read(),",
+    "                  preset=9 | lzma.PRESET_EXTREME))",
+].join("\n");
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+type PyInfo = { bin: string; major: number; minor: number };
+type ErrorKind = "syntax" | "python" | "internal";
+
+function jsonError(
+    status: number,
+    message: string,
+    kind: ErrorKind = "internal",
+) {
+    return NextResponse.json({ error: message, kind }, { status });
+}
 
 function makeLzmaCompressor(pyBin: string): (b: Uint8Array) => Uint8Array {
-    return (bytes: Uint8Array) => {
-        const r = spawnSync(
-            pyBin,
-            [
-                "-c",
-                "import sys, lzma; sys.stdout.buffer.write(lzma.compress(sys.stdin.buffer.read(), preset=9|lzma.PRESET_EXTREME))",
-            ],
-            { input: Buffer.from(bytes), maxBuffer: 256 * 1024 * 1024 },
-        );
+    return (bytes) => {
+        const r = spawnSync(pyBin, ["-c", LZMA_COMPRESS_SNIPPET], {
+            input: Buffer.from(bytes),
+            maxBuffer: 256 * 1024 * 1024,
+        });
         if (r.status !== 0) {
             throw new Error(`lzma compress failed: ${r.stderr?.toString()}`);
         }
@@ -24,64 +58,82 @@ function makeLzmaCompressor(pyBin: string): (b: Uint8Array) => Uint8Array {
     };
 }
 
-export const runtime = "nodejs";
-export const maxDuration = 60;
+/** Normalize Python's `SyntaxError: (...)` traceback to something the UI can
+ *  render without the `<stdin>` / `<unknown>` noise. */
+function formatPyError(stderr: string): { message: string; kind: ErrorKind } {
+    const lines = stderr
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+    const last = lines[lines.length - 1] || "build_ir failed";
+    const isSyntax = /^(SyntaxError|IndentationError|TabError)\b/.test(last);
+    return {
+        message: last.replace(/\(<(?:unknown|stdin)>,\s*/, "("),
+        kind: isSyntax ? "syntax" : "python",
+    };
+}
 
-const BUILD_IR_PATH = path.join(process.cwd(), "lib/v5/build_ir.py");
+function parseSource(body: unknown): string | NextResponse {
+    if (typeof body !== "object" || body === null) {
+        return jsonError(400, "invalid JSON body");
+    }
+    const source = (body as { source?: unknown }).source;
+    if (typeof source !== "string" || !source.trim()) {
+        return jsonError(400, "source required");
+    }
+    if (Buffer.byteLength(source, "utf-8") > MAX_SOURCE_BYTES) {
+        return jsonError(413, `source exceeds ${MAX_SOURCE_BYTES} bytes`);
+    }
+    return source;
+}
 
-// Cap input source to a sane size (users uploading 10 MB files aren't
-// doing legitimate work — the obfuscator also gets slow there).
-const MAX_SOURCE_BYTES = 1_000_000;
+// ---------------------------------------------------------------------------
+// Toolchain discovery (cached for the lifetime of the Node process)
+// ---------------------------------------------------------------------------
 
-type PyInfo = { bin: string; major: number; minor: number };
+let cachedPythons: PyInfo[] | null = null;
+
+function getPythons(): PyInfo[] {
+    if (cachedPythons) return cachedPythons;
+    const found = discoverPythons() as PyInfo[];
+    if (found.length === 0) {
+        throw new Error("no CPython toolchains discovered on server");
+    }
+    cachedPythons = found;
+    return found;
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
-    let source: string;
+    // 1. Validate input
+    let body: unknown;
     try {
-        const body = await req.json();
-        source = body?.source;
-        if (typeof source !== "string" || !source.trim()) {
-            return NextResponse.json(
-                { error: "source required", kind: "internal" },
-                { status: 400 },
-            );
-        }
-        if (Buffer.byteLength(source, "utf-8") > MAX_SOURCE_BYTES) {
-            return NextResponse.json(
-                {
-                    error: `source exceeds ${MAX_SOURCE_BYTES} bytes`,
-                    kind: "internal",
-                },
-                { status: 413 },
-            );
-        }
+        body = await req.json();
     } catch {
-        return NextResponse.json(
-            { error: "invalid JSON body", kind: "internal" },
-            { status: 400 },
-        );
+        return jsonError(400, "invalid JSON body");
     }
+    const maybeSource = parseSource(body);
+    if (maybeSource instanceof NextResponse) return maybeSource;
+    const source = maybeSource;
 
+    // 2. Discover toolchains
     let pythons: PyInfo[];
     try {
-        pythons = discoverPythons();
-        if (pythons.length === 0) {
-            throw new Error("no CPython toolchains discovered on server");
-        }
+        pythons = getPythons();
     } catch (e) {
-        return NextResponse.json(
-            {
-                error: `server build toolchain missing: ${
-                    e instanceof Error ? e.message : String(e)
-                }`,
-                kind: "internal",
-            },
-            { status: 500 },
+        return jsonError(
+            500,
+            `server build toolchain missing: ${
+                e instanceof Error ? e.message : String(e)
+            }`,
         );
     }
 
-    // Step 1: lift user source to IR via build_ir.py (any discovered
-    // Python works — IR is marshal-independent JSON).
+    // 3. Lift user source → IR (any single discovered Python works — the
+    //    emitted IR is marshal-independent JSON).
     const schema = makeV5Schema();
     const ir = spawnSync(pythons[0].bin, [BUILD_IR_PATH], {
         input: source,
@@ -90,41 +142,24 @@ export async function POST(req: NextRequest) {
         maxBuffer: 64 * 1024 * 1024,
     });
     if (ir.status !== 0) {
-        const tail = (ir.stderr || "")
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .filter(Boolean);
-        const last = tail[tail.length - 1] || "build_ir failed";
-        const isSyntax = /^(SyntaxError|IndentationError|TabError)\b/.test(
-            last,
-        );
-        return NextResponse.json(
-            {
-                error: last.replace(/\(<(?:unknown|stdin)>,\s*/, "("),
-                kind: isSyntax ? "syntax" : "python",
-            },
-            { status: 400 },
-        );
+        const { message, kind } = formatPyError(ir.stderr || "");
+        return jsonError(400, message, kind);
     }
 
     let artifacts: { compressed: string; manifest: string };
     try {
         artifacts = JSON.parse((ir.stdout || "").trim());
     } catch (e) {
-        return NextResponse.json(
-            {
-                error: `build_ir output invalid: ${
-                    e instanceof Error ? e.message : String(e)
-                }`,
-                kind: "internal",
-            },
-            { status: 500 },
+        return jsonError(
+            500,
+            `build_ir output invalid: ${
+                e instanceof Error ? e.message : String(e)
+            }`,
         );
     }
 
-    // Step 2: compile+marshal the interpreter source for every discovered
-    // Python minor, wrap as PGMV, deflate. One scan of `pythons` drives
-    // every per-minor subprocess (interpreter + stage1 + stage2).
+    // 4. Compile + marshal the interpreter for every discovered CPython minor
+    //    and LZMA-compress the resulting PGMV blob.
     let interpMarshalCompressed: Uint8Array;
     let compileAndMarshal: (src: string, fn?: string) => Uint8Array;
     const compress = makeLzmaCompressor(pythons[0].bin);
@@ -133,51 +168,46 @@ export async function POST(req: NextRequest) {
         const interpSrc = zlib
             .inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, "base64"))
             .toString("utf-8");
-        const interpMarshalRaw = compileAndMarshal(interpSrc, "<pg_interp>");
-        interpMarshalCompressed = compress(interpMarshalRaw);
+        interpMarshalCompressed = compress(
+            compileAndMarshal(interpSrc, "<pg_interp>"),
+        );
     } catch (e) {
-        return NextResponse.json(
-            {
-                error: `interpreter compile failed: ${
-                    e instanceof Error ? e.message : String(e)
-                }`,
-                kind: "internal",
-            },
-            { status: 500 },
+        return jsonError(
+            500,
+            `interpreter compile failed: ${
+                e instanceof Error ? e.message : String(e)
+            }`,
         );
     }
 
-    // Step 3: produce the stub.
+    // 5. Produce the stub
     let stub: string;
     try {
-        const compressed = Uint8Array.from(
-            Buffer.from(artifacts.compressed, "base64"),
-        );
-        const manifest = Uint8Array.from(
-            Buffer.from(artifacts.manifest, "base64"),
-        );
         stub = obfuscatePythonCode(source, {
-            v5IR: { compressed, manifest, schema },
+            v5IR: {
+                compressed: Uint8Array.from(
+                    Buffer.from(artifacts.compressed, "base64"),
+                ),
+                manifest: Uint8Array.from(
+                    Buffer.from(artifacts.manifest, "base64"),
+                ),
+                schema,
+            },
             compileAndMarshal,
             interpreterMarshalCompressed: interpMarshalCompressed,
             compress,
         });
     } catch (e) {
-        return NextResponse.json(
-            {
-                error: e instanceof Error ? e.message : String(e),
-                kind: "internal",
-            },
-            { status: 500 },
-        );
+        return jsonError(500, e instanceof Error ? e.message : String(e));
     }
 
-    const versions = pythons.map((p) => `${p.major}.${p.minor}`).join(",");
     return new NextResponse(stub, {
         status: 200,
         headers: {
             "Content-Type": "text/plain; charset=utf-8",
-            "X-PyGuard-Targets": versions,
+            "X-PyGuard-Targets": pythons
+                .map((p) => `${p.major}.${p.minor}`)
+                .join(","),
         },
     });
 }
