@@ -339,9 +339,19 @@ function compileAndMarshal(source, filename) {
     return packPGMV(entries);
 }
 
+function lzmaCompress(bytes) {
+    const r = spawnSync(
+        PYTHON_BUILDS[0].bin,
+        ['-c', 'import sys, lzma; sys.stdout.buffer.write(lzma.compress(sys.stdin.buffer.read(), preset=9|lzma.PRESET_EXTREME))'],
+        { input: Buffer.from(bytes), maxBuffer: 256 * 1024 * 1024 },
+    );
+    if (r.status !== 0) throw new Error('lzma compress failed: ' + r.stderr);
+    return Uint8Array.from(r.stdout);
+}
+
 const interpSrcBytes = zlib.inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, 'base64'));
 const interpMarshalRaw = compileAndMarshal(interpSrcBytes.toString('utf-8'), '<pg_interp>');
-const interpMarshalCompressed = Uint8Array.from(zlib.deflateRawSync(Buffer.from(interpMarshalRaw)));
+const interpMarshalCompressed = lzmaCompress(interpMarshalRaw);
 
 const userSource = fs.readFileSync(${JSON.stringify(args.src)}, 'utf-8');
 const compressed = Uint8Array.from(Buffer.from(${JSON.stringify(irArtifacts.compressed)}, 'base64'));
@@ -350,6 +360,7 @@ const stub = obfuscatePythonCode(userSource, {
     v5IR: { compressed, manifest, schema: ${JSON.stringify(schema)} },
     compileAndMarshal,
     interpreterMarshalCompressed: interpMarshalCompressed,
+    compress: lzmaCompress,
 });
 process.stdout.write(stub);
 `;

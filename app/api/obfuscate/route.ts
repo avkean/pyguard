@@ -8,6 +8,23 @@ import { INTERPRETER_SRC_B64 } from "@/lib/v5/interpreter_src";
 // @ts-expect-error - .mjs without TS declarations
 import { discoverPythons, createCompileAndMarshal } from "@/scripts/multi_marshal.mjs";
 
+function makeLzmaCompressor(pyBin: string): (b: Uint8Array) => Uint8Array {
+    return (bytes: Uint8Array) => {
+        const r = spawnSync(
+            pyBin,
+            [
+                "-c",
+                "import sys, lzma; sys.stdout.buffer.write(lzma.compress(sys.stdin.buffer.read(), preset=9|lzma.PRESET_EXTREME))",
+            ],
+            { input: Buffer.from(bytes), maxBuffer: 256 * 1024 * 1024 },
+        );
+        if (r.status !== 0) {
+            throw new Error(`lzma compress failed: ${r.stderr?.toString()}`);
+        }
+        return Uint8Array.from(r.stdout);
+    };
+}
+
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
@@ -111,15 +128,14 @@ export async function POST(req: NextRequest) {
     // every per-minor subprocess (interpreter + stage1 + stage2).
     let interpMarshalCompressed: Uint8Array;
     let compileAndMarshal: (src: string, fn?: string) => Uint8Array;
+    const compress = makeLzmaCompressor(pythons[0].bin);
     try {
         compileAndMarshal = createCompileAndMarshal(pythons);
         const interpSrc = zlib
             .inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, "base64"))
             .toString("utf-8");
         const interpMarshalRaw = compileAndMarshal(interpSrc, "<pg_interp>");
-        interpMarshalCompressed = Uint8Array.from(
-            zlib.deflateRawSync(Buffer.from(interpMarshalRaw)),
-        );
+        interpMarshalCompressed = compress(interpMarshalRaw);
     } catch (e) {
         return NextResponse.json(
             {
@@ -145,6 +161,7 @@ export async function POST(req: NextRequest) {
             v5IR: { compressed, manifest, schema },
             compileAndMarshal,
             interpreterMarshalCompressed: interpMarshalCompressed,
+            compress,
         });
     } catch (e) {
         return NextResponse.json(

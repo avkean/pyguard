@@ -741,9 +741,13 @@ export interface ObfuscateOpts {
     // fails closed on Python-version mismatch instead of falling back to
     // runtime compile() and leaking stage source through audit hooks.
     compileAndMarshal?: (source: string, filename?: string) => Uint8Array;
-    // Zlib-raw-deflated (-15 wbits) tagged marshal blob for the
-    // interpreter module.
+    // LZMA-compressed tagged marshal blob for the interpreter module.
+    // (LZMA's 8MB default window catches cross-version redundancy across
+    // the 6 marshal entries, halving blob size vs raw-deflate's 32KB window.)
     interpreterMarshalCompressed?: Uint8Array;
+    // LZMA compressor (shelled out to Python on the build side). Used to
+    // squeeze stage1 + stage2 multi-version PGMV blobs before encryption.
+    compress?: (bytes: Uint8Array) => Uint8Array;
 }
 
 export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string {
@@ -955,6 +959,13 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // encryption, via chunkB64Apply below.
     const s1Plan = chunkB64Plan(ng, opts && opts.v5IR ? 16 : 32);
 
+    // Name for the module-level concat of the user-payload chunks.
+    // Canonical references it by name; the decl lives in the preamble
+    // outside canonical (see userChunksBlock below). Hoisting these
+    // chunks out of stage1Src stops them from being compile()'d into
+    // every per-minor marshal blob (they were ~50 KB per version).
+    const n_uc = ng.gen();
+
     const realChain = [
         `${n_pepSeed} = bytes(${bytesArrayLit(pepSeedBytes)})`,
         `${n_pepA} = hashlib.sha256(${n_pepSeed}).digest()`,
@@ -1014,7 +1025,7 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // fails → SystemExit(0) before interpreter bytecode runs.
     const canonicalRegion =
 `${BEGIN_MARKER}
-import sys, hashlib, base64, marshal
+import sys, hashlib, base64, marshal, lzma
 ${n_ftype} = (lambda: 0).__class__
 ${n_O} = ${bcap.tupleSource}
 ${n_gf} = ${n_O}[${bi['getattr']}](sys, '_getf' + 'rame')
@@ -1317,8 +1328,8 @@ except Exception:
 ${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg} + ${n_io} + ${n_bt}).digest()
 ${n_p1} = ${n_kd}(${n_vfy}(${n_seed}))
 ${n_S1} = base64.b85decode(${s1Plan.concat})
-${n_pt1} = ${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2])
-${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, '__file__': ${n_path}}
+${n_pt1} = lzma.decompress(${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2]))
+${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, 'lzma': lzma, '__file__': ${n_path}, '${n_uc}': ${n_uc}}
 try:
     if ${n_pt1}[:4] != bytes([80, 71, 77, 86]) or len(${n_pt1}) < 5:
         sys.exit(0)
@@ -1599,7 +1610,12 @@ ${END_MARKER}
             { n_seed, n_kd, n_dec, n_tchk },
             { bootBundleVar: s2_bootVar },
         );
-        const stage2Marshal = opts.compileAndMarshal(stage2Src, '<pg_s2>');
+        // Stage2 multi-version PGMV compresses ~50% via LZMA's large window
+        // (zlib -15's 32KB window can't catch cross-version redundancy across
+        // the 6 marshal entries). Stage1 decrypts then lzma.decompress before
+        // scanning for the target minor.
+        if (!opts.compress) throw new Error('opts.compress required');
+        const stage2Marshal = opts.compress(opts.compileAndMarshal(stage2Src, '<pg_s2>'));
         const bootBundle = packV5BootBundle({
             interpLabel,
             irLabel,
@@ -1707,8 +1723,7 @@ def ${n_dec}(${f_ct}, ${f_rks}, ${f_rotk}, ${f_inv}):
     return bytes(${f_out})
 ${s1_seed2} = hashlib.sha256(bytes(a ^ ${s1_taint} for a in ${n_seed}) + bytes(${bytesArrayLit(stage2Label)})).digest()
 ${s1_p2} = ${n_kd}(${s1_seed2})
-${userChunks.decls}
-${s1_S2} = base64.b85decode(${userChunks.concat})
+${s1_S2} = base64.b85decode(${n_uc})
 ${s1_pt2} = ${n_dec}(${s1_S2}, ${s1_p2}[0], ${s1_p2}[1], ${s1_p2}[2])
 try:
     if ${s1_tstart} > 0 and ${n_O}[${bi['__import__']}]('time').monotonic() - ${s1_tstart} > 30.0:
@@ -1727,6 +1742,7 @@ ${opts && opts.v5IR ? `    if (${s1_pt2}[:4] != bytes([80, 71, 83, 50]) or len($
     ${s1_pkg2} = ${s1_pt2}[${s1_pkg2Off}:${s1_pkg2Off} + ${s1_m2Len}]
     ${s1_pkg2Off} += ${s1_m2Len}
     ${s1_boot2} = ${s1_pt2}[${s1_pkg2Off}:]
+    ${s1_pkg2} = lzma.decompress(${s1_pkg2})
     if ${s1_pkg2}[:4] != bytes([80, 71, 77, 86]) or len(${s1_pkg2}) < 5:
         sys.exit(0)
     ${s1_pv_n} = ${s1_pkg2}[4]
@@ -1782,9 +1798,14 @@ ${n_ftype}(${s1_co2}, ${s1_uns})()
 
     // Stage1 is likewise marshaled at build time so the outer canonical
     // region never compile()s decrypted stage text at runtime.
-    const stage1Bytes = opts && opts.v5IR && opts.compileAndMarshal
+    const stage1Raw = opts && opts.v5IR && opts.compileAndMarshal
         ? opts.compileAndMarshal(stage1Src, '<pg_s1>')
         : strToUtf8(stage1Src);
+    // Stage1 multi-version PGMV: LZMA for large-window cross-version diff
+    // compression. Stage0 decrypts then lzma.decompress before the PGMV scan.
+    const stage1Bytes = opts && opts.compress
+        ? opts.compress(stage1Raw)
+        : stage1Raw;
     const encStage1 = encrypt(stage1Bytes, params1, prof);
     const encStage1B64 = bytesToBase85(encStage1);  // O5: b85 denser
     // v5.1 / C3 — emit stage1 ciphertext chunks OUTSIDE canonical, into
@@ -1793,8 +1814,11 @@ ${n_ftype}(${s1_co2}, ${s1_uns})()
     // declaration sequence does not itself fingerprint the concat order.
     const stage1DeclsBlock = chunkB64Apply(encStage1B64, s1Plan.names);
 
+    // User-payload chunks live at module level (hoisted out of stage1),
+    // then a single concat binds them into ${n_uc} for stage1's ns dict.
+    const userChunksBlock = `${userChunks.decls}\n${n_uc} = ${userChunks.concat}\n`;
     return `#!/usr/bin/env python3
 # Protected by PyGuard v5 (pyguard.avkean.com)
 ${stage1DeclsBlock}
-${canonicalRegion}`;
+${userChunksBlock}${canonicalRegion}`;
 }

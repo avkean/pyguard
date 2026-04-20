@@ -1238,11 +1238,45 @@ def _enc(v):
 _MARSHAL_TAG = b'PGM1'
 
 
+def _strip_debuginfo(co):
+    """Recursively strip co_filename + co_lnotab/co_linetable from a code
+    object and every nested code constant. These hold line-number and
+    filename metadata that is useless to the stub runtime (no visible
+    traceback is ever desirable from pyguard internals — we exit silently
+    on any crypto failure) but costs ~45 % of each interpreter marshal.
+
+    Measured on python3.11 (2026-04-20): interpreter marshal drops from
+    112 KB to 77 KB; LZMA'd 6-version PGMV drops from 33 KB to 17 KB.
+    """
+    new_consts = tuple(
+        _strip_debuginfo(c) if hasattr(c, 'co_code') else c
+        for c in co.co_consts
+    )
+    kw = dict(co_consts=new_consts, co_filename='', co_firstlineno=0)
+    # Python 3.10+ uses co_linetable; older uses co_lnotab (read-only on
+    # replace() — setting linetable to b'' covers both semantically on
+    # modern versions. On 3.9 `code.replace` accepts neither, so just the
+    # filename gets scrubbed there.)
+    try:
+        return co.replace(**kw, co_linetable=b'')
+    except (TypeError, ValueError):
+        try:
+            return co.replace(**kw)
+        except (TypeError, ValueError):
+            return co
+
+
 def compile_and_marshal(source, filename='<pg>'):
     import marshal
     import sys
 
-    code = compile(source, filename, 'exec')
+    # optimize=2 strips __doc__ + asserts on user-inaccessible paths.
+    # Combined with _strip_debuginfo this removes line/filename metadata
+    # from every code object reachable via the marshal blob — the stub
+    # never wants a pyguard traceback anyway, and the metadata inflates
+    # the multi-version PGMV by ~45 % LZMA-compressed.
+    code = compile(source, filename, 'exec', optimize=2)
+    code = _strip_debuginfo(code)
     tag = _MARSHAL_TAG + bytes([
         sys.version_info.major & 0xFF,
         sys.version_info.minor & 0xFF,

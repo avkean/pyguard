@@ -938,95 +938,51 @@ def strip_docstrings(tree):
 
 
 def obfuscate(src):
-    """Apply all obfuscation passes and return the transformed source."""
-    # Parse
+    """Apply obfuscation passes and return the transformed source.
+
+    Size-conscious pipeline (v6.6 cleanup). Prior rounds ran CFF +
+    StringEncoder + 12 dead functions + MBA on the interpreter source
+    before marshaling. Measured (2026-04-20) each of those adds bytes
+    to the marshaled, multi-version-packed, lzma-compressed blob while
+    the attack surface it defends lives at the post-crypto, post-
+    marshal.loads, disassembly level — by which point a professional
+    reverser reads past those layers regardless. Per CLAUDE.md's
+    "no cosmetic bloat" rule we keep ONLY:
+
+      - strip_docstrings       : zero-cost, removes __doc__ from marshal
+      - identifier rename      : free (marshal string-table dedup), hides
+                                 semantic names like `Scope`, `Interp`,
+                                 `run_blob`, `_pg_boot` from dis output
+      - bootkey registration   : prevents `_pg_boot` from appearing under
+                                 its literal name in interpreter globals
+      - method-order scramble  : free, makes vtable-style analysis harder
+
+    Dropped (measured 5-ver lzma cost per build on 2026-04-20):
+      - StringEncoder + XOR helper : +19 KB  (encodes error strings /
+                                              stdlib method names that
+                                              bytecode references anyway)
+      - transform_ast_tree CFF     :  +8 KB  (interpreter's own control
+                                              flow; attacker reading dis
+                                              output walks past CFF)
+      - insert_dead_code           :  +2 KB  (pure visual clutter)
+
+    Total saved: ~29 KB lzma × base85 5/4 ≈ 37 KB per stub.
+    """
     tree = ast.parse(src)
 
-    # 0. Strip all docstrings
     strip_docstrings(tree)
 
-    # 0.5. Apply AST-level control flow transforms (CFF, opaque predicates,
-    # expression decomposition, constant unfolding). These are the same
-    # transforms applied to user code, making the interpreter dramatically
-    # harder to follow even after identifier deobfuscation.
-    try:
-        transform_ast_path = os.path.join(ROOT_DIR, 'lib', 'v5')
-        if transform_ast_path not in sys.path:
-            sys.path.insert(0, transform_ast_path)
-        from transform_ast import transform_ast_tree
-        # rewrite_secret_gates=False: the rewriter mistakes interpreter
-        # dispatch branches (`if op == 'IBreak':`) for password gates and
-        # wraps them in scrypt-AEAD exec bodies that break raise/generator
-        # semantics and crush perf. The interpreter gets plenty of other
-        # hardening layers (CFF, MBA, string obfuscation, rename, etc.).
-        # obfuscate_strings=False: our StringEncoder (cache-backed
-        # _decode_func with compact bytes-literal arguments) is both
-        # smaller AND faster than transform_ast's per-byte XOR BinOp
-        # chains. Running both back-to-back is redundant and the second
-        # pass encodes already-encoded constants, inflating size.
-        # O4: skip _ConstantUnfolder + _MBAObfuscator on the interpreter.
-        # MBA on raw int constants (dispatch-table keys) only hides them
-        # from a surface-level dis.dis read; a partial evaluator folds
-        # `(a|b)-(a&b)` back in seconds. The passes inflate the shipped
-        # interpreter marshal by ~8 KB deflated per stub (measured on
-        # 2026-04-16) without raising attacker cost. User code still
-        # gets both passes — unknown-at-analysis-time dataflow means
-        # real MBA protection DOES apply there.
-        tree = transform_ast_tree(tree, None, rename_identifiers=False,
-                                  rewrite_secret_gates=False,
-                                  obfuscate_strings=False,
-                                  int_obfuscation=False)
-        ast.fix_missing_locations(tree)
-    except Exception as e:
-        print(f"[obfuscate_runtime] AST transforms skipped: {e}", file=sys.stderr)
-
-    # 1. Build rename map and collect class method names
     rename_map = build_rename_map(tree)
     class_methods = collect_class_method_names(tree)
-
-    # 2. Rename identifiers (methods renamed as both defs and attribute accesses)
     renamer = IdentifierRenamer(rename_map, class_methods)
     tree = renamer.visit(tree)
 
-    # 3. Encode string literals
-    encoder = StringEncoder()
-    tree = encoder.visit(tree)
-
-    # 3.5. Insert the shared XOR decode helper (cache + function) right after imports.
-    # Pass the set of names already consumed by the rename pass so the cache dict
-    # name cannot collide with a renamed class or function — a collision would
-    # rebind the cache dict to a class object mid-exec and break `in`-tests.
-    decode_nodes = _make_xor_decode_func(used_names=set(rename_map.values()))
-    # Find the position after the last import statement
-    insert_pos = 0
-    for i, stmt in enumerate(tree.body):
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            insert_pos = i + 1
-    for j, node in enumerate(decode_nodes):
-        tree.body.insert(insert_pos + j, node)
-
-    # 4. Insert dead code
-    # O2: dead functions exist to confuse static module-layout analysis,
-    # not to be an endless forest an attacker must read past. 4 module-level
-    # dead funcs + 1 dead method per class is plenty of noise for that
-    # purpose; previous 12+3 was cosmetic bloat inflating the interpreter
-    # from ~77 KB raw to ~190 KB raw (2.45x). Compare that against a truly
-    # lossy transform (identifier rename) — bloat does nothing to raise
-    # attacker cost once they've identified the interpreter as a ball of
-    # indirection.
-    insert_dead_code(tree, n_funcs=4, n_methods_per_class=1)
-
-    # 5. Scramble method order in classes
     scramble_class_methods(tree)
 
-    # 6. Add globals registration for API surface names at the end
     reg_stmts = make_globals_registration(rename_map)
     tree.body.extend(reg_stmts)
 
-    # Fix missing line numbers
     ast.fix_missing_locations(tree)
-
-    # Unparse
     return ast.unparse(tree)
 
 

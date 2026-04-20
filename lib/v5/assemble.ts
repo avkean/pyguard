@@ -173,6 +173,7 @@ export function buildV5Stage2Source(
     return `import sys
 import hashlib
 import zlib
+import lzma
 import marshal
 try:
     sys.settrace(None)
@@ -262,7 +263,7 @@ for _ in range(_pg_manifest_cnt):
 _pg_manifest_pairs = tuple(_pg_manifest_pairs)
 _pg_interp_seed = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + _pg_interp_label).digest(), _pg_env))
 _pg_interp_p = ${n_kd}(_pg_interp_seed)
-_pg_interp_m = zlib.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2]), -15)
+_pg_interp_m = lzma.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2]))
 if _pg_interp_m[:4] != bytes([80, 71, 77, 86]) or len(_pg_interp_m) < 5:
     raise SystemExit(0)
 _pg_pv_n = _pg_interp_m[4]
