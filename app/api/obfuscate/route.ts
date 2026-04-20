@@ -5,7 +5,6 @@ import path from "node:path";
 import { obfuscatePythonCode } from "@/lib/obfuscate";
 import { makeV5Schema } from "@/lib/v5/schema";
 import { INTERPRETER_SRC_B64 } from "@/lib/v5/interpreter_src";
-// @ts-expect-error - .mjs without TS declarations
 import { discoverPythons, createCompileAndMarshal } from "@/scripts/multi_marshal.mjs";
 
 function makeLzmaCompressor(pyBin: string): (b: Uint8Array) => Uint8Array {
