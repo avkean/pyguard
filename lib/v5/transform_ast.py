@@ -34,6 +34,10 @@ import marshal
 import random
 import os
 
+
+_SEM_ISLAND_SENTINEL = '__pyguard_semantic_island__'
+_LAST_SEMANTIC_ISLAND_AUX = []
+
 # ---------------------------------------------------------------------------
 # Name generation (collision-free temporaries)
 # ---------------------------------------------------------------------------
@@ -1796,6 +1800,869 @@ class _LocalSlotLifter(ast.NodeTransformer):
         return node
 
 
+class _SemanticIslandCompiler:
+    """Compile a closure-sized statement region into a bespoke VM payload."""
+
+    _UNARY = {
+        ast.Not: 'NOT',
+        ast.UAdd: 'UADD',
+        ast.USub: 'USUB',
+        ast.Invert: 'INVERT',
+    }
+    _BINARY = {
+        ast.Add: 'ADD',
+        ast.Sub: 'SUB',
+        ast.Mult: 'MULT',
+        ast.Div: 'DIV',
+        ast.FloorDiv: 'FLOORDIV',
+        ast.Mod: 'MOD',
+        ast.Pow: 'POW',
+        ast.BitOr: 'BITOR',
+        ast.BitXor: 'BITXOR',
+        ast.BitAnd: 'BITAND',
+        ast.LShift: 'LSHIFT',
+        ast.RShift: 'RSHIFT',
+        ast.MatMult: 'MATMULT',
+    }
+    _COMPARE = {
+        ast.Eq: 'EQ',
+        ast.NotEq: 'NE',
+        ast.Lt: 'LT',
+        ast.LtE: 'LE',
+        ast.Gt: 'GT',
+        ast.GtE: 'GE',
+        ast.Is: 'IS',
+        ast.IsNot: 'ISNOT',
+        ast.In: 'IN',
+        ast.NotIn: 'NOTIN',
+    }
+    _LOGICAL_OPS = (
+        'LOAD_CONST', 'LOAD_NAME', 'LOAD_SLOT',
+        'STORE_NAME', 'STORE_SLOT',
+        'LOAD_SUBSCR',
+        'BUILD_LIST', 'BUILD_TUPLE',
+        'POP', 'CALL',
+        'UNARY', 'BINARY', 'COMPARE',
+        'JUMP', 'JUMP_IF_FALSE', 'JUMP_IF_TRUE',
+        'RETURN', 'BREAK', 'CONTINUE', 'RAISE',
+    )
+    _UNARY_LOGICAL = ('NOT', 'UADD', 'USUB', 'INVERT')
+    _BINARY_LOGICAL = (
+        'ADD', 'SUB', 'MULT', 'DIV', 'FLOORDIV', 'MOD', 'POW',
+        'BITOR', 'BITXOR', 'BITAND', 'LSHIFT', 'RSHIFT', 'MATMULT',
+    )
+    _COMPARE_LOGICAL = (
+        'EQ', 'NE', 'LT', 'LE', 'GT', 'GE', 'IS', 'ISNOT', 'IN', 'NOTIN',
+    )
+
+    def __init__(self, ng, slot_name, randomize=True):
+        self.ng = ng
+        self.slot_name = slot_name
+        self._uses_slot = False
+        self._used_slots = set()
+        self._names = []
+        self._name_idx = {}
+        self._consts = []
+        self._const_idx = {}
+        self._insts = []
+        self._labels = {}
+        self._loop_stack = []
+        rng = ng._rng if randomize else random.Random(0)
+        self._island_id = rng.getrandbits(32) or 1
+        self._aux_key = bytes(rng.getrandbits(8) for _ in range(32))
+        code_pool = list(range(1, 256))
+        rng.shuffle(code_pool)
+        self._opcodes = {
+            name: code_pool[i] for i, name in enumerate(self._LOGICAL_OPS)
+        }
+        unary_pool = list(range(1, 256))
+        binary_pool = list(range(1, 256))
+        compare_pool = list(range(1, 256))
+        rng.shuffle(unary_pool)
+        rng.shuffle(binary_pool)
+        rng.shuffle(compare_pool)
+        self._unary_codes = {
+            name: unary_pool[i] for i, name in enumerate(self._UNARY_LOGICAL)
+        }
+        self._binary_codes = {
+            name: binary_pool[i] for i, name in enumerate(self._BINARY_LOGICAL)
+        }
+        self._compare_codes = {
+            name: compare_pool[i] for i, name in enumerate(self._COMPARE_LOGICAL)
+        }
+        self._flags = {
+            'reverse_stack': bool(rng.getrandbits(1)),
+            'relative_jumps': bool(rng.getrandbits(1)),
+            'callee_last': bool(rng.getrandbits(1)),
+            'dispatch_mode': rng.randint(0, 1),
+        }
+        state_slots = [0, 1, 2, 3]
+        rng.shuffle(state_slots)
+        self._state_layout = {
+            'pc': state_slots[0],
+            'stack': state_slots[1],
+            'slot': state_slots[2],
+            'scratch': state_slots[3],
+        }
+        self._u8_keys = {
+            'count': (rng.randint(0, 255), rng.randint(0, 255)),
+            'unaryop': (rng.randint(0, 255), rng.randint(0, 255)),
+            'binaryop': (rng.randint(0, 255), rng.randint(0, 255)),
+            'compareop': (rng.randint(0, 255), rng.randint(0, 255)),
+        }
+        self._u16_keys = {
+            'name': (rng.randint(0, 0xFFFF), rng.randint(0, 0xFFFF)),
+            'const': (rng.randint(0, 0xFFFF), rng.randint(0, 0xFFFF)),
+            'slot': (rng.randint(0, 0xFFFF), rng.randint(0, 0xFFFF)),
+            'jump': (rng.randint(0, 0xFFFF), rng.randint(0, 0xFFFF)),
+        }
+
+    @property
+    def island_id(self):
+        return self._island_id
+
+    @property
+    def aux_key(self):
+        return self._aux_key
+
+    def _key_for_const(self, value):
+        t = type(value)
+        if t is list:
+            return ('list', tuple(self._key_for_const(x) for x in value))
+        if t is tuple:
+            return ('tuple', tuple(self._key_for_const(x) for x in value))
+        if t is bytes:
+            return ('bytes', bytes(value))
+        return (t.__name__, repr(value))
+
+    def _const(self, value):
+        key = self._key_for_const(value)
+        idx = self._const_idx.get(key)
+        if idx is None:
+            idx = len(self._consts)
+            self._const_idx[key] = idx
+            self._consts.append(value)
+        return idx
+
+    def _name(self, value):
+        idx = self._name_idx.get(value)
+        if idx is None:
+            idx = len(self._names)
+            self._name_idx[value] = idx
+            self._names.append(value)
+        return idx
+
+    def _emit(self, opname, *operands):
+        self._insts.append({'op': opname, 'operands': list(operands)})
+
+    def _label(self, name):
+        self._labels[name] = len(self._insts)
+
+    def _new_label(self):
+        return self.ng.temp()
+
+    def _slot_index(self, node):
+        if not isinstance(node, ast.Subscript):
+            return None
+        if not isinstance(node.value, ast.Name) or node.value.id != self.slot_name:
+            return None
+        sl = node.slice
+        if isinstance(sl, ast.Constant) and isinstance(sl.value, int):
+            return sl.value
+        return None
+
+    def _enc_u8(self, value, kind):
+        add, xor = self._u8_keys[kind]
+        return (((value & 0xFF) + add) & 0xFF) ^ xor
+
+    def _enc_u16(self, value, kind):
+        add, xor = self._u16_keys[kind]
+        return ((((value & 0xFFFF) + add) & 0xFFFF) ^ xor) & 0xFFFF
+
+    def _expr_supported(self, node, allow_bool):
+        slot_idx = self._slot_index(node)
+        if slot_idx is not None:
+            return True
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Name):
+            return True
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return len(node.elts) <= 255 and all(
+                self._expr_supported(elt, allow_bool=False) for elt in node.elts
+            )
+        if isinstance(node, ast.Subscript):
+            return self._expr_supported(node.value, allow_bool=False) and \
+                self._expr_supported(node.slice, allow_bool=False)
+        if isinstance(node, ast.Call):
+            if node.keywords or len(node.args) > 255:
+                return False
+            if not self._expr_supported(node.func, allow_bool=False):
+                return False
+            return all(self._expr_supported(a, allow_bool=False) for a in node.args)
+        if isinstance(node, ast.UnaryOp):
+            if type(node.op) not in self._UNARY:
+                return False
+            return self._expr_supported(node.operand, allow_bool=allow_bool)
+        if isinstance(node, ast.BinOp):
+            if type(node.op) not in self._BINARY:
+                return False
+            return self._expr_supported(node.left, False) and \
+                self._expr_supported(node.right, False)
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != 1 or len(node.comparators) != 1:
+                return False
+            if type(node.ops[0]) not in self._COMPARE:
+                return False
+            return self._expr_supported(node.left, False) and \
+                self._expr_supported(node.comparators[0], False)
+        if allow_bool and isinstance(node, ast.BoolOp):
+            return all(self._expr_supported(v, allow_bool=True) for v in node.values)
+        return False
+
+    def _target_supported(self, node):
+        return self._slot_index(node) is not None or isinstance(node, ast.Name)
+
+    def _stmt_supported(self, stmt):
+        if isinstance(stmt, ast.If):
+            if not self._expr_supported(stmt.test, allow_bool=True):
+                return False
+            return all(self._stmt_supported(s) for s in stmt.body) and \
+                all(self._stmt_supported(s) for s in stmt.orelse)
+        if isinstance(stmt, ast.While):
+            if stmt.orelse:
+                return False
+            if not self._expr_supported(stmt.test, allow_bool=True):
+                return False
+            return all(self._stmt_supported(s) for s in stmt.body)
+        if isinstance(stmt, ast.Expr):
+            return self._expr_supported(stmt.value, allow_bool=False)
+        if isinstance(stmt, ast.Assign):
+            return len(stmt.targets) == 1 and \
+                self._target_supported(stmt.targets[0]) and \
+                self._expr_supported(stmt.value, allow_bool=False)
+        if isinstance(stmt, ast.AugAssign):
+            return self._target_supported(stmt.target) and \
+                type(stmt.op) in self._BINARY and \
+                self._expr_supported(stmt.value, allow_bool=False)
+        if isinstance(stmt, ast.Return):
+            return stmt.value is None or self._expr_supported(stmt.value, allow_bool=False)
+        if isinstance(stmt, ast.Raise):
+            return stmt.cause is None and stmt.exc is not None and \
+                self._expr_supported(stmt.exc, allow_bool=False)
+        return isinstance(stmt, (ast.Pass, ast.Break, ast.Continue))
+
+    def supports(self, node):
+        if isinstance(node, list):
+            return all(self._stmt_supported(stmt) for stmt in node)
+        return self._stmt_supported(node)
+
+    def _compile_expr(self, node, allow_bool=False):
+        slot_idx = self._slot_index(node)
+        if slot_idx is not None:
+            self._uses_slot = True
+            self._used_slots.add(slot_idx)
+            self._emit('LOAD_SLOT', ('slot', slot_idx))
+            return
+        if isinstance(node, ast.Constant):
+            self._emit('LOAD_CONST', ('const', self._const(node.value)))
+            return
+        if isinstance(node, ast.Name):
+            self._emit('LOAD_NAME', ('name', self._name(node.id)))
+            return
+        if isinstance(node, ast.List):
+            for elt in node.elts:
+                self._compile_expr(elt, allow_bool=False)
+            self._emit('BUILD_LIST', ('count', len(node.elts)))
+            return
+        if isinstance(node, ast.Tuple):
+            for elt in node.elts:
+                self._compile_expr(elt, allow_bool=False)
+            self._emit('BUILD_TUPLE', ('count', len(node.elts)))
+            return
+        if isinstance(node, ast.Subscript):
+            self._compile_expr(node.value, allow_bool=False)
+            self._compile_expr(node.slice, allow_bool=False)
+            self._emit('LOAD_SUBSCR')
+            return
+        if isinstance(node, ast.Call):
+            if self._flags['callee_last']:
+                for arg in node.args:
+                    self._compile_expr(arg, allow_bool=False)
+                self._compile_expr(node.func, allow_bool=False)
+            else:
+                self._compile_expr(node.func, allow_bool=False)
+                for arg in node.args:
+                    self._compile_expr(arg, allow_bool=False)
+            self._emit('CALL', ('count', len(node.args)))
+            return
+        if isinstance(node, ast.UnaryOp):
+            self._compile_expr(node.operand, allow_bool=allow_bool)
+            self._emit('UNARY', ('unaryop', self._UNARY[type(node.op)]))
+            return
+        if isinstance(node, ast.BinOp):
+            self._compile_expr(node.left, allow_bool=False)
+            self._compile_expr(node.right, allow_bool=False)
+            self._emit('BINARY', ('binaryop', self._BINARY[type(node.op)]))
+            return
+        if isinstance(node, ast.Compare):
+            self._compile_expr(node.left, allow_bool=False)
+            self._compile_expr(node.comparators[0], allow_bool=False)
+            self._emit('COMPARE', ('compareop', self._COMPARE[type(node.ops[0])]))
+            return
+        if allow_bool and isinstance(node, ast.BoolOp):
+            l_false = self._new_label()
+            l_end = self._new_label()
+            self._compile_test_jump_false(node, l_false)
+            self._emit('LOAD_CONST', ('const', self._const(True)))
+            self._emit('JUMP', ('label', l_end))
+            self._label(l_false)
+            self._emit('LOAD_CONST', ('const', self._const(False)))
+            self._label(l_end)
+            return
+        raise ValueError('unsupported expr')
+
+    def _compile_store(self, target):
+        slot_idx = self._slot_index(target)
+        if slot_idx is not None:
+            self._uses_slot = True
+            self._used_slots.add(slot_idx)
+            self._emit('STORE_SLOT', ('slot', slot_idx))
+            return
+        if isinstance(target, ast.Name):
+            self._emit('STORE_NAME', ('name', self._name(target.id)))
+            return
+        raise ValueError('unsupported store target')
+
+    def _compile_test_jump_false(self, node, false_label):
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+            for value in node.values:
+                self._compile_test_jump_false(value, false_label)
+            return
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            done_label = self._new_label()
+            for value in node.values[:-1]:
+                self._compile_expr(value, allow_bool=True)
+                self._emit('JUMP_IF_TRUE', ('label', done_label))
+            self._compile_test_jump_false(node.values[-1], false_label)
+            self._label(done_label)
+            return
+        self._compile_expr(node, allow_bool=True)
+        self._emit('JUMP_IF_FALSE', ('label', false_label))
+
+    def _compile_stmt(self, stmt):
+        if isinstance(stmt, ast.If):
+            l_else = self._new_label()
+            l_end = self._new_label()
+            self._compile_test_jump_false(stmt.test, l_else)
+            for sub in stmt.body:
+                self._compile_stmt(sub)
+            self._emit('JUMP', ('label', l_end))
+            self._label(l_else)
+            for sub in stmt.orelse:
+                self._compile_stmt(sub)
+            self._label(l_end)
+            return
+        if isinstance(stmt, ast.While):
+            l_test = self._new_label()
+            l_end = self._new_label()
+            self._label(l_test)
+            self._compile_test_jump_false(stmt.test, l_end)
+            self._loop_stack.append((l_end, l_test))
+            for sub in stmt.body:
+                self._compile_stmt(sub)
+            self._loop_stack.pop()
+            self._emit('JUMP', ('label', l_test))
+            self._label(l_end)
+            return
+        if isinstance(stmt, ast.Expr):
+            self._compile_expr(stmt.value, allow_bool=False)
+            self._emit('POP')
+            return
+        if isinstance(stmt, ast.Assign):
+            self._compile_expr(stmt.value, allow_bool=False)
+            self._compile_store(stmt.targets[0])
+            return
+        if isinstance(stmt, ast.AugAssign):
+            self._compile_expr(stmt.target, allow_bool=False)
+            self._compile_expr(stmt.value, allow_bool=False)
+            self._emit('BINARY', ('binaryop', self._BINARY[type(stmt.op)]))
+            self._compile_store(stmt.target)
+            return
+        if isinstance(stmt, ast.Return):
+            if stmt.value is None:
+                self._emit('LOAD_CONST', ('const', self._const(None)))
+            else:
+                self._compile_expr(stmt.value, allow_bool=False)
+            self._emit('RETURN')
+            return
+        if isinstance(stmt, ast.Raise):
+            self._compile_expr(stmt.exc, allow_bool=False)
+            self._emit('RAISE')
+            return
+        if isinstance(stmt, ast.Pass):
+            return
+        if isinstance(stmt, ast.Break):
+            if self._loop_stack:
+                self._emit('JUMP', ('label', self._loop_stack[-1][0]))
+            else:
+                self._emit('BREAK')
+            return
+        if isinstance(stmt, ast.Continue):
+            if self._loop_stack:
+                self._emit('JUMP', ('label', self._loop_stack[-1][1]))
+            else:
+                self._emit('CONTINUE')
+            return
+        raise ValueError('unsupported stmt')
+
+    def _fragment_bytes(self, raw):
+        if not raw:
+            return [(0, b'')]
+        rng = self.ng._rng
+        max_parts = min(4, len(raw))
+        part_count = rng.randint(2, max_parts) if max_parts >= 2 and len(raw) >= 4 else 1
+        if part_count == 1:
+            parts = [raw]
+        else:
+            cuts = sorted(rng.sample(range(1, len(raw)), part_count - 1))
+            parts = []
+            start = 0
+            for end in cuts:
+                parts.append(raw[start:end])
+                start = end
+            parts.append(raw[start:])
+        out = []
+        for frag in parts:
+            key = rng.randint(1, 255)
+            out.append((key, bytes((b ^ key) for b in frag)))
+        return out
+
+    def _guard_stream(self, salt, n):
+        key = self._aux_key
+        state = 0x9E3779B9
+        seed = key + salt
+        for idx, b in enumerate(seed):
+            state ^= (b + ((idx + 1) * 0x45D9F3B)) & 0xFFFFFFFF
+            state = ((state << 7) | (state >> 25)) & 0xFFFFFFFF
+            state = (state * 0x85EBCA6B + 0xC2B2AE35) & 0xFFFFFFFF
+        out = bytearray(n)
+        sl = len(salt)
+        kl = len(key)
+        for i in range(n):
+            state ^= (key[i % kl] << 8) ^ salt[i % sl] ^ ((i + 1) * 0x27D4EB2D)
+            state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+            out[i] = ((state >> 16) ^ key[(i * 5 + 3) % kl] ^ salt[(i * 7 + 1) % sl]) & 0xFF
+        return bytes(out)
+
+    def _pack_guarded_blob(self, tag, raw):
+        salt = bytes(self.ng._rng.getrandbits(8) for _ in range(8))
+        stream = self._guard_stream(salt, len(raw))
+        mixed = bytes((b ^ stream[i]) for i, b in enumerate(raw))
+        frags = self._fragment_bytes(mixed)
+        parts = [bytes([tag]), salt, bytes([len(frags)])]
+        for key, frag in frags:
+            parts.append(bytes([key]))
+            parts.append(len(frag).to_bytes(2, 'little'))
+            parts.append(frag)
+        return b''.join(parts)
+
+    def _pack_const(self, value):
+        t = type(value)
+        if value is None:
+            return b'\x00'
+        if value is True:
+            return b'\x01'
+        if value is False:
+            return b'\x02'
+        if t is int:
+            n = (value.bit_length() // 8) + 1
+            b = value.to_bytes(n, 'little', signed=True)
+            return b'\x03' + len(b).to_bytes(2, 'little') + b
+        if t is float:
+            raw = repr(value).encode('utf-8')
+            return b'\x04' + len(raw).to_bytes(2, 'little') + raw
+        if t is str:
+            raw = value.encode('utf-8')
+            if raw:
+                return self._pack_guarded_blob(0x09, raw)
+            return b'\x05\x00'
+        if t is bytes:
+            if value:
+                return self._pack_guarded_blob(0x0A, value)
+            return b'\x06\x00'
+        if t is tuple:
+            parts = b''.join(self._pack_const(x) for x in value)
+            return b'\x07' + len(value).to_bytes(2, 'little') + parts
+        if t is list:
+            parts = b''.join(self._pack_const(x) for x in value)
+            return b'\x08' + len(value).to_bytes(2, 'little') + parts
+        raise TypeError('unsupported const ' + t.__name__)
+
+    def _mask_stream(self, seed, n):
+        out = bytearray(n)
+        state = seed & 0xFFFFFFFF
+        for i in range(n):
+            state = ((1103515245 * state) + 12345) & 0xFFFFFFFF
+            out[i] = (state >> 16) & 0xFF
+        return bytes(out)
+
+    def _inst_size(self, inst):
+        size = 1
+        for kind, _value in inst['operands']:
+            if kind in ('count', 'unaryop', 'binaryop', 'compareop'):
+                size += 1
+            elif kind in ('name', 'const', 'slot', 'label'):
+                size += 2
+            else:
+                raise ValueError(kind)
+        return size
+
+    def _assemble(self):
+        rng = self.ng._rng
+        name_order = list(range(len(self._names)))
+        const_order = list(range(len(self._consts)))
+        slot_order = sorted(self._used_slots)
+        rng.shuffle(name_order)
+        rng.shuffle(const_order)
+        rng.shuffle(slot_order)
+        name_map = {old: new for new, old in enumerate(name_order)}
+        const_map = {old: new for new, old in enumerate(const_order)}
+        slot_map = {old: new for new, old in enumerate(slot_order)}
+        names = [self._names[idx] for idx in name_order]
+        consts = [self._consts[idx] for idx in const_order]
+
+        pcs = []
+        pc = 0
+        for inst in self._insts:
+            pcs.append(pc)
+            pc += self._inst_size(inst)
+        total_len = pc
+        label_pc = {}
+        for name, inst_idx in self._labels.items():
+            label_pc[name] = total_len if inst_idx >= len(pcs) else pcs[inst_idx]
+
+        code = bytearray()
+        for idx, inst in enumerate(self._insts):
+            cur_pc = pcs[idx]
+            code.append(self._opcodes[inst['op']])
+            for kind, value in inst['operands']:
+                if kind == 'count':
+                    code.append(self._enc_u8(value, 'count'))
+                elif kind == 'unaryop':
+                    code.append(self._enc_u8(self._unary_codes[value], 'unaryop'))
+                elif kind == 'binaryop':
+                    code.append(self._enc_u8(self._binary_codes[value], 'binaryop'))
+                elif kind == 'compareop':
+                    code.append(self._enc_u8(self._compare_codes[value], 'compareop'))
+                elif kind == 'name':
+                    enc = self._enc_u16(name_map[value], 'name')
+                    code.extend((enc & 0xFF, (enc >> 8) & 0xFF))
+                elif kind == 'const':
+                    enc = self._enc_u16(const_map[value], 'const')
+                    code.extend((enc & 0xFF, (enc >> 8) & 0xFF))
+                elif kind == 'slot':
+                    enc = self._enc_u16(slot_map[value], 'slot')
+                    code.extend((enc & 0xFF, (enc >> 8) & 0xFF))
+                elif kind == 'label':
+                    target = label_pc[value]
+                    if self._flags['relative_jumps']:
+                        base = cur_pc + self._inst_size(inst)
+                        target = (target - base) & 0xFFFF
+                    enc = self._enc_u16(target, 'jump')
+                    code.extend((enc & 0xFF, (enc >> 8) & 0xFF))
+                else:
+                    raise ValueError(kind)
+        return names, consts, slot_order, bytes(code)
+
+    def compile(self, node):
+        if isinstance(node, list):
+            for stmt in node:
+                self._compile_stmt(stmt)
+        else:
+            self._compile_stmt(node)
+        names, consts, slot_order, code_plain = self._assemble()
+        seed = self.ng._rng.getrandbits(32)
+        mask = self._mask_stream(seed, len(code_plain))
+        code = bytes((code_plain[i] ^ mask[i]) for i in range(len(code_plain)))
+        parts = [b'PGSI2']
+        parts.append((self._island_id & 0xFFFFFFFF).to_bytes(4, 'little'))
+        flags = 0
+        if self._flags['reverse_stack']:
+            flags |= 1
+        if self._flags['relative_jumps']:
+            flags |= 2
+        if self._flags['callee_last']:
+            flags |= 4
+        if self._flags['dispatch_mode']:
+            flags |= 8
+        parts.append(bytes([flags]))
+        parts.append(bytes([
+            self._state_layout['pc'],
+            self._state_layout['stack'],
+            self._state_layout['slot'],
+            self._state_layout['scratch'],
+        ]))
+        if self.slot_name is None or not self._uses_slot:
+            parts.append((0xFFFF).to_bytes(2, 'little'))
+        else:
+            raw = self.slot_name.encode('utf-8')
+            parts.append(len(raw).to_bytes(2, 'little'))
+            parts.append(raw)
+        parts.append(len(slot_order).to_bytes(2, 'little'))
+        for slot_idx in slot_order:
+            parts.append(slot_idx.to_bytes(2, 'little'))
+        parts.append(len(names).to_bytes(2, 'little'))
+        for name in names:
+            raw = name.encode('utf-8')
+            parts.append(len(raw).to_bytes(2, 'little'))
+            parts.append(raw)
+        parts.append(len(consts).to_bytes(2, 'little'))
+        for const in consts:
+            parts.append(self._pack_const(const))
+        parts.append(bytes(self._opcodes[name] for name in self._LOGICAL_OPS))
+        parts.append(bytes(self._unary_codes[name] for name in self._UNARY_LOGICAL))
+        parts.append(bytes(self._binary_codes[name] for name in self._BINARY_LOGICAL))
+        parts.append(bytes(self._compare_codes[name] for name in self._COMPARE_LOGICAL))
+        for kind in ('count', 'unaryop', 'binaryop', 'compareop'):
+            add, xor = self._u8_keys[kind]
+            parts.append(bytes([add, xor]))
+        for kind in ('name', 'const', 'slot', 'jump'):
+            add, xor = self._u16_keys[kind]
+            parts.append(add.to_bytes(2, 'little'))
+            parts.append(xor.to_bytes(2, 'little'))
+        parts.append(seed.to_bytes(4, 'little'))
+        parts.append(len(code).to_bytes(2, 'little'))
+        parts.append(code)
+        return b''.join(parts)
+
+
+class _SemanticIslandRewriter(ast.NodeTransformer):
+    """Lift decisive secret-centric closures into per-island bespoke semantics."""
+
+    MAX_BODY_NODES = 480
+    MAX_STMTS = 18
+
+    def __init__(self, ng, slot_name):
+        self.ng = ng
+        self.slot_name = slot_name
+        self.lifted = 0
+        self._seeded = False
+        self._secret_names = set()
+        self._secret_slots = set()
+        self.aux_entries = []
+
+    def _seed_secret_bindings(self, tree):
+        if self._seeded:
+            return
+        self._seeded = True
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            if not self._expr_has_secret_literal(node.value):
+                continue
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                self._secret_names.add(target.id)
+                continue
+            slot_idx = self._slot_index(target)
+            if slot_idx is not None:
+                self._secret_slots.add(slot_idx)
+
+    def _slot_index(self, node):
+        if not isinstance(node, ast.Subscript):
+            return None
+        if not isinstance(node.value, ast.Name) or node.value.id != self.slot_name:
+            return None
+        sl = node.slice
+        if isinstance(sl, ast.Constant) and isinstance(sl.value, int):
+            return sl.value
+        return None
+
+    def _expr_has_secret_literal(self, node):
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Constant):
+                continue
+            if isinstance(sub.value, str) and len(sub.value) >= 4:
+                return True
+            if isinstance(sub.value, bytes) and len(sub.value) >= 4:
+                return True
+        return False
+
+    def _uses_secret_binding(self, node):
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                if sub.id in self._secret_names:
+                    return True
+                continue
+            slot_idx = self._slot_index(sub)
+            if slot_idx is not None and slot_idx in self._secret_slots:
+                return True
+        return False
+
+    def _has_effect(self, node):
+        nodes = node if isinstance(node, list) else [node]
+        for root in nodes:
+            for sub in ast.walk(root):
+                if isinstance(sub, (ast.Assign, ast.AugAssign, ast.Return,
+                                    ast.Raise, ast.Break, ast.Continue)):
+                    return True
+                if isinstance(sub, ast.Expr) and isinstance(sub.value, ast.Call):
+                    return True
+        return False
+
+    def _count_state_writes(self, stmts):
+        writes = set()
+        reads = set()
+        for stmt in stmts:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Name):
+                    if isinstance(sub.ctx, ast.Store):
+                        writes.add(('name', sub.id))
+                    elif isinstance(sub.ctx, ast.Load):
+                        reads.add(('name', sub.id))
+                    continue
+                slot_idx = self._slot_index(sub)
+                if slot_idx is None:
+                    continue
+                if isinstance(sub.ctx, ast.Store):
+                    writes.add(('slot', slot_idx))
+                elif isinstance(sub.ctx, ast.Load):
+                    reads.add(('slot', slot_idx))
+        return len(writes & reads)
+
+    def _decisive_body(self, stmts, whole_body):
+        if not stmts:
+            return False
+        if not self._has_effect(stmts):
+            return False
+        node_count = sum(1 for stmt in stmts for _ in ast.walk(stmt))
+        if node_count > self.MAX_BODY_NODES or len(stmts) > self.MAX_STMTS:
+            return False
+        secret_touch = any(
+            self._expr_has_secret_literal(stmt) or self._uses_secret_binding(stmt)
+            for stmt in stmts
+        )
+        branch_count = sum(
+            1 for stmt in stmts for sub in ast.walk(stmt)
+            if isinstance(sub, ast.If)
+        )
+        loop_count = sum(
+            1 for stmt in stmts for sub in ast.walk(stmt)
+            if isinstance(sub, ast.While)
+        )
+        call_count = sum(
+            1 for stmt in stmts for sub in ast.walk(stmt)
+            if isinstance(sub, ast.Call)
+        )
+        stateful = self._count_state_writes(stmts) > 0
+        if not secret_touch:
+            return False
+        if whole_body and (loop_count or branch_count >= 2) and stateful:
+            return True
+        return (loop_count and branch_count and stateful) or \
+            (branch_count >= 2 and call_count >= 2 and stateful)
+
+    def _lift_region(self, stmts):
+        if not stmts:
+            return None
+        compiler = _SemanticIslandCompiler(self.ng, self.slot_name)
+        if not compiler.supports(stmts):
+            return None
+        payload = compiler.compile(stmts)
+        self.aux_entries.append((compiler.island_id, compiler.aux_key))
+        self.lifted += 1
+        return ast.copy_location(
+            ast.Expr(
+                value=ast.Call(
+                    func=ast.Name(id=_SEM_ISLAND_SENTINEL, ctx=ast.Load()),
+                    args=[ast.Constant(value=payload)],
+                    keywords=[],
+                )
+            ),
+            stmts[0],
+        )
+
+    def _best_region(self, body):
+        if not body:
+            return None
+        if self._decisive_body(body, whole_body=True):
+            compiler = _SemanticIslandCompiler(self.ng, self.slot_name, randomize=False)
+            if compiler.supports(body):
+                return (0, len(body))
+        best = None
+        best_score = -1
+        for start in range(len(body)):
+            for end in range(start + 2, len(body) + 1):
+                region = body[start:end]
+                compiler = _SemanticIslandCompiler(self.ng, self.slot_name, randomize=False)
+                if not compiler.supports(region):
+                    continue
+                if not self._decisive_body(region, whole_body=False):
+                    continue
+                score = sum(1 for stmt in region for _ in ast.walk(stmt))
+                if score > best_score:
+                    best_score = score
+                    best = (start, end)
+        return best
+
+    def _rewrite_stmt(self, stmt):
+        if isinstance(stmt, ast.FunctionDef):
+            stmt.body = self._rewrite_body(stmt.body)
+            return stmt
+        if isinstance(stmt, ast.AsyncFunctionDef):
+            stmt.body = self._rewrite_body(stmt.body)
+            return stmt
+        if isinstance(stmt, ast.ClassDef):
+            stmt.body = self._rewrite_body(stmt.body)
+            return stmt
+        if isinstance(stmt, ast.If):
+            stmt.body = self._rewrite_body(stmt.body)
+            stmt.orelse = self._rewrite_body(stmt.orelse)
+            return stmt
+        if isinstance(stmt, ast.While):
+            stmt.body = self._rewrite_body(stmt.body)
+            stmt.orelse = self._rewrite_body(stmt.orelse)
+            return stmt
+        if isinstance(stmt, ast.For):
+            stmt.body = self._rewrite_body(stmt.body)
+            stmt.orelse = self._rewrite_body(stmt.orelse)
+            return stmt
+        if isinstance(stmt, ast.With):
+            stmt.body = self._rewrite_body(stmt.body)
+            return stmt
+        if isinstance(stmt, ast.Try):
+            stmt.body = self._rewrite_body(stmt.body)
+            stmt.orelse = self._rewrite_body(stmt.orelse)
+            stmt.finalbody = self._rewrite_body(stmt.finalbody)
+            stmt.handlers = [self._rewrite_stmt(h) for h in stmt.handlers]
+            return stmt
+        if isinstance(stmt, ast.ExceptHandler):
+            stmt.body = self._rewrite_body(stmt.body)
+            return stmt
+        return stmt
+
+    def _rewrite_body(self, body):
+        region = self._best_region(body)
+        if region is None:
+            return [self._rewrite_stmt(stmt) for stmt in body]
+        start, end = region
+        out = [self._rewrite_stmt(stmt) for stmt in body[:start]]
+        lifted = self._lift_region(body[start:end])
+        if lifted is None:
+            return [self._rewrite_stmt(stmt) for stmt in body]
+        out.append(lifted)
+        out.extend(self._rewrite_stmt(stmt) for stmt in body[end:])
+        return out
+
+    def visit_Module(self, node):
+        global _LAST_SEMANTIC_ISLAND_AUX
+        self._seed_secret_bindings(node)
+        node.body = self._rewrite_body(node.body)
+        _LAST_SEMANTIC_ISLAND_AUX = list(self.aux_entries)
+        return node
+
+
 # ---------------------------------------------------------------------------
 # Function Body Fusion (v6.0 / C6.A)
 # ---------------------------------------------------------------------------
@@ -2958,6 +3825,8 @@ def _build_if_chain(cases):
 # ---------------------------------------------------------------------------
 
 def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=True, obfuscate_strings=True, int_obfuscation=True):
+    global _LAST_SEMANTIC_ISLAND_AUX
+    _LAST_SEMANTIC_ISLAND_AUX = []
     """Apply all transforms in the correct order.
 
     Order matters:
@@ -2991,45 +3860,20 @@ def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=Tr
       8. String obfuscation          — split every non-empty string ≤ 200
          bytes into K ≥ 2 XOR'd fragments.
     """
-    # Step 0: Secret-gate rewrite. Must run on an ast.Module.
-    # We record gate bodies as raw AST via sgr.visit(tree) but DEFER the
-    # unparse+encrypt step until after identifier renaming (step 1) so
-    # that names inside the cipher blob match the renamed outer code.
+    # v6.7+: the old source-compile secret-gate path is intentionally
+    # disabled in the main pipeline. Secret-bearing regions now move
+    # onto the semantic-island VM after local-slot lifting so the
+    # protected logic no longer survives as normal compare/jump/source
+    # structure inside generic v5 IR.
     sgr = None
-    if rewrite_secret_gates and isinstance(tree, ast.Module):
-        sgr = _SecretGateRewriter(ng)
-        sgr.prepare(tree)
-        tree = sgr.visit(tree)
-        ast.fix_missing_locations(tree)
 
     if rename_identifiers:
         renamer = _IdentifierRenamer(ng)
-        # prepare() collects attr + kwarg names used as "skip" hints for
-        # renaming. Include gate-body AST subtrees so attributes used only
-        # inside an encrypted gate (e.g. `obj.secret_method()`) are still
-        # excluded from outer renaming. sgr._pending holds (node, g, pw,
-        # body) tuples when gates fired.
         renamer.prepare(tree)
-        if sgr is not None and sgr._pending:
-            for (_n, _g, _pw, gbody) in sgr._pending:
-                for stmt in gbody:
-                    for sub in ast.walk(stmt):
-                        if isinstance(sub, ast.Attribute):
-                            renamer._attr_names.add(sub.attr)
-                        if isinstance(sub, ast.keyword) and sub.arg:
-                            renamer._kwarg_names.add(sub.arg)
         tree = renamer.visit(tree)
         ast.fix_missing_locations(tree)
     else:
         renamer = None
-
-    # Step 0 (cont.): now that the renamer has populated its name map,
-    # seal each pending gate body with the same map, then fill the
-    # placeholder Try bodies.
-    if sgr is not None and sgr._fired > 0:
-        sgr.finalize_gates(tree, renamer=renamer)
-        sgr.prune(tree)
-        ast.fix_missing_locations(tree)
 
     # v5.1 / C1: mangle attribute access into _gA/_sA/_dA calls keyed by
     # small ints, with real names XOR-masked in a synthesized `_ATAB`
@@ -3057,9 +3901,6 @@ def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=Tr
     tree = _ExprDecomposer(ng).visit(tree)
     ast.fix_missing_locations(tree)
 
-    tree = _OpaquePredicateInjector(ng).visit(tree)
-    ast.fix_missing_locations(tree)
-
     # Decompose simple f-strings before CFF/call indirection so the new
     # `str(x)` calls flow through the indirector and the newly-exposed
     # literal fragments flow through the string obfuscator.
@@ -3074,8 +3915,22 @@ def _apply_transforms(tree, ng, rename_identifiers=True, rewrite_secret_gates=Tr
     # Gated on rename_identifiers because un-renamed interpreter locals
     # could collide with synthesized slot names.
     if rename_identifiers:
-        tree = _LocalSlotLifter(ng).visit(tree)
+        slot_lifter = _LocalSlotLifter(ng)
+        tree = slot_lifter.visit(tree)
         ast.fix_missing_locations(tree)
+
+    # v6.7 semantic-island round: after renaming/attr-mangling/import
+    # concealment and after local-slot lifting, small effectful If
+    # regions can be lowered to a bespoke VM payload that carries slot
+    # indices directly. This must happen BEFORE opaque predicates,
+    # fusion, and CFF so the original gate/reward structure is still
+    # available to the island compiler.
+    if rename_identifiers:
+        tree = _SemanticIslandRewriter(ng, slot_lifter._slot).visit(tree)
+        ast.fix_missing_locations(tree)
+
+    tree = _OpaquePredicateInjector(ng).visit(tree)
+    ast.fix_missing_locations(tree)
 
     # v6.0 / C6.A — fuse eligible top-level function bodies into a single
     # mega-dispatcher BEFORE CFF. If we ran this after CFF, CFF would have
@@ -3163,6 +4018,10 @@ def transform_ast_tree(tree, seed=None, rename_identifiers=True,
                              rewrite_secret_gates=rewrite_secret_gates,
                              obfuscate_strings=obfuscate_strings,
                              int_obfuscation=int_obfuscation)
+
+
+def get_last_semantic_island_aux():
+    return list(_LAST_SEMANTIC_ISLAND_AUX)
 
 
 if __name__ == '__main__':

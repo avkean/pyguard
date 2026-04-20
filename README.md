@@ -1,109 +1,143 @@
 # PyGuard
 
-Python source code obfuscator. Transforms source into a protected stub that runs identically but resists casual reverse-engineering.
+PyGuard is a Python source obfuscator that turns a Python program into a protected pure-Python stub.
 
-PyGuard v5 is a pure-Python **friction system**, not a confidential-execution system. The release goal is to avoid trivial one-run recovery paths and to raise per-build analyst cost, not to promise secrecy after one successful run in an attacker-controlled Python process.
+PyGuard v5 is a friction system, not confidential execution. The goal is to make reverse-engineering and reusable automation meaningfully harder, especially after one clean run, while staying honest that an attacker-controlled Python process cannot offer strong secrecy guarantees.
 
-**Website:** [pyguard.avkean.com](https://pyguard.avkean.com)
+Website: [pyguard.avkean.com](https://pyguard.avkean.com)
 
-## How it works
+## What v5 Does
 
-PyGuard never compiles user source at runtime. Instead it:
+At a high level, v5:
 
-1. **Compiles to IR** -- Python AST is lowered into an instruction-tape IR (Code nodes with I-prefixed opcodes like `IAssign`, `IFor`, `ITry`, `IFunctionDef`), not a statement tree.
-2. **Randomizes the schema** -- every stub gets a unique per-build schema that remaps all field names, op tags, and field orderings to random tokens. String literals are XOR-masked. Nothing in the shipped blob has stable labels.
-3. **Packs to binary** -- the IR is serialized into a custom binary format (not JSON), then zlib-compressed.
-4. **Encrypts in layers** -- the packed IR and schema are independently encrypted with derived keys (KDF + XOR pepper + AES-CTR). The schema is only reconstructed after the interpreter loads.
-5. **Embeds an interpreter** -- a generic AST-walking interpreter (`runtime_interp.py`) is deflate-compressed and shipped as **tagged** marshaled bytecode. The runtime checks the tag before `marshal.loads`, so incompatible Python minors fail closed instead of falling back to source compilation. It parses the binary IR into opaque `_PGMap` wrappers and positional tuples, never plain dicts/lists.
-6. **Wraps in a 3-stage launcher**:
-   - **Stage 0**: integrity checks (code-object digest, file hash, recompilation detection) and env-witness probing
-   - **Stage 1**: anti-trace (clears `settrace`/`setprofile`, walks `f_trace` pointers via traceback frames, checks `gettrace`/`getprofile`), decrypts stage 2
-   - **Stage 2**: decrypts schema inside the interpreter's own boot frame, sets up runtime layout tables, decrypts + decompresses IR, invokes `run_blob`
+1. rewrites source into a structurally alien form
+2. lowers it into custom IR
+3. randomizes the schema per build
+4. packs the IR into a custom binary format
+5. encrypts the payload in multiple stages
+6. runs it through an embedded marshaled interpreter
 
-The interpreter resolves every field through the per-build layout map at runtime. A captured payload yields masked strings, randomized field names, randomized tag values, and randomized field positions -- not a readable AST.
+It does not ship plaintext stage source and it does not rely on runtime `compile()` of decrypted user code.
 
-## Env-integrity binding
+## Current Hardening Strategy
 
-Every stub folds a set of environmental witness bytes into its master seed. In a clean env each witness hashes to the build-precomputed value; any attacker probe flips a bit, the derived key diverges, and decryption silently produces garbage bytes that fail zlib / marshal. There is no visible anti-debug branch to NOP out.
+The main failure mode for Python obfuscation is not just "source text recovered." It is "the decisive logic or decisive data still survives somewhere as one attacker-useful representation."
 
-Witnesses currently covered:
+PyGuard's current v5 direction is therefore:
 
-- **Code-object canonical hash** -- bytecode patching between the markers inside the stub changes the hash.
-- **Captured-builtin type identity** -- `type(marshal.loads) is type(zlib.decompress)` etc.; any Python-level wrapper flips `'builtin_function_or_method'` to `'function'`.
-- **Settrace / setprofile / gettrace / getprofile** -- active tracers or Python-level replacements.
-- **`sys.monitoring` (PEP 669)** -- tool_ids 0..5; any pre-reserved slot.
-- **`gc.callbacks` / `gc.get_debug()` / `tracemalloc.is_tracing()`** -- GC-boundary trace surfaces.
-- **Signal / faulthandler / itimer** -- `SIGPROF` handler, `ITIMER_{PROF,VIRTUAL,REAL}` armed, `faulthandler.is_enabled()`.
-- **Unaudited signals** -- `SIGUSR1`, `SIGUSR2`, `SIGXCPU`, `SIGXFSZ` handler installed (uses `callable()` check because `SIGXFSZ` defaults to `SIG_IGN`, not `SIG_DFL`, on POSIX).
-- **Exception hooks** -- `sys.excepthook`, `sys.unraisablehook` replaced.
+- keep the wrapper hard enough to avoid trivial one-run extraction
+- permanently deform source before IR lowering
+- move decisive secret-centric closures into per-build bespoke semantics where the payoff justifies the cost
+- avoid single-stage choke points, so recovering one artefact or one runtime view is not enough to extract, force, or generalize
 
-## Permanent source transforms
+In practice, that means password checks, win gates, reward emission, and similar secret-bearing closures should not survive as obvious compare/jump/call structure inside generic IR when they can be lifted into semantic islands.
 
-These make the original source literally unrecoverable byte-for-byte even if an attacker fully recovers the decrypted IR:
+## Core v5 Pieces
 
-- **Identifier renaming** (vars, functions, methods) with per-build randomization.
-- **Attribute mangling** -- `obj.foo` becomes `_gA(obj, _ATAB[idx])` with an encrypted attribute name table.
-- **Import concealment** -- `from collections import Counter` routed through an encrypted import table.
-- **Local slot lifting** -- function locals and parameters rewritten to `_s[N]` subscripts so variable names leave the string pool entirely.
-- **Function body fusion** -- eligible top-level defs dissolve into a module-level `_pg_F(fid, args)` mega-dispatcher keyed by opaque 32-bit fids; function boundaries are gone at source.
-- **Constant unfolding + MBA rewriting** on numeric literals in user code.
-- **CFG flattening** and **opaque predicates** on control flow.
+- `lib/v5/transform_ast.py`
+  Build-time AST transforms. This is where source deformation lives.
 
-## Release gate
+- `lib/v5/build_ir.py`
+  Lowers transformed AST into v5 IR and tagged marshal payloads.
 
-Primary gate:
+- `lib/v5/runtime_interp.py`
+  The runtime interpreter for v5 IR and semantic-island payloads.
 
-- `npx tsx tests/run_disclosure_checks.ts` -- blocks the shortest known one-run disclosure paths (currently compile-audit leakage of stage text and import-proxy recovery of `from X import Y` fingerprints).
+- `lib/v5/schema.ts`
+  Per-build schema/tag/layout definitions used by the binary layer.
 
-Secondary gates:
+- `lib/obfuscate.ts`
+  Packs, encrypts, and assembles the final stub.
 
-- `npx tsx tests/run_tests.ts` -- compatibility suite.
-- `bash tests/pentest/run_scoreboard.sh` -- regression dashboard, not the north star.
+- `scripts/gen-v5-stub.mjs`
+  Main local entry point for generating a v5 stub.
 
-## Attack scoreboard
+## Permanent Source Transforms
 
-All attacks live in `tests/pentest/`. Run with `bash tests/pentest/run_scoreboard.sh`.
+These transforms survive full payload recovery because they change the program before IR packing:
 
-Current status against 15 compatibility stubs with 27 attacks × 15 stubs = 405 cells:
+- identifier renaming
+- attribute mangling
+- import concealment
+- local slot lifting
+- function body fusion
+- opaque predicates
+- control-flow flattening
+- constant deformation
+- semantic islands for secret-bearing regions
 
-- **390 HELD**
-- **15 CRASH(124)** — c9 gc-walk attack trips the 30 s scoreboard timeout on every stub (perf wall + seed divergence; dual HELD, not a regression).
-- **0 PWNED**
+The newest important addition is semantic islands:
 
-`a37_import_hook` still PWNs `18_import_leak.py` (import-concealment canary) because Python's own module init leaks `fromlist` entries like `OrderedDict`. This is an accepted honest limit — documented below, not a scoreboard regression.
+- transformed AST emits `__pyguard_semantic_island__(payload)`
+- IR lowers this to `IIsland`
+- runtime executes the payload through a bespoke per-island VM
+- the current payload format is `PGSI2`, with per-island variation in opcode space, operand encoding, layout, stack/call convention, and dispatch shape
+- string and bytes material can be fragmented in the payload and materialized late inside the island runtime
+- decisive island constants no longer live entirely inside `PGSI2`; per-island auxiliary key material is transported separately in the encrypted manifest
+- a recovered island payload by itself should therefore not be enough to read the real decisive literals for the protected region
 
-## Honest limits
+This targets the real root issue: preventing a protected secret check or reward path from collapsing into a tiny clean equivalent.
 
-PyGuard is an obfuscator, not an encryptor. The stub must eventually hand data to CPython to execute, so:
+## Release Gates
 
-- A fully symbolic emulator of the decryptor chain recovers the same bytes the runtime does — in a clean env the witnesses all evaluate to known constants and the canonical hash is computable statically. The defense is that the chain is large, multi-stage, and schema-randomized per build, raising the cost of emulation.
-- Build artifacts are tied to the CPython minor that produced their tagged marshal blobs. A mismatched runtime exits before `marshal.loads`; PyGuard does not try to paper over that by recompiling decrypted stages from source.
-- `from X import Y` leaks `Y` through Python's import system regardless of concealment; the import-concealment defense reduces the surface but cannot eliminate it.
-- Runtime VALUES (e.g. what the program prints) are never protected — capturing stdout is equivalent to running the program.
-- If you need cryptographic guarantees, use native compilation, a server-side API, or a hardware enclave.
-
-After every hardening round we write a new attack. If every row says HELD, the next attack has not been written yet.
-
-## Local setup
+Use these in order:
 
 ```bash
-git clone https://github.com/avkean/pyguard.git
-cd pyguard
+npx tsx tests/run_disclosure_checks.ts
+npx tsx tests/run_tests.ts
+bash tests/pentest/run_scoreboard.sh
+```
+
+What they mean:
+
+- `run_disclosure_checks.ts`: primary release gate, including the real `tests/test_rev/dist.py` closure-lift assertion and a guard against plain decisive literals surviving in the lifted island payload
+- `run_tests.ts`: compatibility regression gate
+- `run_scoreboard.sh`: attack dashboard
+
+The scoreboard matters, but it is not the product definition. If the shortest one-run recovery path still works, the hardening round is not done even if many attacks say `HELD`.
+
+## Honest Limits
+
+PyGuard is deliberately honest about what it cannot guarantee:
+
+- An attacker who can run the program controls the Python process.
+- A sufficiently complete symbolic/static emulator can recover what the runtime recovers.
+- Runtime values are not protected. If the program prints a secret, running the program reveals it.
+- Import names still have unavoidable leakage through Python's import system.
+- Artifacts are CPython-minor-specific and should fail closed on mismatches.
+
+If you need cryptographic secrecy, move the secret off the client.
+
+## Local Use
+
+Install:
+
+```bash
 npm install
-npm run dev
 ```
 
-Generate a protected stub locally:
+Generate a stub:
+
 ```bash
-node --import tsx scripts/gen-v5-stub.mjs <source.py> -o out.py
+node --import tsx scripts/gen-v5-stub.mjs input.py -o out.py
 ```
 
-Run tests:
+Regenerate embedded Python sources after editing `lib/v5/build_ir.py` or `lib/v5/runtime_interp.py`:
+
 ```bash
-npx tsx tests/run_disclosure_checks.ts      # primary one-run disclosure gate
-npx tsx tests/run_tests.ts                  # compat suite
-bash tests/pentest/run_scoreboard.sh        # attack scoreboard
+npm run gen:v5
 ```
+
+## Red-Team Fixture
+
+The main local semantic-hardening fixture is:
+
+- clean source target: `tests/test_rev/dist.py`
+- already-obfuscated sample: `tests/test_rev/sillybillysgame.py`
+
+When validating semantic-island work, use `dist.py` as the source target. The important question is whether the clean secret-bearing logic still collapses into a short equivalent after protection.
+
+For this fixture class, a green result means more than "the wrapper held" or "the island exists." A recovered `PGSI2` blob alone should not reveal the flag, the reward text, or enough decisive truth to stop at that layer.
 
 ## License
 

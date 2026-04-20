@@ -50,17 +50,17 @@ function makeV5Schema() {
         "format_spec","func","generators","handlers","i","id","idx","instrs","is_async","is_gen",
         "ifs","items","iter","key",
         "keys","keywords","kw_defaults","kwarg","kwonlyargs","left","level","lower","module","name",
-        "names","op","op2","operand","ops","optional_vars","orelse","posonlyargs","r","returns",
+        "names","op","op2","operand","ops","optional_vars","orelse","payload","posonlyargs","r","returns",
         "right","simple","slice","step","strings","t","target","targets","test","tree","type","upper",
         "v","value","values","vararg",
     ];
     const tags = [
         "Code",
-        "IExpr","IAssign","IAugAssign","IAnnAssign","IReturn","IRaise",
+        "IExpr","IIsland","IAssign","IAugAssign","IAnnAssign","IReturn","IRaise",
         "IPass","IBreak","IContinue","IDelete","IGlobal","INonlocal",
         "IIf","IWhile","IFor","IAsyncFor","IWith","IAsyncWith",
         "ITry","IHandler","IImport","IImportFrom","IFunctionDef","IClassDef",
-        "Module","Expression","Assign","AugAssign","AnnAssign","Expr","Return","Raise","Pass","Break","Continue",
+        "Module","Expression","Assign","AugAssign","AnnAssign","Expr","SemanticIsland","Return","Raise","Pass","Break","Continue",
         "If","While","For","AsyncFor","With","AsyncWith","Try","TryStar","ExceptHandler","FunctionDef",
         "AsyncFunctionDef","Lambda","ClassDef","Global","Nonlocal","Delete","Import","ImportFrom","alias",
         "BinOp","UnaryOp","BoolOp","Compare","IfExp","Call","Attribute","Subscript","Slice","Starred",
@@ -75,6 +75,7 @@ function makeV5Schema() {
     const NODE_LAYOUTS = {
         Code: ["instrs"],
         IExpr: ["value"],
+        IIsland: ["payload"],
         IAssign: ["targets", "value"],
         IAugAssign: ["target", "op2", "value"],
         IAnnAssign: ["target", "annotation", "value", "simple"],
@@ -100,6 +101,7 @@ function makeV5Schema() {
         IClassDef: ["name", "bases", "keywords", "body", "decorator_list"],
         Module: ["body"],
         Expr: ["value"],
+        SemanticIsland: ["payload"],
         Assign: ["targets", "value"],
         AugAssign: ["target", "op2", "value"],
         AnnAssign: ["target", "annotation", "value", "simple"],
@@ -242,6 +244,7 @@ const py = spawnSync(buildIrPython, [path.join(root, 'lib/v5/build_ir.py')], {
     input: userSource,
     encoding: 'utf-8',
     env: { ...process.env, PYGUARD_V5_SCHEMA: JSON.stringify(schema) },
+    maxBuffer: 64 * 1024 * 1024,
 });
 if (py.status !== 0) {
     console.error('build_ir.py failed:');

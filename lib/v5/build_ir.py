@@ -16,6 +16,10 @@ in Pyodide. It exposes a `compile_to_ir(source: str) -> dict` function.
 import ast
 import json
 import os
+import sys
+
+
+_SEM_ISLAND_SENTINEL = '__pyguard_semantic_island__'
 
 
 # IR op names. The TS side replaces these with random numeric tags
@@ -23,7 +27,7 @@ import os
 OPS = (
     'Module', 'Expression',
     'Assign', 'AugAssign', 'AnnAssign',
-    'Expr', 'Return', 'Raise', 'Pass', 'Break', 'Continue',
+    'Expr', 'Return', 'Raise', 'Pass', 'Break', 'Continue', 'SemanticIsland',
     'If', 'While', 'For', 'AsyncFor', 'With', 'AsyncWith',
     'Try', 'TryStar', 'ExceptHandler',
     'FunctionDef', 'AsyncFunctionDef', 'Lambda', 'ClassDef',
@@ -150,6 +154,17 @@ class _Lifter:
 
         # ---- Statements ----
         if cls == 'Expr':
+            value = getattr(node, 'value', None)
+            if (type(value).__name__ == 'Call'
+                    and type(getattr(value, 'func', None)).__name__ == 'Name'
+                    and getattr(value.func, 'id', None) == _SEM_ISLAND_SENTINEL
+                    and len(getattr(value, 'args', ())) == 1
+                    and type(value.args[0]).__name__ == 'Constant'
+                    and isinstance(getattr(value.args[0], 'value', None), (bytes, bytearray))):
+                return {
+                    'op': 'SemanticIsland',
+                    'payload': list(bytes(value.args[0].value)),
+                }
             return {'op': 'Expr', 'value': self.lift(node.value)}
         if cls == 'Assign':
             return {
@@ -523,6 +538,12 @@ def compile_to_ir(source):
           'strings' — list of all interned identifiers and string keys
           'consts'  — list of all interned constant values (Python objects)
     """
+    try:
+        if sys.getrecursionlimit() < 20000:
+            sys.setrecursionlimit(20000)
+    except Exception:
+        pass
+
     tree = ast.parse(source, mode='exec')
 
     # v6 hardening: apply AST-level obfuscation transforms BEFORE lifting.
@@ -533,12 +554,17 @@ def compile_to_ir(source):
     # 1:1 back to the original Python.
     try:
         from transform_ast import transform_ast_tree
+        from transform_ast import get_last_semantic_island_aux
         tree = transform_ast_tree(tree)
+        island_aux = get_last_semantic_island_aux()
     except ImportError:
         try:
             from lib.v5.transform_ast import transform_ast_tree
+            from lib.v5.transform_ast import get_last_semantic_island_aux
             tree = transform_ast_tree(tree)
+            island_aux = get_last_semantic_island_aux()
         except ImportError:
+            island_aux = []
             pass  # transforms not available (e.g. Pyodide without the module)
 
     lifter = _Lifter()
@@ -547,6 +573,7 @@ def compile_to_ir(source):
         'tree': lifted,
         'strings': lifter.strings,
         'consts': lifter.consts,
+        'island_aux': island_aux,
     }
 
 
@@ -607,7 +634,10 @@ def compile_to_json(source):
             encoded_consts.append(['frozenset', [_enc(x) for x in v]])
         else:
             raise NotImplementedError(f"unsupported constant type: {type(v).__name__}")
-    return [ir['strings'], encoded_consts, lowered_tree], manifest
+    return [ir['strings'], encoded_consts, lowered_tree], {
+        'imports': manifest,
+        'islands': ir.get('island_aux', []),
+    }
 
 
 def _lower_to_code(module_node, strings):
@@ -624,6 +654,8 @@ def _lower_stmt_list(node, manifest, strings):
     op = node['op']
     if op == 'Expr':
         return [{'op': 'IExpr', 'value': node['value']}]
+    if op == 'SemanticIsland':
+        return [{'op': 'IIsland', 'payload': node['payload']}]
     if op == 'Assign':
         return [{'op': 'IAssign', 'targets': node['targets'], 'value': node['value']}]
     if op == 'AugAssign':
@@ -990,6 +1022,7 @@ def _pack_obj(obj):
 _NODE_LAYOUTS = {
     'Code': ('instrs',),
     'IExpr': ('value',),
+    'IIsland': ('payload',),
     'IAssign': ('targets', 'value'),
     'IAugAssign': ('target', 'op2', 'value'),
     'IAnnAssign': ('target', 'annotation', 'value', 'simple'),
@@ -1016,6 +1049,7 @@ _NODE_LAYOUTS = {
     'IClassDef': ('name', 'bases', 'keywords', 'body', 'decorator_list'),
     'Module': ('body',),
     'Expr': ('value',),
+    'SemanticIsland': ('payload',),
     'Assign': ('targets', 'value'),
     'AugAssign': ('target', 'op2', 'value'),
     'AnnAssign': ('target', 'annotation', 'value', 'simple'),
@@ -1168,9 +1202,15 @@ def compile_to_compressed_bytes(source, schema_json=None):
 
 
 def _pack_manifest(entries):
+    if isinstance(entries, dict):
+        import_entries = entries.get('imports', ())
+        island_entries = entries.get('islands', ())
+    else:
+        import_entries = entries
+        island_entries = ()
     buf = bytearray()
-    buf.extend(len(entries).to_bytes(4, 'little'))
-    for ident, module_path, attr in entries:
+    buf.extend(len(import_entries).to_bytes(4, 'little'))
+    for ident, module_path, attr in import_entries:
         mb = module_path.encode('utf-8')
         if len(mb) > 0xFFFF:
             raise ValueError('manifest module path too long')
@@ -1185,6 +1225,14 @@ def _pack_manifest(entries):
                 raise ValueError('manifest attr too long')
             buf.extend(len(ab).to_bytes(2, 'little'))
             buf.extend(ab)
+    buf.extend(len(island_entries).to_bytes(4, 'little'))
+    for island_id, aux in island_entries:
+        auxb = bytes(aux)
+        if len(auxb) > 0xFFFF:
+            raise ValueError('manifest island aux too long')
+        buf.extend((int(island_id) & 0xFFFFFFFF).to_bytes(4, 'little'))
+        buf.extend(len(auxb).to_bytes(2, 'little'))
+        buf.extend(auxb)
     return bytes(buf)
 
 

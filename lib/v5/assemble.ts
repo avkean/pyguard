@@ -215,6 +215,7 @@ _pg_manifest_seed = bytes(a ^ b ^ c for a, b, c in zip(hashlib.sha256(${n_seed} 
 _pg_manifest_p = ${n_kd}(_pg_manifest_seed)
 _pg_manifest_blob = zlib.decompress(${n_dec}(_pg_manifest_ct, _pg_manifest_p[0], _pg_manifest_p[1], _pg_manifest_p[2]), -15)
 _pg_manifest_pairs = []
+_pg_island_aux = []
 _pg_manifest_mods = {}
 _pg_mod_type = type(sys)
 _pg_mod_dict = _pg_mod_type.__dict__.get(bytes([95, 95, 100, 105, 99, 116, 95, 95]).decode())
@@ -261,6 +262,21 @@ for _ in range(_pg_manifest_cnt):
     except BaseException as _pg_exc:
         _pg_manifest_pairs.append((_pg_mid, _pg_exc))
 _pg_manifest_pairs = tuple(_pg_manifest_pairs)
+if _pg_manifest_off + 4 <= len(_pg_manifest_blob):
+    _pg_island_cnt = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 4], bytes([108, 105, 116, 116, 108, 101]).decode())
+    _pg_manifest_off += 4
+    for _ in range(_pg_island_cnt):
+        if _pg_manifest_off + 6 > len(_pg_manifest_blob):
+            raise SystemExit(0)
+        _pg_iid = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 4], bytes([108, 105, 116, 116, 108, 101]).decode())
+        _pg_manifest_off += 4
+        _pg_il = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 2], bytes([108, 105, 116, 116, 108, 101]).decode())
+        _pg_manifest_off += 2
+        if _pg_manifest_off + _pg_il > len(_pg_manifest_blob):
+            raise SystemExit(0)
+        _pg_island_aux.append((_pg_iid, _pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + _pg_il]))
+        _pg_manifest_off += _pg_il
+_pg_island_aux = tuple(_pg_island_aux)
 _pg_interp_seed = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + _pg_interp_label).digest(), _pg_env))
 _pg_interp_p = ${n_kd}(_pg_interp_seed)
 _pg_interp_m = lzma.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2]))
@@ -294,9 +310,9 @@ for _pg_mod_name, _pg_mod in _pg_manifest_mods.items():
     except Exception:
         pass
 _pg_interp_ns = {bytes([95, 95, 98, 117, 105, 108, 116, 105, 110, 115, 95, 95]).decode(): __builtins__, bytes([95, 95, 110, 97, 109, 101, 95, 95]).decode(): bytes([60, 112, 103, 95, 105, 62]).decode()}
-_pg_interp_ns[_pg_boot_key] = (_pg_schema_ct, _pg_schema_label, _pg_ir_ct, _pg_ir_label, ${n_seed}, _pg_interp_hash, _pg_env, _pg_pep, _pg_profile, bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode(), _pg_bi_snap, _pg_manifest_pairs)
+_pg_interp_ns[_pg_boot_key] = (_pg_schema_ct, _pg_schema_label, _pg_ir_ct, _pg_ir_label, ${n_seed}, _pg_interp_hash, _pg_env, _pg_pep, _pg_profile, bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode(), _pg_bi_snap, _pg_manifest_pairs, _pg_island_aux)
 _pg_ft(_pg_interp_code, _pg_interp_ns)()
-del _pg_pkg, _pg_interp_ct, _pg_manifest_ct, _pg_schema_ct, _pg_ir_ct, _pg_manifest_blob, _pg_manifest_mods, _pg_manifest_pairs
+del _pg_pkg, _pg_interp_ct, _pg_manifest_ct, _pg_schema_ct, _pg_ir_ct, _pg_manifest_blob, _pg_manifest_mods, _pg_manifest_pairs, _pg_island_aux
 `;
 }
 

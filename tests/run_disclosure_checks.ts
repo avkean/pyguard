@@ -39,9 +39,83 @@ function assertImportProxyHeld(stubPath: string, fingerprint: string): void {
     }
 }
 
+function assertSemanticIslands(srcPath: string, expectedCount: number, minLargestPayloadBytes: number): void {
+    const script = `
+from pathlib import Path
+from lib.v5.build_ir import compile_to_json
+
+src = Path(${JSON.stringify(srcPath)}).read_text()
+payload, _manifest = compile_to_json(src)
+stack = [payload[2]]
+count = 0
+largest = 0
+while stack:
+    cur = stack.pop()
+    if isinstance(cur, dict):
+        if cur.get('op') == 'IIsland':
+            count += 1
+            largest = max(largest, len(cur.get('payload', ())))
+        for v in cur.values():
+            if isinstance(v, (dict, list)):
+                stack.append(v)
+    elif isinstance(cur, list):
+        stack.extend(cur)
+print(count, largest)
+`;
+    const out = runCmd("python3", ["-c", script]).trim().split(/\s+/);
+    const count = Number(out[0]);
+    const largest = Number(out[1]);
+    if (!Number.isFinite(count) || count !== expectedCount) {
+        throw new Error(`semantic-island regression: expected ${expectedCount} decisive island(s), saw ${out.join(" ")}`);
+    }
+    if (!Number.isFinite(largest) || largest < minLargestPayloadBytes) {
+        throw new Error(`semantic-island regression: expected largest payload >= ${minLargestPayloadBytes} bytes, saw ${out.join(" ")}`);
+    }
+}
+
+function assertNoPlainIslandDisclosure(srcPath: string, forbidden: string[]): void {
+    const script = `
+from pathlib import Path
+import ast, json
+from lib.v5.transform_ast import transform_ast_tree
+
+src = Path(${JSON.stringify(srcPath)}).read_text()
+tree = transform_ast_tree(ast.parse(src))
+payloads = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call) and isinstance(getattr(node, 'func', None), ast.Name):
+        if node.func.id == '__pyguard_semantic_island__' and len(getattr(node, 'args', ())) == 1:
+            arg = node.args[0]
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, (bytes, bytearray)):
+                payloads.append(bytes(arg.value))
+print(json.dumps([p.hex() for p in payloads]))
+`;
+    const payloads = JSON.parse(runCmd("python3", ["-c", script])) as string[];
+    for (const hex of payloads) {
+        const raw = Buffer.from(hex, "hex");
+        for (const needle of forbidden) {
+            if (raw.includes(Buffer.from(needle, "utf8"))) {
+                throw new Error(`semantic-island disclosure regression: payload still contains ${JSON.stringify(needle)}`);
+            }
+        }
+    }
+}
+
 function main(): void {
     const td = fs.mkdtempSync(path.join(os.tmpdir(), "pyguard-disclosure-"));
     try {
+        assertSemanticIslands(path.join(ROOT, "tests", "test_rev", "dist.py"), 1, 400);
+        console.log("PASS  semantic island closure");
+        assertNoPlainIslandDisclosure(path.join(ROOT, "tests", "test_rev", "dist.py"), [
+            "EC3{REDACTED}",
+            "Congratulations!",
+            "rock",
+            "paper",
+            "scissors",
+            "Invalid input.",
+        ]);
+        console.log("PASS  semantic island payload disclosure");
+
         const auditStub = path.join(td, "01_print.py");
         buildStub(path.join(ROOT, "tests", "cases", "01_print.py"), auditStub);
         assertNoCompileLeak(auditStub);
