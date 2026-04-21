@@ -27,6 +27,8 @@ const DEFAULT_MINORS = ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14'];
 function probeBin(bin) {
     const r = spawnSync(bin, ['-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'], {
         encoding: 'utf-8',
+        timeout: 5_000,
+        killSignal: 'SIGKILL',
     });
     if (r.status !== 0) return null;
     const vs = (r.stdout || '').trim();
@@ -73,12 +75,17 @@ function compileAndMarshalOne(pythonBin, source, filename) {
         input: source,
         encoding: 'utf-8',
         env: {
-            ...process.env,
+            PATH: process.env.PATH,
             PYGUARD_MODE: 'marshal',
             PYGUARD_FILENAME: filename || '<pg>',
         },
         maxBuffer: 64 * 1024 * 1024,
+        timeout: 45_000,
+        killSignal: 'SIGKILL',
     });
+    if (r.error && r.error.code === 'ETIMEDOUT') {
+        throw new Error('compile_and_marshal subprocess timed out');
+    }
     if (r.status !== 0) {
         throw new Error('compile_and_marshal subprocess (' + pythonBin + ') failed: ' + r.stderr);
     }

@@ -568,19 +568,29 @@ def compile_to_ir(source, schema_json=None):
     # arithmetic, and obfuscates string literals. The resulting AST is
     # semantically equivalent but structurally alien — the IR no longer maps
     # 1:1 back to the original Python.
-    try:
-        from transform_ast import transform_ast_tree
-        from transform_ast import set_semantic_island_build_secret
-        set_semantic_island_build_secret(_schema_build_secret(schema_json))
-        tree = transform_ast_tree(tree)
-    except ImportError:
+    # Load transform_ast. Missing this module means we'd ship IR straight from
+    # the user's original AST — the opposite of what "v5 hardening" claims to
+    # do. Fail loud so a broken deploy can't silently emit weaker stubs.
+    # Pyodide / embed contexts that genuinely cannot provide the module can
+    # opt out explicitly with PYGUARD_ALLOW_UNOBFUSCATED_IR=1.
+    _ta_mod = None
+    _ta_err = None
+    for _candidate in ('transform_ast', 'lib.v5.transform_ast'):
         try:
-            from lib.v5.transform_ast import transform_ast_tree
-            from lib.v5.transform_ast import set_semantic_island_build_secret
-            set_semantic_island_build_secret(_schema_build_secret(schema_json))
-            tree = transform_ast_tree(tree)
-        except ImportError:
-            pass  # transforms not available (e.g. Pyodide without the module)
+            _ta_mod = __import__(_candidate, fromlist=['transform_ast_tree'])
+            break
+        except ImportError as _e:
+            _ta_err = _e
+    if _ta_mod is not None:
+        _ta_mod.set_semantic_island_build_secret(_schema_build_secret(schema_json))
+        tree = _ta_mod.transform_ast_tree(tree)
+    elif not os.environ.get('PYGUARD_ALLOW_UNOBFUSCATED_IR'):
+        raise RuntimeError(
+            'pyguard: transform_ast module missing; refusing to emit '
+            'un-deformed IR. Set PYGUARD_ALLOW_UNOBFUSCATED_IR=1 only for '
+            'embedded contexts (Pyodide) that intentionally skip transforms. '
+            f'Last import error: {_ta_err}'
+        )
 
     lifter = _Lifter()
     lifted = lifter.lift(tree)

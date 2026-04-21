@@ -235,6 +235,8 @@ const py = spawnSync(buildIrPython, [path.join(root, 'lib/v5/build_ir.py')], {
     encoding: 'utf-8',
     env: { ...process.env, PYGUARD_V5_SCHEMA: JSON.stringify(schema) },
     maxBuffer: 64 * 1024 * 1024,
+    timeout: 120_000,
+    killSignal: 'SIGKILL',
 });
 if (py.status !== 0) {
     console.error('build_ir.py failed:');
@@ -288,6 +290,8 @@ try {
         cwd: root,
         encoding: 'utf-8',
         maxBuffer: 64 * 1024 * 1024,
+        timeout: 120_000,
+        killSignal: 'SIGKILL',
     });
     if (ts.status !== 0) {
         console.error('tsx driver failed:');

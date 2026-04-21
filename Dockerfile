@@ -62,18 +62,32 @@ WORKDIR /app
 #                                multi_marshal itself references build_ir.py
 #                                at a $PWD-relative path, so we still need
 #                                scripts/ present)
-COPY --from=builder /app/.next          ./.next
-COPY --from=builder /app/node_modules   ./node_modules
-COPY --from=builder /app/package*.json  ./
-COPY --from=builder /app/public         ./public
-COPY --from=builder /app/lib            ./lib
-COPY --from=builder /app/scripts        ./scripts
+# Unprivileged runtime user. The /api/obfuscate path shells out to Python on
+# untrusted source — keeping that out of root narrows blast radius if a
+# build_ir bug ever becomes exploitable.
+RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin pyguard
+
+COPY --from=builder --chown=pyguard:pyguard /app/.next          ./.next
+COPY --from=builder --chown=pyguard:pyguard /app/node_modules   ./node_modules
+COPY --from=builder --chown=pyguard:pyguard /app/package*.json  ./
+COPY --from=builder --chown=pyguard:pyguard /app/public         ./public
+COPY --from=builder --chown=pyguard:pyguard /app/lib            ./lib
+COPY --from=builder --chown=pyguard:pyguard /app/scripts        ./scripts
 
 # Optional knob: pin the discovered Python toolchains explicitly.
 # Empty by default → discoverPythons() probes $PATH for python3.9..3.14.
 ENV PYGUARD_PYTHON_BINS=""
 
+# When running behind a reverse proxy that sets x-forwarded-for, flip this on
+# so the rate limiter keys on real client IPs rather than the proxy's.
+ENV TRUSTED_PROXY="0"
+
+USER pyguard
+
 EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # `next start` serves both the static site and /api/obfuscate.
 CMD ["npm", "run", "start"]

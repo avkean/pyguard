@@ -270,11 +270,15 @@ function bytesToBase85(bytes: Uint8Array): string {
 function randomBytes(n: number): Uint8Array {
     const out = new Uint8Array(n);
     const g: any = typeof globalThis !== "undefined" ? globalThis : {};
-    if (g.crypto && typeof g.crypto.getRandomValues === "function") {
-        g.crypto.getRandomValues(out);
-        return out;
+    if (!g.crypto || typeof g.crypto.getRandomValues !== "function") {
+        // Refuse to silently degrade to Math.random(): every byte out of this
+        // function ends up in cipher labels, XOR keys, or S-box seeds. A weak
+        // PRNG here means a weak stub — fail loud instead.
+        throw new Error(
+            "pyguard: crypto.getRandomValues unavailable; refusing to emit stub with weak PRNG",
+        );
     }
-    for (let i = 0; i < n; i++) out[i] = Math.floor(Math.random() * 256);
+    g.crypto.getRandomValues(out);
     return out;
 }
 
