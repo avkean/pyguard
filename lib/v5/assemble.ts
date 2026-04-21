@@ -149,10 +149,10 @@ export function packV5Stage2Payload(
 //   1. Trace/profile nullification + env-integrity hash
 //   2. Unpack the binary boot bundle supplied by stage1
 //   3. Decrypt the encrypted manifest blob and resolve it into opaque
-//      `(id, value)` pairs BEFORE the interpreter marshal.loads event fires
-//   4. Decrypt the tagged interpreter marshal blob and version-check it
+//      `(id, value)` pairs before the interpreter source is compiled
+//   4. Decrypt the compressed interpreter source bytes
 //   5. Pre-seed the boot argument tuple into `interp_ns[bootKey]`
-//   6. marshal.loads() + FunctionType(code, interp_ns)()
+//   6. compile() + FunctionType(code, interp_ns)()
 //
 // The schema is NEVER written to any globals dict outside the boot frame.
 // `run_blob` is NEVER assigned to a globals name. Profile-hooking stage2's
@@ -215,7 +215,6 @@ _pg_manifest_seed = bytes(a ^ b ^ c for a, b, c in zip(hashlib.sha256(${n_seed} 
 _pg_manifest_p = ${n_kd}(_pg_manifest_seed)
 _pg_manifest_blob = zlib.decompress(${n_dec}(_pg_manifest_ct, _pg_manifest_p[0], _pg_manifest_p[1], _pg_manifest_p[2]), -15)
 _pg_manifest_pairs = []
-_pg_island_aux = []
 _pg_manifest_mods = {}
 _pg_mod_type = type(sys)
 _pg_mod_dict = _pg_mod_type.__dict__.get(bytes([95, 95, 100, 105, 99, 116, 95, 95]).decode())
@@ -262,57 +261,19 @@ for _ in range(_pg_manifest_cnt):
     except BaseException as _pg_exc:
         _pg_manifest_pairs.append((_pg_mid, _pg_exc))
 _pg_manifest_pairs = tuple(_pg_manifest_pairs)
-if _pg_manifest_off + 4 <= len(_pg_manifest_blob):
-    _pg_island_cnt = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 4], bytes([108, 105, 116, 116, 108, 101]).decode())
-    _pg_manifest_off += 4
-    for _ in range(_pg_island_cnt):
-        if _pg_manifest_off + 6 > len(_pg_manifest_blob):
-            raise SystemExit(0)
-        _pg_iid = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 4], bytes([108, 105, 116, 116, 108, 101]).decode())
-        _pg_manifest_off += 4
-        _pg_il = int.from_bytes(_pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + 2], bytes([108, 105, 116, 116, 108, 101]).decode())
-        _pg_manifest_off += 2
-        if _pg_manifest_off + _pg_il > len(_pg_manifest_blob):
-            raise SystemExit(0)
-        _pg_island_aux.append((_pg_iid, _pg_manifest_blob[_pg_manifest_off:_pg_manifest_off + _pg_il]))
-        _pg_manifest_off += _pg_il
-_pg_island_aux = tuple(_pg_island_aux)
 _pg_interp_seed = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + _pg_interp_label).digest(), _pg_env))
 _pg_interp_p = ${n_kd}(_pg_interp_seed)
-_pg_interp_m = lzma.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2]))
-if _pg_interp_m[:4] != bytes([80, 71, 77, 86]) or len(_pg_interp_m) < 5:
-    raise SystemExit(0)
-_pg_pv_n = _pg_interp_m[4]
-_pg_pv_i = 5
-_pg_pv_mj = sys.version_info[0]
-_pg_pv_mn = sys.version_info[1]
-_pg_pv_bytes = None
-while _pg_pv_n > 0:
-    _pg_pv_n -= 1
-    if _pg_pv_i + 6 > len(_pg_interp_m):
-        raise SystemExit(0)
-    _pg_pv_a = _pg_interp_m[_pg_pv_i]
-    _pg_pv_b = _pg_interp_m[_pg_pv_i+1]
-    _pg_pv_l = int.from_bytes(_pg_interp_m[_pg_pv_i+2:_pg_pv_i+6], 'little')
-    _pg_pv_i += 6
-    if _pg_pv_i + _pg_pv_l > len(_pg_interp_m):
-        raise SystemExit(0)
-    if _pg_pv_a == _pg_pv_mj and _pg_pv_b == _pg_pv_mn:
-        _pg_pv_bytes = _pg_interp_m[_pg_pv_i:_pg_pv_i+_pg_pv_l]
-        break
-    _pg_pv_i += _pg_pv_l
-if _pg_pv_bytes is None:
-    raise SystemExit(0)
-_pg_interp_code = marshal.loads(_pg_pv_bytes)
+_pg_interp_src = lzma.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2])).decode('utf-8')
+_pg_interp_code = compile(_pg_interp_src, '<pg_i>', 'exec', optimize=2)
 for _pg_mod_name, _pg_mod in _pg_manifest_mods.items():
     try:
         sys.modules[_pg_mod_name] = _pg_mod
     except Exception:
         pass
 _pg_interp_ns = {bytes([95, 95, 98, 117, 105, 108, 116, 105, 110, 115, 95, 95]).decode(): __builtins__, bytes([95, 95, 110, 97, 109, 101, 95, 95]).decode(): bytes([60, 112, 103, 95, 105, 62]).decode()}
-_pg_interp_ns[_pg_boot_key] = (_pg_schema_ct, _pg_schema_label, _pg_ir_ct, _pg_ir_label, ${n_seed}, _pg_interp_hash, _pg_env, _pg_pep, _pg_profile, bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode(), _pg_bi_snap, _pg_manifest_pairs, _pg_island_aux)
+_pg_interp_ns[_pg_boot_key] = (_pg_schema_ct, _pg_schema_label, _pg_ir_ct, _pg_ir_label, ${n_seed}, _pg_interp_hash, _pg_env, _pg_pep, _pg_profile, bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode(), _pg_bi_snap, _pg_manifest_pairs)
 _pg_ft(_pg_interp_code, _pg_interp_ns)()
-del _pg_pkg, _pg_interp_ct, _pg_manifest_ct, _pg_schema_ct, _pg_ir_ct, _pg_manifest_blob, _pg_manifest_mods, _pg_manifest_pairs, _pg_island_aux
+del _pg_pkg, _pg_interp_ct, _pg_manifest_ct, _pg_schema_ct, _pg_ir_ct, _pg_manifest_blob, _pg_manifest_mods, _pg_manifest_pairs
 `;
 }
 

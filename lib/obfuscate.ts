@@ -735,18 +735,13 @@ export interface ObfuscateOpts {
     // never sees user source. Build the IR with lib/v5/build_ir.py
     // (in Pyodide for browser, or via subprocess for Node testing).
     v5IR?: V5IR;
-    // Compile Python source to a tagged marshal blob:
-    //   b'PGM1' + <major byte> + <minor byte> + marshal.dumps(code)
-    // The runtime checks the 6-byte tag before marshal.loads so a stub
-    // fails closed on Python-version mismatch instead of falling back to
-    // runtime compile() and leaking stage source through audit hooks.
-    compileAndMarshal?: (source: string, filename?: string) => Uint8Array;
-    // LZMA-compressed tagged marshal blob for the interpreter module.
-    // (LZMA's 8MB default window catches cross-version redundancy across
-    // the 6 marshal entries, halving blob size vs raw-deflate's 32KB window.)
-    interpreterMarshalCompressed?: Uint8Array;
+    // LZMA-compressed interpreter SOURCE bytes. Stage2 decrypts, compiles,
+    // and execs this generic runtime source instead of calling marshal.loads
+    // on an executable blob.
+    interpreterSourceCompressed?: Uint8Array;
     // LZMA compressor (shelled out to Python on the build side). Used to
-    // squeeze stage1 + stage2 multi-version PGMV blobs before encryption.
+    // squeeze the stage1 / stage2 / interpreter source payloads before
+    // encryption.
     compress?: (bytes: Uint8Array) => Uint8Array;
 }
 
@@ -784,6 +779,7 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_p1       = ng.gen();
     const n_S1       = ng.gen();
     const n_pt1      = ng.gen();
+    const n_src1     = ng.gen();
     const n_ns       = ng.gen();
     const n_co       = ng.gen();
     const n_chainA   = ng.gen(); // canonical region hash-fold variable
@@ -862,6 +858,7 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const s1_pt2     = ng.gen();
     const s1_uns     = ng.gen();
     const s1_co2     = ng.gen();
+    const s1_src2    = ng.gen();
     const s1_pkg2    = ng.gen();
     const s1_pkg2Off = ng.gen();
     const s1_m2Len   = ng.gen();
@@ -1331,30 +1328,8 @@ ${n_S1} = base64.b85decode(${s1Plan.concat})
 ${n_pt1} = lzma.decompress(${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2]))
 ${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, 'lzma': lzma, '__file__': ${n_path}, '${n_uc}': ${n_uc}}
 try:
-    if ${n_pt1}[:4] != bytes([80, 71, 77, 86]) or len(${n_pt1}) < 5:
-        sys.exit(0)
-    ${n_pv_n} = ${n_pt1}[4]
-    ${n_pv_i} = 5
-    ${n_pv_mj} = sys.version_info[0]
-    ${n_pv_mn} = sys.version_info[1]
-    ${n_pv_bytes} = None
-    while ${n_pv_n} > 0:
-        ${n_pv_n} -= 1
-        if ${n_pv_i} + 6 > len(${n_pt1}):
-            sys.exit(0)
-        ${n_pv_a} = ${n_pt1}[${n_pv_i}]
-        ${n_pv_b} = ${n_pt1}[${n_pv_i}+1]
-        ${n_pv_l} = int.from_bytes(${n_pt1}[${n_pv_i}+2:${n_pv_i}+6], 'little')
-        ${n_pv_i} += 6
-        if ${n_pv_i} + ${n_pv_l} > len(${n_pt1}):
-            sys.exit(0)
-        if ${n_pv_a} == ${n_pv_mj} and ${n_pv_b} == ${n_pv_mn}:
-            ${n_pv_bytes} = ${n_pt1}[${n_pv_i}:${n_pv_i}+${n_pv_l}]
-            break
-        ${n_pv_i} += ${n_pv_l}
-    if ${n_pv_bytes} is None:
-        sys.exit(0)
-    ${n_co} = marshal.loads(${n_pv_bytes})
+    ${n_src1} = ${n_pt1}.decode('utf-8')
+    ${n_co} = ${n_O}[${bi['compile']}](${n_src1}, '<pg_s1>', 'exec', optimize=2)
 except Exception:
     sys.exit(0)
 if not isinstance(${n_co}, type((lambda: 0).__code__)):
@@ -1455,26 +1430,16 @@ ${END_MARKER}
     const pepperedSeed2 = xor32(seed2, pep);
     const params2 = kdf(pepperedSeed2, prof);
 
-    // Stages and the interpreter are shipped as tagged marshal blobs:
-    //   b'PGM1' + major + minor + marshal.dumps(code)
-    // This keeps stage source out of runtime `compile()` audit events
-    // while still failing closed before marshal.loads on a Python-version
-    // mismatch.
+    // Stages and the interpreter are shipped as compressed UTF-8 source.
+    // Runtime compile() still exists, but it now sees only generic
+    // bootstrap/runtime glue. The decisive user program remains in the
+    // encrypted IR path rather than in a pre-terminal executable blob.
     let payloadBytes: Uint8Array;
     if (opts && opts.v5IR) {
-        if (!opts.compileAndMarshal) {
+        if (!opts.interpreterSourceCompressed) {
             throw new Error(
-                'v5IR obfuscation requires opts.compileAndMarshal. ' +
-                'The Node driver and the browser driver each supply one; ' +
-                'callers that embed the library directly must provide a ' +
-                'callback that returns a tagged marshal blob.',
-            );
-        }
-        if (!opts.interpreterMarshalCompressed) {
-            throw new Error(
-                'v5IR obfuscation requires opts.interpreterMarshalCompressed ' +
-                '— raw-deflate (-15) bytes of the tagged interpreter ' +
-                'marshal blob.',
+                'v5IR obfuscation requires opts.interpreterSourceCompressed ' +
+                '— LZMA-compressed UTF-8 bytes of the interpreter source.',
             );
         }
         // v9: boot entry point indexed by a RANDOMIZED BYTES KEY, not by
@@ -1542,11 +1507,8 @@ ${END_MARKER}
                 + '|function|True|type|builtins')
         );
 
-        // ---- 1. Encrypt the pre-marshaled interpreter --------------------
-        // The caller supplies raw-deflated tagged marshal bytes. We just
-        // encrypt them; v12 no longer re-encodes the resulting ciphertext
-        // as stage2 source literals.
-        const interpMarshalCompressed = opts.interpreterMarshalCompressed;
+        // ---- 1. Encrypt the compressed interpreter source ----------------
+        const interpSourceCompressed = opts.interpreterSourceCompressed;
 
         // Interpreter cipher: derived from seed + interpLabel + envCheck.
         // NOT XOR'd with interpHash because interpHash IS the hash of the
@@ -1556,7 +1518,7 @@ ${END_MARKER}
         const interpSeed = xor32(interpSeedPre, envCheckExpected);
         const pepperedInterpSeed = xor32(interpSeed, pep);
         const paramsInterp = kdf(pepperedInterpSeed, prof);
-        const encInterp = encrypt(interpMarshalCompressed, paramsInterp, prof);
+        const encInterp = encrypt(interpSourceCompressed, paramsInterp, prof);
 
         // ---- 2. Interp-hash binding for schema + IR ----------------------
         // The schema and IR keys XOR in the hash of the *encrypted*
@@ -1590,7 +1552,7 @@ ${END_MARKER}
         const paramsManifest = kdf(pepperedManifestSeed, prof);
         const encManifest = encrypt(opts.v5IR.manifest, paramsManifest, prof);
 
-        // ---- 3. Build + marshal stage2 -----------------------------------
+        // ---- 3. Build + compress stage2 source ---------------------------
         // v11: pack PolyProfile into 15 bytes for inline _k_derive inside
         // the interpreter. Layout must match the `_pg_boot` unpack in
         // lib/v5/runtime_interp.py:
@@ -1610,12 +1572,8 @@ ${END_MARKER}
             { n_seed, n_kd, n_dec, n_tchk },
             { bootBundleVar: s2_bootVar },
         );
-        // Stage2 multi-version PGMV compresses ~50% via LZMA's large window
-        // (zlib -15's 32KB window can't catch cross-version redundancy across
-        // the 6 marshal entries). Stage1 decrypts then lzma.decompress before
-        // scanning for the target minor.
         if (!opts.compress) throw new Error('opts.compress required');
-        const stage2Marshal = opts.compress(opts.compileAndMarshal(stage2Src, '<pg_s2>'));
+        const stage2SourceCompressed = opts.compress(strToUtf8(stage2Src));
         const bootBundle = packV5BootBundle({
             interpLabel,
             irLabel,
@@ -1630,7 +1588,7 @@ ${END_MARKER}
             profileBytes,
         });
         payloadBytes = packV5Stage2Payload(
-            stage2Marshal,
+            stage2SourceCompressed,
             bootBundle,
         );
     } else {
@@ -1743,66 +1701,16 @@ ${opts && opts.v5IR ? `    if (${s1_pt2}[:4] != bytes([80, 71, 83, 50]) or len($
     ${s1_pkg2Off} += ${s1_m2Len}
     ${s1_boot2} = ${s1_pt2}[${s1_pkg2Off}:]
     ${s1_pkg2} = lzma.decompress(${s1_pkg2})
-    if ${s1_pkg2}[:4] != bytes([80, 71, 77, 86]) or len(${s1_pkg2}) < 5:
-        sys.exit(0)
-    ${s1_pv_n} = ${s1_pkg2}[4]
-    ${s1_pv_i} = 5
-    ${s1_pv_mj} = sys.version_info[0]
-    ${s1_pv_mn} = sys.version_info[1]
-    ${s1_pv_bytes} = None
-    while ${s1_pv_n} > 0:
-        ${s1_pv_n} -= 1
-        if ${s1_pv_i} + 6 > len(${s1_pkg2}):
-            sys.exit(0)
-        ${s1_pv_a} = ${s1_pkg2}[${s1_pv_i}]
-        ${s1_pv_b} = ${s1_pkg2}[${s1_pv_i}+1]
-        ${s1_pv_l} = int.from_bytes(${s1_pkg2}[${s1_pv_i}+2:${s1_pv_i}+6], 'little')
-        ${s1_pv_i} += 6
-        if ${s1_pv_i} + ${s1_pv_l} > len(${s1_pkg2}):
-            sys.exit(0)
-        if ${s1_pv_a} == ${s1_pv_mj} and ${s1_pv_b} == ${s1_pv_mn}:
-            ${s1_pv_bytes} = ${s1_pkg2}[${s1_pv_i}:${s1_pv_i}+${s1_pv_l}]
-            break
-        ${s1_pv_i} += ${s1_pv_l}
-    if ${s1_pv_bytes} is None:
-        sys.exit(0)
     ${s1_uns}[${JSON.stringify(s2_bootVar)}] = ${s1_boot2}
-    ${s1_co2} = marshal.loads(${s1_pv_bytes})` : `    if ${s1_pt2}[:4] != bytes([80, 71, 77, 86]) or len(${s1_pt2}) < 5:
-        sys.exit(0)
-    ${s1_pv_n} = ${s1_pt2}[4]
-    ${s1_pv_i} = 5
-    ${s1_pv_mj} = sys.version_info[0]
-    ${s1_pv_mn} = sys.version_info[1]
-    ${s1_pv_bytes} = None
-    while ${s1_pv_n} > 0:
-        ${s1_pv_n} -= 1
-        if ${s1_pv_i} + 6 > len(${s1_pt2}):
-            sys.exit(0)
-        ${s1_pv_a} = ${s1_pt2}[${s1_pv_i}]
-        ${s1_pv_b} = ${s1_pt2}[${s1_pv_i}+1]
-        ${s1_pv_l} = int.from_bytes(${s1_pt2}[${s1_pv_i}+2:${s1_pv_i}+6], 'little')
-        ${s1_pv_i} += 6
-        if ${s1_pv_i} + ${s1_pv_l} > len(${s1_pt2}):
-            sys.exit(0)
-        if ${s1_pv_a} == ${s1_pv_mj} and ${s1_pv_b} == ${s1_pv_mn}:
-            ${s1_pv_bytes} = ${s1_pt2}[${s1_pv_i}:${s1_pv_i}+${s1_pv_l}]
-            break
-        ${s1_pv_i} += ${s1_pv_l}
-    if ${s1_pv_bytes} is None:
-        sys.exit(0)
-    ${s1_co2} = marshal.loads(${s1_pv_bytes})`}
+    ${s1_src2} = ${s1_pkg2}.decode('utf-8')
+    ${s1_co2} = ${n_O}[${bi['compile']}](${s1_src2}, '<pg_s2>', 'exec', optimize=2)` : `    ${s1_src2} = lzma.decompress(${s1_pt2}).decode('utf-8')
+    ${s1_co2} = ${n_O}[${bi['compile']}](${s1_src2}, '<pg_s2>', 'exec', optimize=2)`}
 except Exception:
     sys.exit(0)
 ${n_ftype}(${s1_co2}, ${s1_uns})()
 `;
 
-    // Stage1 is likewise marshaled at build time so the outer canonical
-    // region never compile()s decrypted stage text at runtime.
-    const stage1Raw = opts && opts.v5IR && opts.compileAndMarshal
-        ? opts.compileAndMarshal(stage1Src, '<pg_s1>')
-        : strToUtf8(stage1Src);
-    // Stage1 multi-version PGMV: LZMA for large-window cross-version diff
-    // compression. Stage0 decrypts then lzma.decompress before the PGMV scan.
+    const stage1Raw = strToUtf8(stage1Src);
     const stage1Bytes = opts && opts.compress
         ? opts.compress(stage1Raw)
         : stage1Raw;

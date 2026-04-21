@@ -36,7 +36,7 @@ import os
 
 
 _SEM_ISLAND_SENTINEL = '__pyguard_semantic_island__'
-_LAST_SEMANTIC_ISLAND_AUX = []
+_SEMANTIC_ISLAND_BUILD_SECRET = None
 
 # ---------------------------------------------------------------------------
 # Name generation (collision-free temporaries)
@@ -1855,9 +1855,10 @@ class _SemanticIslandCompiler:
         'EQ', 'NE', 'LT', 'LE', 'GT', 'GE', 'IS', 'ISNOT', 'IN', 'NOTIN',
     )
 
-    def __init__(self, ng, slot_name, randomize=True):
+    def __init__(self, ng, slot_name, build_secret, randomize=True):
         self.ng = ng
         self.slot_name = slot_name
+        self._build_secret = bytes(build_secret or b'')
         self._uses_slot = False
         self._used_slots = set()
         self._names = []
@@ -1869,7 +1870,6 @@ class _SemanticIslandCompiler:
         self._loop_stack = []
         rng = ng._rng if randomize else random.Random(0)
         self._island_id = rng.getrandbits(32) or 1
-        self._aux_key = bytes(rng.getrandbits(8) for _ in range(32))
         code_pool = list(range(1, 256))
         rng.shuffle(code_pool)
         self._opcodes = {
@@ -1923,7 +1923,8 @@ class _SemanticIslandCompiler:
 
     @property
     def aux_key(self):
-        return self._aux_key
+        ident = (self._island_id & 0xFFFFFFFF).to_bytes(4, 'little')
+        return hashlib.sha256(self._build_secret + b'|pgsi-key|' + ident + b'|').digest()
 
     def _key_for_const(self, value):
         t = type(value)
@@ -2239,7 +2240,7 @@ class _SemanticIslandCompiler:
         return out
 
     def _guard_stream(self, salt, n):
-        key = self._aux_key
+        key = self.aux_key
         state = 0x9E3779B9
         seed = key + salt
         for idx, b in enumerate(seed):
@@ -2404,19 +2405,16 @@ class _SemanticIslandCompiler:
             self._state_layout['scratch'],
         ]))
         if self.slot_name is None or not self._uses_slot:
-            parts.append((0xFFFF).to_bytes(2, 'little'))
+            parts.append(b'\x00')
         else:
-            raw = self.slot_name.encode('utf-8')
-            parts.append(len(raw).to_bytes(2, 'little'))
-            parts.append(raw)
+            parts.append(b'\x01')
+            parts.append(self._pack_const(self.slot_name))
         parts.append(len(slot_order).to_bytes(2, 'little'))
         for slot_idx in slot_order:
             parts.append(slot_idx.to_bytes(2, 'little'))
         parts.append(len(names).to_bytes(2, 'little'))
         for name in names:
-            raw = name.encode('utf-8')
-            parts.append(len(raw).to_bytes(2, 'little'))
-            parts.append(raw)
+            parts.append(self._pack_const(name))
         parts.append(len(consts).to_bytes(2, 'little'))
         for const in consts:
             parts.append(self._pack_const(const))
@@ -2446,11 +2444,11 @@ class _SemanticIslandRewriter(ast.NodeTransformer):
     def __init__(self, ng, slot_name):
         self.ng = ng
         self.slot_name = slot_name
+        self.build_secret = get_semantic_island_build_secret()
         self.lifted = 0
         self._seeded = False
         self._secret_names = set()
         self._secret_slots = set()
-        self.aux_entries = []
 
     def _seed_secret_bindings(self, tree):
         if self._seeded:
@@ -2566,11 +2564,10 @@ class _SemanticIslandRewriter(ast.NodeTransformer):
     def _lift_region(self, stmts):
         if not stmts:
             return None
-        compiler = _SemanticIslandCompiler(self.ng, self.slot_name)
+        compiler = _SemanticIslandCompiler(self.ng, self.slot_name, self.build_secret)
         if not compiler.supports(stmts):
             return None
         payload = compiler.compile(stmts)
-        self.aux_entries.append((compiler.island_id, compiler.aux_key))
         self.lifted += 1
         return ast.copy_location(
             ast.Expr(
@@ -2587,7 +2584,9 @@ class _SemanticIslandRewriter(ast.NodeTransformer):
         if not body:
             return None
         if self._decisive_body(body, whole_body=True):
-            compiler = _SemanticIslandCompiler(self.ng, self.slot_name, randomize=False)
+            compiler = _SemanticIslandCompiler(
+                self.ng, self.slot_name, self.build_secret, randomize=False
+            )
             if compiler.supports(body):
                 return (0, len(body))
         best = None
@@ -2595,7 +2594,9 @@ class _SemanticIslandRewriter(ast.NodeTransformer):
         for start in range(len(body)):
             for end in range(start + 2, len(body) + 1):
                 region = body[start:end]
-                compiler = _SemanticIslandCompiler(self.ng, self.slot_name, randomize=False)
+                compiler = _SemanticIslandCompiler(
+                    self.ng, self.slot_name, self.build_secret, randomize=False
+                )
                 if not compiler.supports(region):
                     continue
                 if not self._decisive_body(region, whole_body=False):
@@ -2656,10 +2657,8 @@ class _SemanticIslandRewriter(ast.NodeTransformer):
         return out
 
     def visit_Module(self, node):
-        global _LAST_SEMANTIC_ISLAND_AUX
         self._seed_secret_bindings(node)
         node.body = self._rewrite_body(node.body)
-        _LAST_SEMANTIC_ISLAND_AUX = list(self.aux_entries)
         return node
 
 
@@ -4020,8 +4019,18 @@ def transform_ast_tree(tree, seed=None, rename_identifiers=True,
                              int_obfuscation=int_obfuscation)
 
 
-def get_last_semantic_island_aux():
-    return list(_LAST_SEMANTIC_ISLAND_AUX)
+def set_semantic_island_build_secret(secret):
+    global _SEMANTIC_ISLAND_BUILD_SECRET
+    if secret is None:
+        _SEMANTIC_ISLAND_BUILD_SECRET = None
+    else:
+        _SEMANTIC_ISLAND_BUILD_SECRET = bytes(secret)
+
+
+def get_semantic_island_build_secret():
+    if _SEMANTIC_ISLAND_BUILD_SECRET:
+        return bytes(_SEMANTIC_ISLAND_BUILD_SECRET)
+    return hashlib.sha256(os.urandom(32) + b'|pgsi-default|').digest()
 
 
 if __name__ == '__main__':

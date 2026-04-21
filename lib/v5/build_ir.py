@@ -17,6 +17,7 @@ import ast
 import json
 import os
 import sys
+import hashlib
 
 
 _SEM_ISLAND_SENTINEL = '__pyguard_semantic_island__'
@@ -529,7 +530,22 @@ class _ImportManifestBuilder:
         return ident
 
 
-def compile_to_ir(source):
+def _schema_build_secret(schema_json):
+    if not schema_json:
+        return None
+    if isinstance(schema_json, str):
+        schema = json.loads(schema_json)
+    else:
+        schema = schema_json
+    h = hashlib.sha256()
+    h.update(b'PGSI-BUILD-SECRET\0')
+    mask = bytes(schema.get('mask', ()))
+    h.update(len(mask).to_bytes(2, 'little'))
+    h.update(mask)
+    return h.digest()
+
+
+def compile_to_ir(source, schema_json=None):
     """Parse user Python source and emit a v5 IR dict.
 
     Returns:
@@ -554,17 +570,16 @@ def compile_to_ir(source):
     # 1:1 back to the original Python.
     try:
         from transform_ast import transform_ast_tree
-        from transform_ast import get_last_semantic_island_aux
+        from transform_ast import set_semantic_island_build_secret
+        set_semantic_island_build_secret(_schema_build_secret(schema_json))
         tree = transform_ast_tree(tree)
-        island_aux = get_last_semantic_island_aux()
     except ImportError:
         try:
             from lib.v5.transform_ast import transform_ast_tree
-            from lib.v5.transform_ast import get_last_semantic_island_aux
+            from lib.v5.transform_ast import set_semantic_island_build_secret
+            set_semantic_island_build_secret(_schema_build_secret(schema_json))
             tree = transform_ast_tree(tree)
-            island_aux = get_last_semantic_island_aux()
         except ImportError:
-            island_aux = []
             pass  # transforms not available (e.g. Pyodide without the module)
 
     lifter = _Lifter()
@@ -573,11 +588,10 @@ def compile_to_ir(source):
         'tree': lifted,
         'strings': lifter.strings,
         'consts': lifter.consts,
-        'island_aux': island_aux,
     }
 
 
-def compile_to_json(source):
+def compile_to_json(source, schema_json=None):
     """Return `(payload, manifest)` for the build pipeline.
 
     v5.2 shape change: the top-level container is a list, not a dict.
@@ -600,7 +614,7 @@ def compile_to_json(source):
     interpreter marshal.loads event fires, without retaining plaintext
     module/attr names after stage2 completes.
     """
-    ir = compile_to_ir(source)
+    ir = compile_to_ir(source, schema_json=schema_json)
     lowered_tree, manifest = _lower_to_code(ir['tree'], ir['strings'])
     # v8: consts now emitted positionally as lists, not dicts. Previous
     # `{'t': type, 'v': value}` shape gave attackers a stable structural
@@ -636,7 +650,6 @@ def compile_to_json(source):
             raise NotImplementedError(f"unsupported constant type: {type(v).__name__}")
     return [ir['strings'], encoded_consts, lowered_tree], {
         'imports': manifest,
-        'islands': ir.get('island_aux', []),
     }
 
 
@@ -1182,7 +1195,7 @@ def compile_to_compressed_bytes(source, schema_json=None):
     must first decrypt the schema to learn them.
     """
     import zlib
-    payload, _manifest = compile_to_json(source)
+    payload, _manifest = compile_to_json(source, schema_json=schema_json)
     key_map, tag_map, mask, layouts = _schema_parts(schema_json)
     payload = _mask_payload(payload, mask)
     if key_map or tag_map:
@@ -1204,10 +1217,8 @@ def compile_to_compressed_bytes(source, schema_json=None):
 def _pack_manifest(entries):
     if isinstance(entries, dict):
         import_entries = entries.get('imports', ())
-        island_entries = entries.get('islands', ())
     else:
         import_entries = entries
-        island_entries = ()
     buf = bytearray()
     buf.extend(len(import_entries).to_bytes(4, 'little'))
     for ident, module_path, attr in import_entries:
@@ -1225,21 +1236,13 @@ def _pack_manifest(entries):
                 raise ValueError('manifest attr too long')
             buf.extend(len(ab).to_bytes(2, 'little'))
             buf.extend(ab)
-    buf.extend(len(island_entries).to_bytes(4, 'little'))
-    for island_id, aux in island_entries:
-        auxb = bytes(aux)
-        if len(auxb) > 0xFFFF:
-            raise ValueError('manifest island aux too long')
-        buf.extend((int(island_id) & 0xFFFFFFFF).to_bytes(4, 'little'))
-        buf.extend(len(auxb).to_bytes(2, 'little'))
-        buf.extend(auxb)
     return bytes(buf)
 
 
 def compile_to_artifacts(source, schema_json=None):
     import zlib
 
-    payload, manifest = compile_to_json(source)
+    payload, manifest = compile_to_json(source, schema_json=schema_json)
     key_map, tag_map, mask, layouts = _schema_parts(schema_json)
     payload = _mask_payload(payload, mask)
     if key_map or tag_map:

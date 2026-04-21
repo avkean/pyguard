@@ -13,6 +13,7 @@ Stdlib-only. Compatible with Python 3.8+.
 import builtins
 import struct as _pg_struct
 import sys
+import hashlib as _pg_hashlib
 
 
 # v6.5 / C17 — capture real built-in type objects via C-slot __class__ reads
@@ -394,6 +395,7 @@ _S_K = {}   # keys mapping
 _S_RT = {}  # reverse tags
 _S_M = b''  # XOR mask
 _S_L = {}   # field layouts
+_S_IS = b''  # schema-derived semantic-island build secret
 
 # v6.5 / C19 — pinned builtins snapshot. Populated by `_pg_boot` from an
 # 11th arg supplied by stage2, which captures `dict(__builtins__)` after
@@ -429,6 +431,67 @@ def _pg_text(value):
             buf[i] = b ^ mask[i % len(mask)]
         return _PGBT(buf).decode('utf-8')
     return value
+
+
+def _pg_schema_island_secret(mask, key_map, reverse_tags, layouts):
+    h = _pg_hashlib.sha256()
+    h.update(b'PGSI-BUILD-SECRET\0')
+    mask_b = _PGBT(mask or b'')
+    h.update(len(mask_b).to_bytes(2, 'little'))
+    h.update(mask_b)
+    return h.digest()
+
+
+def _pg_si_island_key(island_id):
+    if not _S_IS:
+        raise ValueError('missing semantic-island build secret')
+    return _pg_hashlib.sha256(
+        _PGBT(_S_IS) + b'|pgsi-key|' + (int(island_id) & 0xFFFFFFFF).to_bytes(4, 'little') + b'|'
+    ).digest()
+
+
+def _pg_si_state_fingerprint(value, depth=0):
+    if depth >= 3:
+        return b'R' + (id(value) & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')
+    if value is None:
+        return b'N'
+    if value is True:
+        return b'T'
+    if value is False:
+        return b'F'
+    t = type(value)
+    if t is int:
+        n = (value.bit_length() // 8) + 1
+        return b'I' + value.to_bytes(n, 'little', signed=True)
+    if t is float:
+        return b'G' + _pg_struct.pack('<d', value)
+    if t is str:
+        return b'S' + value.encode('utf-8')
+    if t is bytes:
+        return b'B' + _PGBT(value)
+    if t is tuple:
+        out = bytearray(b'U')
+        for item in value[:8]:
+            fp = _pg_si_state_fingerprint(item, depth + 1)
+            out.extend(len(fp).to_bytes(2, 'little'))
+            out.extend(fp)
+        return _PGBT(out)
+    if t is list:
+        return b'L' + (id(value) & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')
+    if t is dict:
+        return b'D' + (id(value) & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')
+    return b'O' + (id(value) & 0xFFFFFFFFFFFFFFFF).to_bytes(8, 'little')
+
+
+def _pg_si_state_seal(island_key, label, value):
+    fp = _pg_si_state_fingerprint(value)
+    salt = (int(label) & 0xFFFFFFFF).to_bytes(4, 'little')
+    acc = bytearray(_pg_si_guard_stream(island_key, salt + b'PG', 16))
+    for idx, b in enumerate(fp):
+        pos = idx % 16
+        acc[pos] ^= (b + ((idx + 1) * 17)) & 0xFF
+        acc[pos] = ((acc[pos] << 1) | (acc[pos] >> 7)) & 0xFF
+    return _PGBT(acc)
 
 
 def _pg_env_w():
@@ -673,25 +736,74 @@ class Scope:
 
 # --- user function -------------------------------------------------------
 
+def _pg_ufunc_slot(item):
+    if item == '__name__':
+        return '_name'
+    if item == '__qualname__':
+        return '_qualname'
+    if item == '__module__':
+        return '_module_name'
+    if item == '__doc__':
+        return '_doc'
+    if item == '__annotations__':
+        return '_ann'
+    return None
+
+
+def _pg_make_ufunc_blob(args_def, body, is_gen, is_async, defaults, kw_defaults):
+    kw_mask = tuple(kd is _MISSING for kd in kw_defaults)
+    kw_vals = tuple(None if kd is _MISSING else kd for kd in kw_defaults)
+    return _pg_pack_const((
+        args_def,
+        body,
+        bool(is_gen),
+        bool(is_async),
+        tuple(defaults),
+        kw_mask,
+        kw_vals,
+    ))
+
+
+def _pg_read_ufunc_blob(blob):
+    args_def, body, is_gen, is_async, defaults, kw_mask, kw_vals = _pg_unpack_const(blob)[0]
+    kw_defaults = tuple(
+        _MISSING if kw_mask[idx] else kw_vals[idx]
+        for idx in range(len(kw_vals))
+    )
+    return args_def, body, is_gen, is_async, tuple(defaults), kw_defaults
+
+
 class _UFunction:
     """A user-defined function. Acts as a regular Python callable."""
 
-    def __init__(self, interp, name, args_def, body, defining_scope,
-                 is_gen, is_async, defaults, kw_defaults):
+    __slots__ = (
+        '_interp', '_scope', '_blob', '_name', '_qualname',
+        '_module_name', '_doc', '_ann', 'defining_class',
+    )
+
+    def __init__(self, interp, name, defining_scope, blob):
         self._interp = interp
-        self.__name__ = name
-        self.__qualname__ = name
-        self.__module__ = '__main__'
-        self.__doc__ = None
-        self.__annotations__ = {}
-        self.args_def = args_def
-        self.body = body
-        self.defining_scope = defining_scope
-        self.is_gen = is_gen
-        self.is_async = is_async
-        self.defaults = defaults
-        self.kw_defaults = kw_defaults
+        self._scope = defining_scope
+        self._blob = blob
+        self._name = name
+        self._qualname = name
+        self._module_name = '__main__'
+        self._doc = None
+        self._ann = {}
         self.defining_class = None  # patched after class build for super()
+
+    def __getattribute__(self, item):
+        slot = _pg_ufunc_slot(item)
+        if slot is not None:
+            return object.__getattribute__(self, slot)
+        return object.__getattribute__(self, item)
+
+    def __setattr__(self, item, value):
+        slot = _pg_ufunc_slot(item)
+        if slot is not None:
+            object.__setattr__(self, slot, value)
+            return
+        object.__setattr__(self, item, value)
 
     def __get__(self, instance, owner):
         if instance is None:
@@ -721,6 +833,383 @@ class _BoundMethod:
     def __repr__(self):
         return "<bound method {} of {!r}>".format(
             self.__func__.__name__, self.__self__)
+
+
+_PGSI_NOARG = object()
+
+
+class _IslandMachine:
+    __slots__ = (
+        '_scope', '_iid', '_flags', '_layout', '_slot_layout',
+        '_names_buf', '_name_idx', '_const_buf', '_const_idx',
+        '_ops', '_unary', '_binary', '_compare',
+        '_u8', '_u16', '_seed', '_enc', '_code_len',
+        '_state', '_name_seals', '_slot_seals', '_tr', '_hold',
+    )
+
+    def __init__(self, payload, scope):
+        pos = 5
+        island_id = int.from_bytes(payload[pos:pos+4], 'little')
+        pos += 4
+        flags = payload[pos]
+        pos += 1
+
+        pc_i = payload[pos]
+        stack_i = payload[pos + 1]
+        slot_i = payload[pos + 2]
+        scratch_i = payload[pos + 3]
+        pos += 4
+
+        slot_flag = payload[pos]
+        pos += 1
+        if slot_flag:
+            slot_name_enc, pos = _pg_si_unpack_const(payload, pos)
+        else:
+            slot_name_enc = None
+
+        slot_count = int.from_bytes(payload[pos:pos+2], 'little')
+        pos += 2
+        slot_layout = []
+        for _ in range(slot_count):
+            slot_layout.append(int.from_bytes(payload[pos:pos+2], 'little'))
+            pos += 2
+
+        name_count = int.from_bytes(payload[pos:pos+2], 'little')
+        pos += 2
+        name_start = pos
+        name_idx = []
+        for _ in range(name_count):
+            name_idx.append(pos - name_start)
+            _value, pos = _pg_si_unpack_const(payload, pos)
+        names_buf = payload[name_start:pos]
+
+        const_count = int.from_bytes(payload[pos:pos+2], 'little')
+        pos += 2
+        const_start = pos
+        const_idx = []
+        for _ in range(const_count):
+            const_idx.append(pos - const_start)
+            _value, pos = _pg_si_unpack_const(payload, pos)
+        const_buf = payload[const_start:pos]
+
+        ops = _PGBT(payload[pos:pos + 20])
+        pos += 20
+        unary = _PGBT(payload[pos:pos + 4])
+        pos += 4
+        binary = _PGBT(payload[pos:pos + 13])
+        pos += 13
+        compare = _PGBT(payload[pos:pos + 10])
+        pos += 10
+
+        u8 = []
+        for _ in range(4):
+            u8.append((payload[pos], payload[pos + 1]))
+            pos += 2
+        u16 = []
+        for _ in range(4):
+            add = int.from_bytes(payload[pos:pos+2], 'little')
+            xor = int.from_bytes(payload[pos+2:pos+4], 'little')
+            pos += 4
+            u16.append((add, xor))
+
+        seed = int.from_bytes(payload[pos:pos+4], 'little')
+        pos += 4
+        code_len = int.from_bytes(payload[pos:pos+2], 'little')
+        pos += 2
+        enc = _PGBT(payload[pos:pos+code_len])
+
+        state = [None, None, None, None]
+        state[pc_i] = 0
+        state[stack_i] = []
+        state[slot_i] = None
+        state[scratch_i] = 0
+
+        if slot_name_enc is not None:
+            slot_name = _pg_si_materialize(slot_name_enc, _pg_si_island_key(island_id))
+            state[slot_i] = scope.get(slot_name)
+
+        self._scope = scope
+        self._iid = island_id
+        self._flags = flags
+        self._layout = (pc_i, stack_i, slot_i, scratch_i)
+        self._slot_layout = tuple(slot_layout)
+        self._names_buf = _PGBT(names_buf)
+        self._name_idx = tuple(name_idx)
+        self._const_buf = _PGBT(const_buf)
+        self._const_idx = tuple(const_idx)
+        self._ops = ops
+        self._unary = unary
+        self._binary = binary
+        self._compare = compare
+        self._u8 = tuple(u8)
+        self._u16 = tuple(u16)
+        self._seed = seed
+        self._enc = enc
+        self._code_len = code_len
+        self._state = state
+        self._name_seals = [None] * name_count
+        self._slot_seals = [None] * slot_count
+        self._tr = _pg_hashlib.sha256(
+            _pg_si_island_key(island_id) + b'|pgsi-transcript|' +
+            (island_id & 0xFFFFFFFF).to_bytes(4, 'little')
+        ).digest()
+        self._hold = None
+
+    def _reverse_stack(self):
+        return bool(self._flags & 1)
+
+    def _relative_jumps(self):
+        return bool(self._flags & 2)
+
+    def _callee_last(self):
+        return bool(self._flags & 4)
+
+    def _pc(self):
+        return self._state[self._layout[0]]
+
+    def _set_pc(self, value):
+        self._state[self._layout[0]] = value
+
+    def _stack(self):
+        return self._state[self._layout[1]]
+
+    def _push(self, value):
+        if self._reverse_stack():
+            self._stack().insert(0, value)
+        else:
+            self._stack().append(value)
+
+    def _pop(self):
+        if self._reverse_stack():
+            return self._stack().pop(0)
+        return self._stack().pop()
+
+    def _tick(self, tag, value=b''):
+        h = _pg_hashlib.sha256()
+        h.update(self._tr)
+        h.update(bytes([tag & 0xFF]))
+        h.update(_PGBT(value))
+        self._tr = h.digest()
+
+    def _key(self):
+        return _pg_si_island_key(self._iid)
+
+    def _host_seal(self):
+        snap = (
+            self._pc(),
+            self._state[self._layout[3]],
+            tuple(self._stack()),
+            tuple(self._name_seals),
+            tuple(self._slot_seals),
+        )
+        return _pg_hashlib.sha256(
+            self._key() + b'|pgsi-host|' + self._tr +
+            _pg_si_state_fingerprint(snap)
+        ).digest()
+
+    def _resume_host(self, value, raised):
+        if self._hold is None:
+            if raised is not None:
+                raise raised
+            return
+        if self._hold != self._host_seal():
+            raise ValueError('semantic-island machine tampered')
+        self._hold = None
+        if raised is not None:
+            self._tick(0xE2, _pg_si_state_fingerprint(raised))
+            raise raised
+        self._tick(0xE1, _pg_si_state_fingerprint(value))
+        self._push(value)
+
+    def _code_byte(self, idx):
+        state = self._seed & 0xFFFFFFFF
+        i = 0
+        while i <= idx:
+            state = ((1103515245 * state) + 12345) & 0xFFFFFFFF
+            i += 1
+        return self._enc[idx] ^ ((state >> 16) & 0xFF)
+
+    def _u8_raw(self):
+        pc = self._pc()
+        value = self._code_byte(pc)
+        self._set_pc(pc + 1)
+        return value
+
+    def _u16_raw(self):
+        pc = self._pc()
+        value = self._code_byte(pc) | (self._code_byte(pc + 1) << 8)
+        self._set_pc(pc + 2)
+        return value
+
+    def _dec_u8(self, raw, kind):
+        add, xor = self._u8[kind]
+        return ((raw ^ xor) - add) & 0xFF
+
+    def _dec_u16(self, raw, kind):
+        add, xor = self._u16[kind]
+        return ((raw ^ xor) - add) & 0xFFFF
+
+    def _jump_target(self):
+        raw = self._dec_u16(self._u16_raw(), 3)
+        if self._relative_jumps():
+            if raw >= 0x8000:
+                raw -= 0x10000
+            return self._pc() + raw
+        return raw
+
+    def _logical(self, raw):
+        for idx, code in enumerate(self._ops):
+            if code == raw:
+                return idx
+        return -1
+
+    def _decode_name(self, idx):
+        value, _pos = _pg_si_unpack_const(self._names_buf, self._name_idx[idx])
+        return _pg_si_materialize(value, self._key())
+
+    def _decode_const(self, idx):
+        value, _pos = _pg_si_unpack_const(self._const_buf, self._const_idx[idx])
+        return _pg_si_materialize(value, self._key())
+
+    def _slot_ref(self, idx):
+        slot_ref = self._state[self._layout[2]]
+        slot_idx = self._slot_layout[idx]
+        value = slot_ref[slot_idx]
+        seal = self._slot_seals[idx]
+        key = self._key()
+        if seal is None:
+            self._slot_seals[idx] = _pg_si_state_seal(key, slot_idx, value)
+        elif seal != _pg_si_state_seal(key, slot_idx, value):
+            raise ValueError('semantic-island slot state tampered')
+        return value
+
+    def _slot_store(self, idx, value):
+        slot_ref = self._state[self._layout[2]]
+        slot_idx = self._slot_layout[idx]
+        slot_ref[slot_idx] = value
+        self._slot_seals[idx] = _pg_si_state_seal(self._key(), slot_idx, value)
+
+    def _load_name_value(self, idx):
+        name = self._decode_name(idx)
+        value = self._scope.get(name)
+        seal = self._name_seals[idx]
+        key = self._key()
+        if seal is None:
+            self._name_seals[idx] = _pg_si_state_seal(key, 0x80000000 | idx, value)
+        elif seal != _pg_si_state_seal(key, 0x80000000 | idx, value):
+            raise ValueError('semantic-island name state tampered')
+        return value
+
+    def _store_name_value(self, idx, value):
+        name = self._decode_name(idx)
+        self._scope.set(name, value)
+        self._name_seals[idx] = _pg_si_state_seal(
+            self._key(), 0x80000000 | idx, value)
+
+    def run(self, value=_PGSI_NOARG, raised=None):
+        self._resume_host(value, raised)
+        while self._pc() < self._code_len:
+            pc = self._pc()
+            raw = self._code_byte(pc)
+            self._state[self._layout[3]] = raw
+            self._set_pc(pc + 1)
+            self._tick(0xA0, bytes([raw, pc & 0xFF, (pc >> 8) & 0xFF]))
+            op = self._logical(raw)
+            if op == 0:
+                idx = self._dec_u16(self._u16_raw(), 1)
+                self._push(self._decode_const(idx))
+                continue
+            if op == 1:
+                idx = self._dec_u16(self._u16_raw(), 0)
+                self._push(self._load_name_value(idx))
+                continue
+            if op == 2:
+                idx = self._dec_u16(self._u16_raw(), 2)
+                self._push(self._slot_ref(idx))
+                continue
+            if op == 3:
+                idx = self._dec_u16(self._u16_raw(), 0)
+                self._store_name_value(idx, self._pop())
+                continue
+            if op == 4:
+                idx = self._dec_u16(self._u16_raw(), 2)
+                self._slot_store(idx, self._pop())
+                continue
+            if op == 5:
+                key = self._pop()
+                obj = self._pop()
+                self._push(obj[key])
+                continue
+            if op == 6:
+                n = self._dec_u8(self._u8_raw(), 0)
+                vals = [self._pop() for _ in range(n)]
+                vals.reverse()
+                self._push(vals)
+                continue
+            if op == 7:
+                n = self._dec_u8(self._u8_raw(), 0)
+                vals = [self._pop() for _ in range(n)]
+                vals.reverse()
+                self._push(tuple(vals))
+                continue
+            if op == 8:
+                self._pop()
+                continue
+            if op == 9:
+                argc = self._dec_u8(self._u8_raw(), 0)
+                if self._callee_last():
+                    fn = self._pop()
+                    args = [self._pop() for _ in range(argc)]
+                    args.reverse()
+                else:
+                    args = [self._pop() for _ in range(argc)]
+                    args.reverse()
+                    fn = self._pop()
+                self._tick(0xC1, _pg_si_state_fingerprint((fn, tuple(args))))
+                self._hold = self._host_seal()
+                return fn, tuple(args)
+            if op == 10:
+                raw_id = self._dec_u8(self._u8_raw(), 1)
+                opid = self._unary.find(bytes([raw_id])) + 1
+                self._push(_pg_si_unary(opid, self._pop()))
+                continue
+            if op == 11:
+                raw_id = self._dec_u8(self._u8_raw(), 2)
+                opid = self._binary.find(bytes([raw_id])) + 1
+                right = self._pop()
+                left = self._pop()
+                self._push(_pg_si_binary(opid, left, right))
+                continue
+            if op == 12:
+                raw_id = self._dec_u8(self._u8_raw(), 3)
+                opid = self._compare.find(bytes([raw_id])) + 1
+                right = self._pop()
+                left = self._pop()
+                self._push(_pg_si_compare(opid, left, right))
+                continue
+            if op == 13:
+                self._set_pc(self._jump_target())
+                continue
+            if op == 14:
+                target = self._jump_target()
+                if not self._pop():
+                    self._set_pc(target)
+                continue
+            if op == 15:
+                target = self._jump_target()
+                if self._pop():
+                    self._set_pc(target)
+                continue
+            if op == 16:
+                raise _Return(self._pop() if self._stack() else None)
+            if op == 17:
+                raise _Break()
+            if op == 18:
+                raise _Continue()
+            if op == 19:
+                raise self._pop()
+            raise ValueError('bad island opcode')
+        return None
 
 
 # --- driver helpers ------------------------------------------------------
@@ -1028,349 +1517,20 @@ class Interp:
         if payload[:5] != b'PGSI2':
             raise ValueError('bad island payload')
 
-        pos = 5
-        island_id = int.from_bytes(payload[pos:pos+4], 'little')
-        pos += 4
-        flags = payload[pos]
-        pos += 1
-        reverse_stack = bool(flags & 1)
-        relative_jumps = bool(flags & 2)
-        callee_last = bool(flags & 4)
-        dispatch_mode = 1 if flags & 8 else 0
-
-        pc_i = payload[pos]
-        stack_i = payload[pos + 1]
-        slot_i = payload[pos + 2]
-        scratch_i = payload[pos + 3]
-        pos += 4
-
-        slot_len = int.from_bytes(payload[pos:pos+2], 'little')
-        pos += 2
-        if slot_len == 0xFFFF:
-            slot_name = None
-        else:
-            slot_name = payload[pos:pos+slot_len].decode('utf-8')
-            pos += slot_len
-
-        slot_count = int.from_bytes(payload[pos:pos+2], 'little')
-        pos += 2
-        slot_layout = []
-        for _ in range(slot_count):
-            slot_layout.append(int.from_bytes(payload[pos:pos+2], 'little'))
-            pos += 2
-
-        name_count = int.from_bytes(payload[pos:pos+2], 'little')
-        pos += 2
-        names = []
-        for _ in range(name_count):
-            n = int.from_bytes(payload[pos:pos+2], 'little')
-            pos += 2
-            names.append(payload[pos:pos+n].decode('utf-8'))
-            pos += n
-
-        const_count = int.from_bytes(payload[pos:pos+2], 'little')
-        pos += 2
-        consts = []
-        for _ in range(const_count):
-            value, pos = _pg_si_unpack_const(payload, pos)
-            consts.append(value)
-
-        logical = (
-            'LOAD_CONST', 'LOAD_NAME', 'LOAD_SLOT',
-            'STORE_NAME', 'STORE_SLOT',
-            'LOAD_SUBSCR',
-            'BUILD_LIST', 'BUILD_TUPLE',
-            'POP', 'CALL',
-            'UNARY', 'BINARY', 'COMPARE',
-            'JUMP', 'JUMP_IF_FALSE', 'JUMP_IF_TRUE',
-            'RETURN', 'BREAK', 'CONTINUE', 'RAISE',
-        )
-        opmap = {}
-        for name in logical:
-            opmap[payload[pos]] = name
-            pos += 1
-        unary_map = {}
-        for idx in range(4):
-            unary_map[payload[pos]] = idx + 1
-            pos += 1
-        binary_map = {}
-        for idx in range(13):
-            binary_map[payload[pos]] = idx + 1
-            pos += 1
-        compare_map = {}
-        for idx in range(10):
-            compare_map[payload[pos]] = idx + 1
-            pos += 1
-
-        u8_keys = {}
-        for kind in ('count', 'unaryop', 'binaryop', 'compareop'):
-            u8_keys[kind] = (payload[pos], payload[pos + 1])
-            pos += 2
-        u16_keys = {}
-        for kind in ('name', 'const', 'slot', 'jump'):
-            add = int.from_bytes(payload[pos:pos+2], 'little')
-            xor = int.from_bytes(payload[pos+2:pos+4], 'little')
-            pos += 4
-            u16_keys[kind] = (add, xor)
-
-        seed = int.from_bytes(payload[pos:pos+4], 'little')
-        pos += 4
-        code_len = int.from_bytes(payload[pos:pos+2], 'little')
-        pos += 2
-        enc = payload[pos:pos+code_len]
-        mask = _pg_si_mask_stream(seed, code_len)
-        code = _PGBT(enc[i] ^ mask[i] for i in range(code_len))
-        island_key = self._a(2, island_id)
-
-        state = [None, None, None, None]
-        state[pc_i] = 0
-        state[stack_i] = []
-        state[slot_i] = scope.get(slot_name) if slot_name is not None else None
-        state[scratch_i] = 0
-
-        def _pc():
-            return state[pc_i]
-
-        def _set_pc(value):
-            state[pc_i] = value
-
-        def _stack():
-            return state[stack_i]
-
-        def _push(value):
-            if reverse_stack:
-                _stack().insert(0, value)
-            else:
-                _stack().append(value)
-
-        def _pop():
-            if reverse_stack:
-                return _stack().pop(0)
-            return _stack().pop()
-
-        def _u8_raw():
-            pc = _pc()
-            value = code[pc]
-            _set_pc(pc + 1)
-            return value
-
-        def _u16_raw():
-            pc = _pc()
-            value = code[pc] | (code[pc + 1] << 8)
-            _set_pc(pc + 2)
-            return value
-
-        def _dec_u8(raw, kind):
-            add, xor = u8_keys[kind]
-            return ((raw ^ xor) - add) & 0xFF
-
-        def _dec_u16(raw, kind):
-            add, xor = u16_keys[kind]
-            return ((raw ^ xor) - add) & 0xFFFF
-
-        def _jump_target():
-            raw = _dec_u16(_u16_raw(), 'jump')
-            if relative_jumps:
-                if raw >= 0x8000:
-                    raw -= 0x10000
-                return _pc() + raw
-            return raw
-
-        def _slot_ref(idx):
-            slot_ref = state[slot_i]
-            return slot_ref[slot_layout[idx]]
-
-        def _slot_store(idx, value):
-            slot_ref = state[slot_i]
-            slot_ref[slot_layout[idx]] = value
-
-        def _load_const():
-            idx = _dec_u16(_u16_raw(), 'const')
-            _push(_pg_si_materialize(consts[idx], island_key))
-
-        def _load_name():
-            idx = _dec_u16(_u16_raw(), 'name')
-            _push(scope.get(names[idx]))
-
-        def _load_slot():
-            idx = _dec_u16(_u16_raw(), 'slot')
-            _push(_slot_ref(idx))
-
-        def _store_name():
-            idx = _dec_u16(_u16_raw(), 'name')
-            scope.set(names[idx], _pop())
-
-        def _store_slot():
-            idx = _dec_u16(_u16_raw(), 'slot')
-            _slot_store(idx, _pop())
-
-        def _load_subscr():
-            key = _pop()
-            obj = _pop()
-            _push(obj[key])
-
-        def _build_list():
-            n = _dec_u8(_u8_raw(), 'count')
-            vals = [_pop() for _ in range(n)]
-            vals.reverse()
-            _push(vals)
-
-        def _build_tuple():
-            n = _dec_u8(_u8_raw(), 'count')
-            vals = [_pop() for _ in range(n)]
-            vals.reverse()
-            _push(tuple(vals))
-
-        def _do_pop():
-            _pop()
-
-        def _call():
-            argc = _dec_u8(_u8_raw(), 'count')
-            if callee_last:
-                fn = _pop()
-                args = [_pop() for _ in range(argc)]
-                args.reverse()
-            else:
-                args = [_pop() for _ in range(argc)]
-                args.reverse()
-                fn = _pop()
-            _push(fn(*args))
-
-        def _unary():
-            opid = unary_map.get(_dec_u8(_u8_raw(), 'unaryop'))
-            _push(_pg_si_unary(opid, _pop()))
-
-        def _binary():
-            opid = binary_map.get(_dec_u8(_u8_raw(), 'binaryop'))
-            right = _pop()
-            left = _pop()
-            _push(_pg_si_binary(opid, left, right))
-
-        def _compare():
-            opid = compare_map.get(_dec_u8(_u8_raw(), 'compareop'))
-            right = _pop()
-            left = _pop()
-            _push(_pg_si_compare(opid, left, right))
-
-        def _jump():
-            _set_pc(_jump_target())
-
-        def _jump_if_false():
-            target = _jump_target()
-            if not _pop():
-                _set_pc(target)
-
-        def _jump_if_true():
-            target = _jump_target()
-            if _pop():
-                _set_pc(target)
-
-        def _return():
-            raise _Return(_pop() if _stack() else None)
-
-        def _break():
-            raise _Break()
-
-        def _continue():
-            raise _Continue()
-
-        def _raise():
-            raise _pop()
-
-        handlers = {
-            'LOAD_CONST': _load_const,
-            'LOAD_NAME': _load_name,
-            'LOAD_SLOT': _load_slot,
-            'STORE_NAME': _store_name,
-            'STORE_SLOT': _store_slot,
-            'LOAD_SUBSCR': _load_subscr,
-            'BUILD_LIST': _build_list,
-            'BUILD_TUPLE': _build_tuple,
-            'POP': _do_pop,
-            'CALL': _call,
-            'UNARY': _unary,
-            'BINARY': _binary,
-            'COMPARE': _compare,
-            'JUMP': _jump,
-            'JUMP_IF_FALSE': _jump_if_false,
-            'JUMP_IF_TRUE': _jump_if_true,
-            'RETURN': _return,
-            'BREAK': _break,
-            'CONTINUE': _continue,
-            'RAISE': _raise,
-        }
-
-        while _pc() < code_len:
-            state[scratch_i] = code[_pc()]
-            op = opmap.get(code[_pc()])
-            _set_pc(_pc() + 1)
-            if dispatch_mode:
-                handler = handlers.get(op)
-                if handler is None:
-                    raise ValueError('bad island opcode')
-                handler()
-                continue
-            if op == 'LOAD_CONST':
-                _load_const()
-                continue
-            if op == 'LOAD_NAME':
-                _load_name()
-                continue
-            if op == 'LOAD_SLOT':
-                _load_slot()
-                continue
-            if op == 'STORE_NAME':
-                _store_name()
-                continue
-            if op == 'STORE_SLOT':
-                _store_slot()
-                continue
-            if op == 'LOAD_SUBSCR':
-                _load_subscr()
-                continue
-            if op == 'BUILD_LIST':
-                _build_list()
-                continue
-            if op == 'BUILD_TUPLE':
-                _build_tuple()
-                continue
-            if op == 'POP':
-                _do_pop()
-                continue
-            if op == 'CALL':
-                _call()
-                continue
-            if op == 'UNARY':
-                _unary()
-                continue
-            if op == 'BINARY':
-                _binary()
-                continue
-            if op == 'COMPARE':
-                _compare()
-                continue
-            if op == 'JUMP':
-                _jump()
-                continue
-            if op == 'JUMP_IF_FALSE':
-                _jump_if_false()
-                continue
-            if op == 'JUMP_IF_TRUE':
-                _jump_if_true()
-                continue
-            if op == 'RETURN':
-                _return()
-                continue
-            if op == 'BREAK':
-                _break()
-                continue
-            if op == 'CONTINUE':
-                _continue()
-                continue
-            if op == 'RAISE':
-                _raise()
-                continue
-            raise ValueError('bad island opcode')
+        machine = _IslandMachine(payload, scope)
+        value = _PGSI_NOARG
+        raised = None
+        while True:
+            request = machine.run(value, raised)
+            value = _PGSI_NOARG
+            raised = None
+            if request is None:
+                return
+            fn, args = request
+            try:
+                value = fn(*args)
+            except BaseException as exc:
+                raised = exc
 
     def step_inst(self, node, scope):
         if False:
@@ -1957,8 +2117,9 @@ class Interp:
                     kw_defaults.append(kdv)
             # Wrap body as Return statement so the function path works
             wrapped = (('Return', _nf(node, 'body')),)
-            return _UFunction(self, '<lambda>', args_def, wrapped,
-                              scope, False, False, defaults, kw_defaults)
+            blob = _pg_make_ufunc_blob(
+                args_def, wrapped, False, False, defaults, kw_defaults)
+            return _UFunction(self, '<lambda>', scope, blob)
 
         if op == 'ListComp':
             return (yield from self._eval_comp('list', node, scope))
@@ -2168,9 +2329,10 @@ class Interp:
             else:
                 kdv = yield from self.step_expr(kd, scope)
                 kw_defaults.append(kdv)
-        func = _UFunction(
-            self, self.s(_nf(node, 'name')), args_def, _nf(node, 'body'),
-            scope, is_gen, is_async, defaults, kw_defaults)
+        func_name = self.s(_nf(node, 'name'))
+        blob = _pg_make_ufunc_blob(
+            args_def, _nf(node, 'body'), is_gen, is_async, defaults, kw_defaults)
+        func = _UFunction(self, func_name, scope, blob)
         # Evaluate annotations
         ann = {}
         for a in (_nf(args_def, 'posonlyargs') + _nf(args_def, 'args')
@@ -2247,24 +2409,25 @@ class Interp:
     # ---- function call binding ----
 
     def call_user_function(self, func, args, kwargs):
-        local = Scope(parent=func.defining_scope)
-        self._bind_args(func, args, kwargs, local)
+        args_def, body, is_gen, is_async, defaults, kw_defaults = (
+            _pg_read_ufunc_blob(func._blob))
+        local = Scope(parent=func._scope)
+        self._bind_args(func, args_def, defaults, kw_defaults, args, kwargs, local)
         if func.defining_class is not None:
             local.vars['__pyguard_class__'] = func.defining_class
             if args:
                 local.vars['__pyguard_self__'] = args[0]
-        if func.is_gen:
+        if is_gen:
             return self._make_host_generator(func, local)
-        if func.is_async:
+        if is_async:
             return self._make_host_coroutine(func, local)
         try:
-            _drive_sync(self._exec_body(func.body, local))
+            _drive_sync(self._exec_body(body, local))
         except _Return as r:
             return r.value
         return None
 
-    def _bind_args(self, func, args, kwargs, local):
-        a = func.args_def
+    def _bind_args(self, func, a, defaults, kw_defaults, args, kwargs, local):
         posonly = _nf(a, 'posonlyargs')
         pos = _nf(a, 'args')
         kwonly = _nf(a, 'kwonlyargs')
@@ -2273,7 +2436,6 @@ class Interp:
 
         all_pos = posonly + pos
         n_pos = len(all_pos)
-        defaults = func.defaults
         n_defaults = len(defaults)
 
         bound = {}
@@ -2325,7 +2487,7 @@ class Interp:
         for i, name in enumerate(kwonly_names):
             if name in bound:
                 continue
-            kd = func.kw_defaults[i]
+            kd = kw_defaults[i]
             if kd is not _MISSING:
                 bound[name] = kd
             else:
@@ -2346,7 +2508,8 @@ class Interp:
     # ---- generator / coroutine host wrappers ----
 
     def _make_host_generator(self, func, local):
-        inner = self._exec_body(func.body, local)
+        body = _pg_read_ufunc_blob(func._blob)[1]
+        inner = self._exec_body(body, local)
         def host():
             sent = None
             try:
@@ -2369,7 +2532,8 @@ class Interp:
         return host()
 
     def _make_host_coroutine(self, func, local):
-        inner = self._exec_body(func.body, local)
+        body = _pg_read_ufunc_blob(func._blob)[1]
+        inner = self._exec_body(body, local)
         async def host():
             sent = None
             try:
@@ -2614,7 +2778,7 @@ def _decode_const(c):
     raise ValueError("unknown const tag: " + t)
 
 
-def _build_accessor(strings, consts, island_aux=None):
+def _build_accessor(strings, consts):
     """v6.5 / C12+C17 — construct the opaque (kind, idx) accessor.
 
     SECURITY MODEL (post-decryption leak defense):
@@ -2668,25 +2832,13 @@ def _build_accessor(strings, consts, island_aux=None):
         b = _pg_pack_const(c)
         _c_offs.append((len(_c_plain), len(b)))
         _c_plain.extend(b)
-    _i_offs = {}
-    _i_plain = bytearray()
-    if isinstance(island_aux, dict):
-        _iaux = island_aux.items()
-    else:
-        _iaux = island_aux or ()
-    for ident, aux in _iaux:
-        b = _PGBT(aux)
-        _i_offs[int(ident) & 0xFFFFFFFF] = (len(_i_plain), len(b))
-        _i_plain.extend(b)
     _s_ct = _PGBT(b ^ _xk[i % _xkl] for i, b in enumerate(_s_plain))
     _c_ct = _PGBT(b ^ _xk[i % _xkl] for i, b in enumerate(_c_plain))
-    _i_ct = _PGBT(b ^ _xk[i % _xkl] for i, b in enumerate(_i_plain))
     _s_offs_t = tuple(_s_offs)
     _c_offs_t = tuple(_c_offs)
-    _i_offs_t = dict(_i_offs)
     _bw = _pg_env_w()
     # Scrub plaintext locals before closure is built.
-    del _s_plain, _c_plain, _i_plain, _s_offs, _c_offs, _i_offs, strings, consts, island_aux
+    del _s_plain, _c_plain, _s_offs, _c_offs, strings, consts
 
     def _a(kind, idx):
         delta = _bw ^ _pg_env_w()
@@ -2705,10 +2857,6 @@ def _build_accessor(strings, consts, island_aux=None):
             pt = _PGBT(_c_ct[start + i] ^ _xk[(start + i) % _xkl] ^ delta
                        for i in range(length))
             return _pg_unpack_const(pt, 0)[0]
-        if kind == 2:
-            start, length = _i_offs_t[int(idx) & 0xFFFFFFFF]
-            return _PGBT(_i_ct[start + i] ^ _xk[(start + i) % _xkl] ^ delta
-                         for i in range(length))
         raise LookupError(kind)
     return _a
 
@@ -2719,7 +2867,7 @@ def run_blob(blob, module_name='__main__'):
     Strips noise bytes and reverses rolling XOR before parsing. The
     seed and noise schedule are injected as globals by stage2.
     """
-    global _S_K, _S_RT, _S_M, _S_L
+    global _S_K, _S_RT, _S_M, _S_L, _S_IS
     g = globals()
     # Internalize schema from _PG_* globals → private module vars, then wipe.
     # This prevents frame-walk attacks from extracting schema by known names.
@@ -2727,6 +2875,7 @@ def run_blob(blob, module_name='__main__'):
     _S_RT = dict(g.pop('_PG_RTAGS', {}))
     _S_M = _PGBT(g.pop('_PG_MASK', ()))
     _S_L = dict(g.pop('_PG_LAYOUTS', {}))
+    _S_IS = _pg_schema_island_secret(_S_M, _S_K, _S_RT, _S_L)
     g.pop('_PG_TAGS', None)
     # --- undo noise injection + rolling XOR ---
     _ns = g.pop('_PG_NOISE_SCHEDULE', None)
@@ -2739,7 +2888,7 @@ def run_blob(blob, module_name='__main__'):
     # ------------------------------------------------
     loaded = _pg_parse_bin(blob)
     consts = tuple(_decode_const(c) for c in loaded[1])
-    _acc = _build_accessor(loaded[0], consts, {})
+    _acc = _build_accessor(loaded[0], consts)
     interp = Interp(_acc)
     tree = loaded[2]
     del loaded, blob, consts
@@ -2779,7 +2928,7 @@ def _pg_scrub_post_run(_acc, _interp):
     except Exception:
         pass
     _g = globals()
-    for _n in ('_S_K', '_S_RT', '_S_M', '_S_L'):
+    for _n in ('_S_K', '_S_RT', '_S_M', '_S_L', '_S_IS'):
         _g.pop(_n, None)
     try:
         _PG_IMP.clear()
@@ -2799,10 +2948,10 @@ def _pg_scrub_post_run(_acc, _interp):
 def _pg_boot(*_a):
     """PyGuard interpreter entry point.
 
-    Signature (9..13 positional args, no stage2 callables):
+    Signature (9..12 positional args, no stage2 callables):
       schema_ct, schema_label, ir_ct, ir_label, seed, interp_hash,
       env_hash, pep, profile[, module_name='__main__'[, builtins_snapshot
-      [, import_pairs[, island_aux]]]]
+      [, import_pairs]]]
 
     All stage2-supplied "config" is inert bytes: a 32-byte `pep` pepper,
     and a 15-byte `profile` struct (rounds, rot_mod, sbx_nudge,
@@ -2816,7 +2965,6 @@ def _pg_boot(*_a):
     """
     _bi_snap = None
     _imp_lut = None
-    _island_aux = None
     if len(_a) == 9:
         (schema_ct, schema_label, ir_ct, ir_label, seed,
          interp_hash, env_hash, pep, profile) = _a
@@ -2830,12 +2978,8 @@ def _pg_boot(*_a):
     elif len(_a) == 12:
         (schema_ct, schema_label, ir_ct, ir_label, seed,
          interp_hash, env_hash, pep, profile, module_name, _bi_snap, _imp_lut) = _a
-    elif len(_a) == 13:
-        (schema_ct, schema_label, ir_ct, ir_label, seed,
-         interp_hash, env_hash, pep, profile, module_name, _bi_snap, _imp_lut,
-         _island_aux) = _a
     else:
-        raise TypeError("_pg_boot: expected 9..13 args, got " + str(len(_a)))
+        raise TypeError("_pg_boot: expected 9..12 args, got " + str(len(_a)))
     del _a
     global _PG_BI, _PG_IMP
     if isinstance(_bi_snap, dict):
@@ -2847,18 +2991,8 @@ def _pg_boot(*_a):
             _PG_IMP = {k: v for k, v in _imp_lut}
         except Exception:
             _PG_IMP = {}
-    if isinstance(_island_aux, dict):
-        _island_aux_lut = _island_aux
-    elif isinstance(_island_aux, (tuple, list)):
-        try:
-            _island_aux_lut = {int(k) & 0xFFFFFFFF: _PGBT(v) for k, v in _island_aux}
-        except Exception:
-            _island_aux_lut = {}
-    else:
-        _island_aux_lut = {}
     del _bi_snap
     del _imp_lut
-    del _island_aux
 
     # Unpack the 15-byte profile struct (layout must match TS emission
     # in lib/obfuscate.ts / lib/v5/assemble.ts).
@@ -2869,7 +3003,7 @@ def _pg_boot(*_a):
     _rot_label = _PGBT(profile[7:11])
     _sbx_label = _PGBT(profile[11:15])
 
-    global _S_K, _S_RT, _S_M, _S_L
+    global _S_K, _S_RT, _S_M, _S_L, _S_IS
     import hashlib as _h
     import zlib as _z
 
@@ -2928,6 +3062,7 @@ def _pg_boot(*_a):
             _fn = _sb[_o:_o + _fl].decode('utf-8'); _o += _fl
             _fmap[_fn] = _j + 1
         _S_L[_tag] = _fmap
+    _S_IS = _pg_schema_island_secret(_S_M, _S_K, _S_RT, _S_L)
     del _sb, _o, _ml, _bk_lo, _bk_hi, _nc
     try:
         del _pos, _ln, _kc, _kl, _k, _vl, _v, _tc, _lc, _tl, _tag, _fc, _fmap, _fl, _fn, _j
@@ -2957,10 +3092,10 @@ def _pg_boot(*_a):
     # v6.5 / C17: _build_accessor packs and XOR-encrypts the strings +
     # consts at this point. The closure cells of `_a` hold only
     # ciphertext + offset tables; plaintext tuples never reach closure.
-    _acc = _build_accessor(loaded[0], _consts, _island_aux_lut)
+    _acc = _build_accessor(loaded[0], _consts)
     interp = Interp(_acc)
     tree = loaded[2]
-    del loaded, blob, _consts, _island_aux_lut
+    del loaded, blob, _consts
     try:
         interp.run(tree, module_name)
     finally:

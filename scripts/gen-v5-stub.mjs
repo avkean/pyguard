@@ -216,25 +216,15 @@ const args = parseArgs(process.argv);
 const userSource = fs.readFileSync(args.src, 'utf-8');
 const schema = makeV5Schema();
 
-// Discover Python build toolchains. Each stub embeds per-minor marshal
-// blobs for every (major, minor) found here, wrapped in a PGMV multi-
-// version container. The runtime scans the container for its own
-// sys.version_info and fails closed (silent exit) if no entry matches.
-//
-// Priority order:
-//   1. PYGUARD_PYTHON_BINS env var (':'-separated list of python binaries)
-//   2. Auto-discovery across homebrew / system / ~/.local paths for
-//      CPython minors 3.9..3.14.
-// The discovered set is deduplicated by (major, minor); the first binary
-// reporting a given minor wins.
+// Discover Python build toolchains. v5 now needs only one local Python:
+// build_ir.py emits the decisive IR, and the generic bootstrap/runtime
+// layers ship as compressed source instead of per-minor marshal blobs.
 const pythons = discoverPythonsHelper();
 if (pythons.length === 0) {
     console.error('gen-v5-stub: no Python build toolchains discovered');
     process.exit(3);
 }
-console.error(`gen-v5-stub: embedding marshal blobs for Python ${pythons.map((p) => `${p.major}.${p.minor}`).join(', ')}`);
-// Any of the discovered Pythons is fine for the IR JSON step — the IR is
-// marshal-independent (plain JSON). Pick the first.
+console.error(`gen-v5-stub: using ${pythons[0].bin} for IR/source packaging`);
 const buildIrPython = pythons[0].bin;
 
 // Step 1: compile IR via build_ir.py.
@@ -258,19 +248,6 @@ const irArtifacts = JSON.parse(py.stdout.trim());
 // stripping (the re-export graph ends up empty). Dynamic import via tsx
 // works correctly.
 //
-// Build tagged multi-version marshal blobs (PGMV) for stage1 / stage2 /
-// interpreter. Each PGMV bundle contains per-minor marshal payloads for
-// every Python build toolchain discovered above. At runtime the stub
-// scans the bundle for a (major, minor) entry matching the executing
-// CPython and silently exits if no entry matches.
-//
-// Format:
-//   b'PGMV' + <1-byte entry count> +
-//       N × (major:1 + minor:1 + len:4LE + marshal_bytes)
-//
-// marshal_bytes is raw `marshal.dumps(compile(source, filename, 'exec'))`
-// for that minor — no nested tag. Audit hooks still observe exactly one
-// `marshal.loads` event per stage, on the matching entry's bytes only.
 const driver = `
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
@@ -278,73 +255,11 @@ const { obfuscatePythonCode } = await import('./lib/obfuscate.ts');
 const { INTERPRETER_SRC_B64 } = await import('./lib/v5/interpreter_src.ts');
 const fs = await import('node:fs');
 
-const PYTHON_BUILDS = ${JSON.stringify(pythons.map((p) => ({ bin: p.bin, major: p.major, minor: p.minor })))};
-const BUILD_IR_PATH = ${JSON.stringify(path.join(root, 'lib/v5/build_ir.py').replace(/\\/g, '\\\\'))};
-
-function compileAndMarshalOne(pythonBin, source, filename) {
-    const r = spawnSync(pythonBin, [BUILD_IR_PATH], {
-        input: source,
-        encoding: 'utf-8',
-        env: {
-            ...process.env,
-            PYGUARD_MODE: 'marshal',
-            PYGUARD_FILENAME: filename || '<pg>',
-        },
-        maxBuffer: 64 * 1024 * 1024,
-    });
-    if (r.status !== 0) {
-        throw new Error('compile_and_marshal subprocess (' + pythonBin + ') failed: ' + r.stderr);
-    }
-    const buf = Buffer.from(r.stdout.trim(), 'base64');
-    // build_ir outputs b'PGM1' + major + minor + marshal.dumps(code).
-    // Validate and strip the 6-byte tag; PGMV stores raw marshal bytes.
-    if (buf.length < 6 || buf[0] !== 0x50 || buf[1] !== 0x47 || buf[2] !== 0x4d || buf[3] !== 0x31) {
-        throw new Error('compile_and_marshal: missing PGM1 tag from ' + pythonBin);
-    }
-    return { major: buf[4], minor: buf[5], bytes: Uint8Array.from(buf.subarray(6)) };
-}
-
-function packPGMV(entries) {
-    // entries: [{major, minor, bytes}]
-    if (entries.length === 0 || entries.length > 255) {
-        throw new Error('packPGMV: invalid entry count ' + entries.length);
-    }
-    let total = 5;
-    for (const e of entries) total += 6 + e.bytes.length;
-    const out = new Uint8Array(total);
-    out[0] = 0x50; out[1] = 0x47; out[2] = 0x4d; out[3] = 0x56; // 'PGMV'
-    out[4] = entries.length;
-    let off = 5;
-    for (const e of entries) {
-        out[off] = e.major; out[off+1] = e.minor;
-        const L = e.bytes.length;
-        out[off+2] = L & 0xff;
-        out[off+3] = (L >>> 8) & 0xff;
-        out[off+4] = (L >>> 16) & 0xff;
-        out[off+5] = (L >>> 24) & 0xff;
-        off += 6;
-        out.set(e.bytes, off);
-        off += e.bytes.length;
-    }
-    return out;
-}
-
-function compileAndMarshal(source, filename) {
-    const entries = [];
-    const seen = new Set();
-    for (const b of PYTHON_BUILDS) {
-        const entry = compileAndMarshalOne(b.bin, source, filename);
-        const key = entry.major + '.' + entry.minor;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        entries.push(entry);
-    }
-    return packPGMV(entries);
-}
+const PYTHON_BIN = ${JSON.stringify(buildIrPython)};
 
 function lzmaCompress(bytes) {
     const r = spawnSync(
-        PYTHON_BUILDS[0].bin,
+        PYTHON_BIN,
         ['-c', 'import sys, lzma; sys.stdout.buffer.write(lzma.compress(sys.stdin.buffer.read(), preset=9|lzma.PRESET_EXTREME))'],
         { input: Buffer.from(bytes), maxBuffer: 256 * 1024 * 1024 },
     );
@@ -353,16 +268,14 @@ function lzmaCompress(bytes) {
 }
 
 const interpSrcBytes = zlib.inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, 'base64'));
-const interpMarshalRaw = compileAndMarshal(interpSrcBytes.toString('utf-8'), '<pg_interp>');
-const interpMarshalCompressed = lzmaCompress(interpMarshalRaw);
+const interpreterSourceCompressed = lzmaCompress(interpSrcBytes);
 
 const userSource = fs.readFileSync(${JSON.stringify(args.src)}, 'utf-8');
 const compressed = Uint8Array.from(Buffer.from(${JSON.stringify(irArtifacts.compressed)}, 'base64'));
 const manifest = Uint8Array.from(Buffer.from(${JSON.stringify(irArtifacts.manifest)}, 'base64'));
 const stub = obfuscatePythonCode(userSource, {
     v5IR: { compressed, manifest, schema: ${JSON.stringify(schema)} },
-    compileAndMarshal,
-    interpreterMarshalCompressed: interpMarshalCompressed,
+    interpreterSourceCompressed,
     compress: lzmaCompress,
 });
 process.stdout.write(stub);
