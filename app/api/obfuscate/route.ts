@@ -5,7 +5,7 @@ import path from "node:path";
 import { obfuscatePythonCode } from "@/lib/obfuscate";
 import { makeV5Schema } from "@/lib/v5/schema";
 import { INTERPRETER_SRC_B64 } from "@/lib/v5/interpreter_src";
-import { discoverPythons } from "@/scripts/multi_marshal.mjs";
+import { createCompileAndPackCode, discoverPythons } from "@/scripts/multi_marshal.mjs";
 import { createRateLimiter, clientIp } from "@/lib/rateLimit";
 
 // ---------------------------------------------------------------------------
@@ -226,19 +226,20 @@ export async function POST(req: NextRequest) {
         );
     }
 
-    // 4. LZMA-compress the interpreter SOURCE. Stage2 decrypts and execs
-    //    this source directly — no marshal.loads boundary.
-    let interpreterSourceCompressed: Uint8Array;
+    // 4. Prepare the interpreter source and the code-pack compiler used
+    //    by stage1 / stage2 / interpreter packaging.
+    let interpreterSource = "";
     const compress = makeLzmaCompressor(pythons[0].bin);
+    const compileAndPackCode = createCompileAndPackCode(pythons);
     try {
         const interpSrcBytes = zlib.inflateRawSync(
             Buffer.from(INTERPRETER_SRC_B64, "base64"),
         );
-        interpreterSourceCompressed = compress(Uint8Array.from(interpSrcBytes));
+        interpreterSource = Buffer.from(interpSrcBytes).toString("utf8");
     } catch (e) {
         return jsonError(
             500,
-            `interpreter compress failed: ${
+            `interpreter prepare failed: ${
                 e instanceof Error ? e.message : String(e)
             }`,
         );
@@ -257,7 +258,8 @@ export async function POST(req: NextRequest) {
                 ),
                 schema,
             },
-            interpreterSourceCompressed,
+            interpreterSource,
+            compileAndPackCode,
             compress,
         });
     } catch (e) {

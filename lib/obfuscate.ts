@@ -410,6 +410,515 @@ function bytesArrayLit(b: Uint8Array): string {
     return "[" + Array.from(b).join(", ") + "]";
 }
 
+function indentBlock(src: string, pad: string): string {
+    return src
+        .split("\n")
+        .map((line) => (line.length ? pad + line : line))
+        .join("\n");
+}
+
+type PackedCodeNode =
+    | { kind: "none" }
+    | { kind: "true" }
+    | { kind: "false" }
+    | { kind: "ellipsis" }
+    | { kind: "int"; bytes: Uint8Array }
+    | { kind: "float"; bytes: Uint8Array }
+    | { kind: "complex"; bytes: Uint8Array }
+    | { kind: "bytes"; bytes: Uint8Array }
+    | { kind: "str"; utf8: Uint8Array }
+    | { kind: "tuple"; items: PackedCodeNode[] }
+    | { kind: "frozenset"; items: PackedCodeNode[] }
+    | { kind: "slice"; items: [PackedCodeNode, PackedCodeNode, PackedCodeNode] }
+    | { kind: "code"; fields: PackedCodeNode[] };
+
+interface Stage1BundleEntry {
+    major: number;
+    minor: number;
+    node: PackedCodeNode;
+}
+
+interface Stage1TagMap {
+    none: number;
+    true: number;
+    false: number;
+    int: number;
+    float: number;
+    complex: number;
+    bytes: number;
+    str: number;
+    tuple: number;
+    frozenset: number;
+    ellipsis: number;
+    code: number;
+    slice: number;
+}
+
+interface Stage1BundleConfig {
+    magic: Uint8Array;
+    countXor: number;
+    majorXor: number;
+    minorXor: number;
+    lenMask: Uint8Array;
+    intMask: number;
+    floatMask: number;
+    complexMask: number;
+    bytesMask: number;
+    strMask: number;
+    tags: Stage1TagMap;
+    codeFieldOrder: number[];
+}
+
+function readU32LE(buf: Uint8Array, off: number): number {
+    if (off + 4 > buf.length) {
+        throw new Error("packed-code parse overflow");
+    }
+    return (
+        buf[off] |
+        (buf[off + 1] << 8) |
+        (buf[off + 2] << 16) |
+        (buf[off + 3] << 24)
+    ) >>> 0;
+}
+
+function parsePackedCodeNode(
+    buf: Uint8Array,
+    off: number,
+): { node: PackedCodeNode; off: number } {
+    if (off >= buf.length) {
+        throw new Error("packed-code parse overflow");
+    }
+    const tag = buf[off++];
+    if (tag === 0) return { node: { kind: "none" }, off };
+    if (tag === 1) return { node: { kind: "true" }, off };
+    if (tag === 2) return { node: { kind: "false" }, off };
+    if (tag === 10) return { node: { kind: "ellipsis" }, off };
+    if (tag === 3) {
+        const len = readU32LE(buf, off);
+        off += 4;
+        if (off + len > buf.length) throw new Error("packed-code int overflow");
+        return { node: { kind: "int", bytes: buf.slice(off, off + len) }, off: off + len };
+    }
+    if (tag === 4) {
+        if (off + 8 > buf.length) throw new Error("packed-code float overflow");
+        return { node: { kind: "float", bytes: buf.slice(off, off + 8) }, off: off + 8 };
+    }
+    if (tag === 5) {
+        if (off + 16 > buf.length) throw new Error("packed-code complex overflow");
+        return { node: { kind: "complex", bytes: buf.slice(off, off + 16) }, off: off + 16 };
+    }
+    if (tag === 6) {
+        const len = readU32LE(buf, off);
+        off += 4;
+        if (off + len > buf.length) throw new Error("packed-code bytes overflow");
+        return { node: { kind: "bytes", bytes: buf.slice(off, off + len) }, off: off + len };
+    }
+    if (tag === 7) {
+        const len = readU32LE(buf, off);
+        off += 4;
+        if (off + len > buf.length) throw new Error("packed-code str overflow");
+        return { node: { kind: "str", utf8: buf.slice(off, off + len) }, off: off + len };
+    }
+    if (tag === 8 || tag === 9) {
+        const len = readU32LE(buf, off);
+        off += 4;
+        const items: PackedCodeNode[] = [];
+        for (let i = 0; i < len; i++) {
+            const parsed = parsePackedCodeNode(buf, off);
+            items.push(parsed.node);
+            off = parsed.off;
+        }
+        return {
+            node: tag === 8
+                ? { kind: "tuple", items }
+                : { kind: "frozenset", items },
+            off,
+        };
+    }
+    if (tag === 12) {
+        const parsed = parsePackedCodeNode(buf, off);
+        off = parsed.off;
+        if (parsed.node.kind !== "tuple" || parsed.node.items.length !== 3) {
+            throw new Error("packed-code slice payload malformed");
+        }
+        return {
+            node: {
+                kind: "slice",
+                items: [
+                    parsed.node.items[0],
+                    parsed.node.items[1],
+                    parsed.node.items[2],
+                ],
+            },
+            off,
+        };
+    }
+    if (tag === 11) {
+        const parsed = parsePackedCodeNode(buf, off);
+        off = parsed.off;
+        if (parsed.node.kind !== "tuple" || parsed.node.items.length !== 17) {
+            throw new Error("packed-code code payload malformed");
+        }
+        return { node: { kind: "code", fields: parsed.node.items }, off };
+    }
+    throw new Error(`packed-code tag unsupported: ${tag}`);
+}
+
+function parsePGCVCodePack(buf: Uint8Array): Stage1BundleEntry[] {
+    if (
+        buf.length < 5 ||
+        buf[0] !== 0x50 ||
+        buf[1] !== 0x47 ||
+        buf[2] !== 0x43 ||
+        buf[3] !== 0x56
+    ) {
+        throw new Error("stage1 code-pack missing PGCV tag");
+    }
+    const count = buf[4];
+    const out: Stage1BundleEntry[] = [];
+    let off = 5;
+    for (let i = 0; i < count; i++) {
+        if (off + 6 > buf.length) {
+            throw new Error("stage1 code-pack entry overflow");
+        }
+        const major = buf[off];
+        const minor = buf[off + 1];
+        const len = readU32LE(buf, off + 2);
+        off += 6;
+        if (off + len > buf.length) {
+            throw new Error("stage1 code-pack payload overflow");
+        }
+        const payload = buf.slice(off, off + len);
+        off += len;
+        const parsed = parsePackedCodeNode(payload, 0);
+        if (parsed.off !== payload.length || parsed.node.kind !== "code") {
+            throw new Error("stage1 code-pack payload malformed");
+        }
+        out.push({ major, minor, node: parsed.node });
+    }
+    if (off !== buf.length) {
+        throw new Error("stage1 code-pack trailing garbage");
+    }
+    return out;
+}
+
+function randomNonZeroByte(): number {
+    return 1 + (randomBytes(1)[0] % 255);
+}
+
+function makeStage1BundleConfig(): Stage1BundleConfig {
+    const tags = Array.from({ length: 256 }, (_, i) => i);
+    shuffleArr(tags);
+    const codeFieldOrder = Array.from({ length: 17 }, (_, i) => i);
+    shuffleArr(codeFieldOrder);
+    let magic = randomBytes(4);
+    if (
+        magic[0] === 0x50 &&
+        magic[1] === 0x47 &&
+        magic[2] === 0x43 &&
+        magic[3] === 0x56
+    ) {
+        magic = randomBytes(4);
+    }
+    return {
+        magic,
+        countXor: randomNonZeroByte(),
+        majorXor: randomNonZeroByte(),
+        minorXor: randomNonZeroByte(),
+        lenMask: randomBytes(4),
+        intMask: randomNonZeroByte(),
+        floatMask: randomNonZeroByte(),
+        complexMask: randomNonZeroByte(),
+        bytesMask: randomNonZeroByte(),
+        strMask: randomNonZeroByte(),
+        tags: {
+            none: tags[0],
+            true: tags[1],
+            false: tags[2],
+            int: tags[3],
+            float: tags[4],
+            complex: tags[5],
+            bytes: tags[6],
+            str: tags[7],
+            tuple: tags[8],
+            frozenset: tags[9],
+            ellipsis: tags[10],
+            code: tags[11],
+            slice: tags[12],
+        },
+        codeFieldOrder,
+    };
+}
+
+function pushMaskedU32LE(out: number[], n: number, mask: Uint8Array): void {
+    out.push((n & 0xff) ^ mask[0]);
+    out.push(((n >>> 8) & 0xff) ^ mask[1]);
+    out.push(((n >>> 16) & 0xff) ^ mask[2]);
+    out.push(((n >>> 24) & 0xff) ^ mask[3]);
+}
+
+function pushXorBytes(out: number[], buf: Uint8Array, mask: number): void {
+    for (let i = 0; i < buf.length; i++) out.push(buf[i] ^ mask);
+}
+
+function encodeStage1Node(
+    node: PackedCodeNode,
+    cfg: Stage1BundleConfig,
+    out: number[],
+): void {
+    if (node.kind === "none") {
+        out.push(cfg.tags.none);
+        return;
+    }
+    if (node.kind === "true") {
+        out.push(cfg.tags.true);
+        return;
+    }
+    if (node.kind === "false") {
+        out.push(cfg.tags.false);
+        return;
+    }
+    if (node.kind === "ellipsis") {
+        out.push(cfg.tags.ellipsis);
+        return;
+    }
+    if (node.kind === "int") {
+        out.push(cfg.tags.int);
+        pushMaskedU32LE(out, node.bytes.length, cfg.lenMask);
+        pushXorBytes(out, node.bytes, cfg.intMask);
+        return;
+    }
+    if (node.kind === "float") {
+        out.push(cfg.tags.float);
+        pushXorBytes(out, node.bytes, cfg.floatMask);
+        return;
+    }
+    if (node.kind === "complex") {
+        out.push(cfg.tags.complex);
+        pushXorBytes(out, node.bytes, cfg.complexMask);
+        return;
+    }
+    if (node.kind === "bytes") {
+        out.push(cfg.tags.bytes);
+        pushMaskedU32LE(out, node.bytes.length, cfg.lenMask);
+        pushXorBytes(out, node.bytes, cfg.bytesMask);
+        return;
+    }
+    if (node.kind === "str") {
+        out.push(cfg.tags.str);
+        pushMaskedU32LE(out, node.utf8.length, cfg.lenMask);
+        pushXorBytes(out, node.utf8, cfg.strMask);
+        return;
+    }
+    if (node.kind === "tuple" || node.kind === "frozenset") {
+        out.push(node.kind === "tuple" ? cfg.tags.tuple : cfg.tags.frozenset);
+        pushMaskedU32LE(out, node.items.length, cfg.lenMask);
+        for (const item of node.items) encodeStage1Node(item, cfg, out);
+        return;
+    }
+    if (node.kind === "slice") {
+        out.push(cfg.tags.slice);
+        for (const item of node.items) encodeStage1Node(item, cfg, out);
+        return;
+    }
+    out.push(cfg.tags.code);
+    for (const idx of cfg.codeFieldOrder) {
+        encodeStage1Node(node.fields[idx], cfg, out);
+    }
+}
+
+function packStage1Bundle(
+    entries: Stage1BundleEntry[],
+    cfg: Stage1BundleConfig,
+): Uint8Array {
+    const encodedEntries = entries.map((entry) => {
+        const chunks: number[] = [];
+        encodeStage1Node(entry.node, cfg, chunks);
+        return {
+            major: entry.major,
+            minor: entry.minor,
+            bytes: Uint8Array.from(chunks),
+        };
+    });
+    shuffleArr(encodedEntries);
+    let total = 5;
+    for (const entry of encodedEntries) total += 6 + entry.bytes.length;
+    const out = new Uint8Array(total);
+    out.set(cfg.magic, 0);
+    out[4] = encodedEntries.length ^ cfg.countXor;
+    let off = 5;
+    for (const entry of encodedEntries) {
+        out[off] = entry.major ^ cfg.majorXor;
+        out[off + 1] = entry.minor ^ cfg.minorXor;
+        const len = entry.bytes.length >>> 0;
+        out[off + 2] = (len & 0xff) ^ cfg.lenMask[0];
+        out[off + 3] = ((len >>> 8) & 0xff) ^ cfg.lenMask[1];
+        out[off + 4] = ((len >>> 16) & 0xff) ^ cfg.lenMask[2];
+        out[off + 5] = ((len >>> 24) & 0xff) ^ cfg.lenMask[3];
+        off += 6;
+        out.set(entry.bytes, off);
+        off += entry.bytes.length;
+    }
+    return out;
+}
+
+interface Stage1LoaderNames {
+    dec: string;
+    load: string;
+    buf: string;
+    ofs: string;
+    tag: string;
+    len: string;
+    tmp: string;
+    vals: string;
+    sel: string;
+    cnt: string;
+    mj: string;
+    mn: string;
+    obj: string;
+    end: string;
+    tpl: string;
+    kw: string;
+}
+
+function buildStage1LoaderSource(
+    names: Stage1LoaderNames,
+    cfg: Stage1BundleConfig,
+): string {
+    const readLen =
+        `((${names.buf}[${names.ofs}] ^ ${cfg.lenMask[0]}) | ` +
+        `((${names.buf}[${names.ofs} + 1] ^ ${cfg.lenMask[1]}) << 8) | ` +
+        `((${names.buf}[${names.ofs} + 2] ^ ${cfg.lenMask[2]}) << 16) | ` +
+        `((${names.buf}[${names.ofs} + 3] ^ ${cfg.lenMask[3]}) << 24))`;
+    const codeAssignments = cfg.codeFieldOrder.map((fieldIdx) =>
+        `        ${names.tmp}, ${names.ofs} = ${names.dec}(${names.buf}, ${names.ofs})
+        ${names.vals}[${fieldIdx}] = ${names.tmp}`,
+    ).join("\n");
+    return `
+def ${names.dec}(${names.buf}, ${names.ofs}=0):
+    ${names.tag} = ${names.buf}[${names.ofs}]
+    ${names.ofs} += 1
+    if ${names.tag} == ${cfg.tags.none}:
+        return None, ${names.ofs}
+    if ${names.tag} == ${cfg.tags.true}:
+        return True, ${names.ofs}
+    if ${names.tag} == ${cfg.tags.false}:
+        return False, ${names.ofs}
+    if ${names.tag} == ${cfg.tags.ellipsis}:
+        return Ellipsis, ${names.ofs}
+    if ${names.tag} == ${cfg.tags.int}:
+        ${names.len} = ${readLen}
+        ${names.ofs} += 4
+        ${names.tmp} = bytes((b ^ ${cfg.intMask}) for b in ${names.buf}[${names.ofs}:${names.ofs} + ${names.len}])
+        ${names.ofs} += ${names.len}
+        return int.from_bytes(${names.tmp}, 'little', signed=True), ${names.ofs}
+    if ${names.tag} == ${cfg.tags.float}:
+        ${names.tmp} = bytes((b ^ ${cfg.floatMask}) for b in ${names.buf}[${names.ofs}:${names.ofs} + 8])
+        ${names.ofs} += 8
+        return struct.unpack('<d', ${names.tmp})[0], ${names.ofs}
+    if ${names.tag} == ${cfg.tags.complex}:
+        ${names.tmp} = bytes((b ^ ${cfg.complexMask}) for b in ${names.buf}[${names.ofs}:${names.ofs} + 16])
+        ${names.ofs} += 16
+        ${names.vals} = struct.unpack('<dd', ${names.tmp})
+        return complex(${names.vals}[0], ${names.vals}[1]), ${names.ofs}
+    if ${names.tag} == ${cfg.tags.bytes}:
+        ${names.len} = ${readLen}
+        ${names.ofs} += 4
+        ${names.tmp} = bytes((b ^ ${cfg.bytesMask}) for b in ${names.buf}[${names.ofs}:${names.ofs} + ${names.len}])
+        ${names.ofs} += ${names.len}
+        return ${names.tmp}, ${names.ofs}
+    if ${names.tag} == ${cfg.tags.str}:
+        ${names.len} = ${readLen}
+        ${names.ofs} += 4
+        ${names.tmp} = bytes((b ^ ${cfg.strMask}) for b in ${names.buf}[${names.ofs}:${names.ofs} + ${names.len}])
+        ${names.ofs} += ${names.len}
+        return ${names.tmp}.decode('utf-8'), ${names.ofs}
+    if ${names.tag} == ${cfg.tags.tuple}:
+        ${names.len} = ${readLen}
+        ${names.ofs} += 4
+        ${names.vals} = []
+        for _ in range(${names.len}):
+            ${names.tmp}, ${names.ofs} = ${names.dec}(${names.buf}, ${names.ofs})
+            ${names.vals}.append(${names.tmp})
+        return tuple(${names.vals}), ${names.ofs}
+    if ${names.tag} == ${cfg.tags.frozenset}:
+        ${names.len} = ${readLen}
+        ${names.ofs} += 4
+        ${names.vals} = []
+        for _ in range(${names.len}):
+            ${names.tmp}, ${names.ofs} = ${names.dec}(${names.buf}, ${names.ofs})
+            ${names.vals}.append(${names.tmp})
+        return frozenset(${names.vals}), ${names.ofs}
+    if ${names.tag} == ${cfg.tags.slice}:
+        ${names.vals} = []
+        for _ in range(3):
+            ${names.tmp}, ${names.ofs} = ${names.dec}(${names.buf}, ${names.ofs})
+            ${names.vals}.append(${names.tmp})
+        return slice(${names.vals}[0], ${names.vals}[1], ${names.vals}[2]), ${names.ofs}
+    if ${names.tag} == ${cfg.tags.code}:
+        ${names.vals} = [None] * 17
+${codeAssignments}
+        ${names.tpl} = (lambda: 0).__code__
+        ${names.kw} = {
+            'co_argcount': ${names.vals}[0],
+            'co_posonlyargcount': ${names.vals}[1],
+            'co_kwonlyargcount': ${names.vals}[2],
+            'co_nlocals': ${names.vals}[3],
+            'co_stacksize': ${names.vals}[4],
+            'co_flags': ${names.vals}[5],
+            'co_code': ${names.vals}[6],
+            'co_consts': ${names.vals}[7],
+            'co_names': ${names.vals}[8],
+            'co_varnames': ${names.vals}[9],
+            'co_filename': '',
+            'co_name': ${names.vals}[12],
+            'co_firstlineno': ${names.vals}[14],
+            'co_freevars': ${names.vals}[10],
+            'co_cellvars': ${names.vals}[11],
+        }
+        if hasattr(${names.tpl}, 'co_qualname'):
+            ${names.kw}['co_qualname'] = ${names.vals}[13]
+        if hasattr(${names.tpl}, 'co_linetable'):
+            ${names.kw}['co_linetable'] = ${names.vals}[15]
+        elif hasattr(${names.tpl}, 'co_lnotab'):
+            ${names.kw}['co_lnotab'] = ${names.vals}[15]
+        if hasattr(${names.tpl}, 'co_exceptiontable'):
+            ${names.kw}['co_exceptiontable'] = ${names.vals}[16]
+        return ${names.tpl}.replace(**${names.kw}), ${names.ofs}
+    raise ValueError(${names.tag})
+def ${names.load}(${names.buf}):
+    if len(${names.buf}) < 5 or ${names.buf}[:4] != bytes(${bytesArrayLit(cfg.magic)}):
+        sys.exit(0)
+    ${names.cnt} = ${names.buf}[4] ^ ${cfg.countXor}
+    ${names.ofs} = 5
+    ${names.sel} = None
+    for _ in range(${names.cnt}):
+        if ${names.ofs} + 6 > len(${names.buf}):
+            sys.exit(0)
+        ${names.mj} = ${names.buf}[${names.ofs}] ^ ${cfg.majorXor}
+        ${names.mn} = ${names.buf}[${names.ofs} + 1] ^ ${cfg.minorXor}
+        ${names.len} = ((${names.buf}[${names.ofs} + 2] ^ ${cfg.lenMask[0]}) |
+            ((${names.buf}[${names.ofs} + 3] ^ ${cfg.lenMask[1]}) << 8) |
+            ((${names.buf}[${names.ofs} + 4] ^ ${cfg.lenMask[2]}) << 16) |
+            ((${names.buf}[${names.ofs} + 5] ^ ${cfg.lenMask[3]}) << 24))
+        ${names.ofs} += 6
+        if ${names.ofs} + ${names.len} > len(${names.buf}):
+            sys.exit(0)
+        if ${names.mj} == (sys.version_info.major & 255) and ${names.mn} == (sys.version_info.minor & 255):
+            ${names.sel} = ${names.buf}[${names.ofs}:${names.ofs} + ${names.len}]
+        ${names.ofs} += ${names.len}
+    if ${names.sel} is None:
+        sys.exit(0)
+    try:
+        ${names.obj}, ${names.end} = ${names.dec}(${names.sel}, 0)
+    except Exception:
+        sys.exit(0)
+    if ${names.end} != len(${names.sel}) or not isinstance(${names.obj}, type((lambda: 0).__code__)):
+        sys.exit(0)
+    return ${names.obj}
+`;
+}
+
 // ---------------------------------------------------------------------------
 // Anti-LLM obfuscation helpers.
 // ---------------------------------------------------------------------------
@@ -730,7 +1239,7 @@ import {
     serializeIR,
 } from './v5/assemble';
 import type { V5IR } from './v5/assemble';
-import { INTERPRETER_SRC_B64, BOOT_KEY_BYTES } from './v5/interpreter_src';
+import { BOOT_FUNC_NAME, BOOT_KEY_BYTES } from './v5/interpreter_src';
 
 export interface ObfuscateOpts {
     // When provided, uses the v5 AST-walking interpreter path:
@@ -739,12 +1248,14 @@ export interface ObfuscateOpts {
     // never sees user source. Build the IR with lib/v5/build_ir.py
     // (in Pyodide for browser, or via subprocess for Node testing).
     v5IR?: V5IR;
-    // LZMA-compressed interpreter SOURCE bytes. Stage2 decrypts, compiles,
-    // and execs this generic runtime source instead of calling marshal.loads
-    // on an executable blob.
-    interpreterSourceCompressed?: Uint8Array;
+    // Build-time interpreter source text. The v5 path compiles this into
+    // a per-version code-pack before encrypting it into the boot bundle.
+    interpreterSource?: string;
+    // Build-time compiler that turns Python source into a multi-version
+    // code-pack keyed by the target CPython minor.
+    compileAndPackCode?: (source: string, filename: string) => Uint8Array;
     // LZMA compressor (shelled out to Python on the build side). Used to
-    // squeeze the stage1 / stage2 / interpreter source payloads before
+    // squeeze the stage1 / stage2 / interpreter code-pack payloads before
     // encryption.
     compress?: (bytes: Uint8Array) => Uint8Array;
 }
@@ -905,6 +1416,36 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const n_pv_b     = ng.gen();
     const n_pv_l     = ng.gen();
     const n_pv_bytes = ng.gen();
+    const n_pv_sel   = ng.gen();
+    const n_cp_obj   = ng.gen();
+    const n_cp_end   = ng.gen();
+    const n_cp_dec   = ng.gen();
+    const n_cp_buf   = ng.gen();
+    const n_cp_ofs   = ng.gen();
+    const n_cp_tag   = ng.gen();
+    const n_cp_len   = ng.gen();
+    const n_cp_vals  = ng.gen();
+    const n_cp_tmp   = ng.gen();
+    const n_cp_kw    = ng.gen();
+    const n_cp_tpl   = ng.gen();
+    const n_loadc    = ng.gen();
+    const n_s1_dec   = ng.gen();
+    const n_s1_load  = ng.gen();
+    const n_s1_buf   = ng.gen();
+    const n_s1_ofs   = ng.gen();
+    const n_s1_tag   = ng.gen();
+    const n_s1_len   = ng.gen();
+    const n_s1_tmp   = ng.gen();
+    const n_s1_vals  = ng.gen();
+    const n_s1_sel   = ng.gen();
+    const n_s1_cnt   = ng.gen();
+    const n_s1_mj    = ng.gen();
+    const n_s1_mn    = ng.gen();
+    const n_s1_obj   = ng.gen();
+    const n_s1_end   = ng.gen();
+    const n_s1_tpl   = ng.gen();
+    const n_s1_kw    = ng.gen();
+    const n_s1_run   = ng.gen();
 
     // PGMV multi-version blob scan — stage1 body (matches stage2 payload)
     const s1_pv_n     = ng.gen();
@@ -967,6 +1508,36 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // every per-minor marshal blob (they were ~50 KB per version).
     const n_uc = ng.gen();
 
+    const stage1BundleConfig = opts && opts.v5IR
+        ? makeStage1BundleConfig()
+        : null;
+    const stage1LoaderSource = stage1BundleConfig
+        ? buildStage1LoaderSource(
+            {
+                dec: n_s1_dec,
+                load: n_s1_load,
+                buf: n_s1_buf,
+                ofs: n_s1_ofs,
+                tag: n_s1_tag,
+                len: n_s1_len,
+                tmp: n_s1_tmp,
+                vals: n_s1_vals,
+                sel: n_s1_sel,
+                cnt: n_s1_cnt,
+                mj: n_s1_mj,
+                mn: n_s1_mn,
+                obj: n_s1_obj,
+                end: n_s1_end,
+                tpl: n_s1_tpl,
+                kw: n_s1_kw,
+            },
+            stage1BundleConfig,
+        )
+        : "";
+    const stage1LoaderSourceIndented = stage1LoaderSource
+        ? indentBlock(stage1LoaderSource.trim(), "    ")
+        : "";
+
     const realChain = [
         `${n_pepSeed} = bytes(${bytesArrayLit(pepSeedBytes)})`,
         `${n_pepA} = hashlib.sha256(${n_pepSeed}).digest()`,
@@ -1026,10 +1597,125 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     // fails → SystemExit(0) before interpreter bytecode runs.
     const canonicalRegion =
 `${BEGIN_MARKER}
-import sys, hashlib, base64, marshal, lzma
+import sys, hashlib, base64, marshal, lzma, struct
 ${n_ftype} = (lambda: 0).__class__
 ${n_O} = ${bcap.tupleSource}
 ${n_gf} = ${n_O}[${bi['getattr']}](sys, '_getf' + 'rame')
+def ${n_cp_dec}(${n_cp_buf}, ${n_cp_ofs}=0):
+    ${n_cp_tag} = ${n_cp_buf}[${n_cp_ofs}]
+    ${n_cp_ofs} += 1
+    if ${n_cp_tag} == 0:
+        return None, ${n_cp_ofs}
+    if ${n_cp_tag} == 1:
+        return True, ${n_cp_ofs}
+    if ${n_cp_tag} == 2:
+        return False, ${n_cp_ofs}
+    if ${n_cp_tag} == 10:
+        return Ellipsis, ${n_cp_ofs}
+    if ${n_cp_tag} == 3:
+        ${n_cp_len} = int.from_bytes(${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + 4], 'little')
+        ${n_cp_ofs} += 4
+        ${n_cp_tmp} = int.from_bytes(${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + ${n_cp_len}], 'little', signed=True)
+        ${n_cp_ofs} += ${n_cp_len}
+        return ${n_cp_tmp}, ${n_cp_ofs}
+    if ${n_cp_tag} == 4:
+        ${n_cp_tmp} = struct.unpack('<d', ${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + 8])[0]
+        ${n_cp_ofs} += 8
+        return ${n_cp_tmp}, ${n_cp_ofs}
+    if ${n_cp_tag} == 5:
+        ${n_cp_vals} = struct.unpack('<dd', ${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + 16])
+        ${n_cp_ofs} += 16
+        return complex(${n_cp_vals}[0], ${n_cp_vals}[1]), ${n_cp_ofs}
+    if ${n_cp_tag} == 6:
+        ${n_cp_len} = int.from_bytes(${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + 4], 'little')
+        ${n_cp_ofs} += 4
+        ${n_cp_tmp} = bytes(${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + ${n_cp_len}])
+        ${n_cp_ofs} += ${n_cp_len}
+        return ${n_cp_tmp}, ${n_cp_ofs}
+    if ${n_cp_tag} == 7:
+        ${n_cp_len} = int.from_bytes(${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + 4], 'little')
+        ${n_cp_ofs} += 4
+        ${n_cp_tmp} = ${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + ${n_cp_len}].decode('utf-8')
+        ${n_cp_ofs} += ${n_cp_len}
+        return ${n_cp_tmp}, ${n_cp_ofs}
+    if ${n_cp_tag} == 8:
+        ${n_cp_len} = int.from_bytes(${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + 4], 'little')
+        ${n_cp_ofs} += 4
+        ${n_cp_vals} = []
+        for _ in range(${n_cp_len}):
+            ${n_cp_tmp}, ${n_cp_ofs} = ${n_cp_dec}(${n_cp_buf}, ${n_cp_ofs})
+            ${n_cp_vals}.append(${n_cp_tmp})
+        return tuple(${n_cp_vals}), ${n_cp_ofs}
+    if ${n_cp_tag} == 9:
+        ${n_cp_len} = int.from_bytes(${n_cp_buf}[${n_cp_ofs}:${n_cp_ofs} + 4], 'little')
+        ${n_cp_ofs} += 4
+        ${n_cp_vals} = []
+        for _ in range(${n_cp_len}):
+            ${n_cp_tmp}, ${n_cp_ofs} = ${n_cp_dec}(${n_cp_buf}, ${n_cp_ofs})
+            ${n_cp_vals}.append(${n_cp_tmp})
+        return frozenset(${n_cp_vals}), ${n_cp_ofs}
+    if ${n_cp_tag} == 12:
+        ${n_cp_vals}, ${n_cp_ofs} = ${n_cp_dec}(${n_cp_buf}, ${n_cp_ofs})
+        return slice(${n_cp_vals}[0], ${n_cp_vals}[1], ${n_cp_vals}[2]), ${n_cp_ofs}
+    if ${n_cp_tag} == 11:
+        ${n_cp_vals}, ${n_cp_ofs} = ${n_cp_dec}(${n_cp_buf}, ${n_cp_ofs})
+        ${n_cp_tpl} = (lambda: 0).__code__
+        ${n_cp_kw} = {
+            'co_argcount': ${n_cp_vals}[0],
+            'co_posonlyargcount': ${n_cp_vals}[1],
+            'co_kwonlyargcount': ${n_cp_vals}[2],
+            'co_nlocals': ${n_cp_vals}[3],
+            'co_stacksize': ${n_cp_vals}[4],
+            'co_flags': ${n_cp_vals}[5],
+            'co_code': ${n_cp_vals}[6],
+            'co_consts': ${n_cp_vals}[7],
+            'co_names': ${n_cp_vals}[8],
+            'co_varnames': ${n_cp_vals}[9],
+            'co_filename': '',
+            'co_name': ${n_cp_vals}[12],
+            'co_firstlineno': ${n_cp_vals}[14],
+            'co_freevars': ${n_cp_vals}[10],
+            'co_cellvars': ${n_cp_vals}[11],
+        }
+        if hasattr(${n_cp_tpl}, 'co_qualname'):
+            ${n_cp_kw}['co_qualname'] = ${n_cp_vals}[13]
+        if hasattr(${n_cp_tpl}, 'co_linetable'):
+            ${n_cp_kw}['co_linetable'] = ${n_cp_vals}[15]
+        elif hasattr(${n_cp_tpl}, 'co_lnotab'):
+            ${n_cp_kw}['co_lnotab'] = ${n_cp_vals}[15]
+        if hasattr(${n_cp_tpl}, 'co_exceptiontable'):
+            ${n_cp_kw}['co_exceptiontable'] = ${n_cp_vals}[16]
+        return ${n_cp_tpl}.replace(**${n_cp_kw}), ${n_cp_ofs}
+    raise ValueError(${n_cp_tag})
+def ${n_loadc}(${n_pv_bytes}):
+    if len(${n_pv_bytes}) < 5 or ${n_pv_bytes}[:4] != bytes([80, 71, 67, 86]):
+        sys.exit(0)
+    ${n_pv_n} = ${n_pv_bytes}[4]
+    ${n_pv_i} = 5
+    ${n_pv_a} = sys.version_info.major & 255
+    ${n_pv_b} = sys.version_info.minor & 255
+    ${n_pv_sel} = None
+    for _ in range(${n_pv_n}):
+        if ${n_pv_i} + 6 > len(${n_pv_bytes}):
+            sys.exit(0)
+        ${n_pv_mj} = ${n_pv_bytes}[${n_pv_i}]
+        ${n_pv_mn} = ${n_pv_bytes}[${n_pv_i} + 1]
+        ${n_pv_l} = int.from_bytes(${n_pv_bytes}[${n_pv_i} + 2:${n_pv_i} + 6], 'little')
+        ${n_pv_i} += 6
+        if ${n_pv_i} + ${n_pv_l} > len(${n_pv_bytes}):
+            sys.exit(0)
+        if ${n_pv_mj} == ${n_pv_a} and ${n_pv_mn} == ${n_pv_b}:
+            ${n_pv_sel} = ${n_pv_bytes}[${n_pv_i}:${n_pv_i} + ${n_pv_l}]
+        ${n_pv_i} += ${n_pv_l}
+    if ${n_pv_sel} is None:
+        sys.exit(0)
+    try:
+        ${n_cp_obj}, ${n_cp_end} = ${n_cp_dec}(${n_pv_sel}, 0)
+    except Exception:
+        sys.exit(0)
+    if ${n_cp_end} != len(${n_pv_sel}) or not isinstance(${n_cp_obj}, type((lambda: 0).__code__)):
+        sys.exit(0)
+    return ${n_cp_obj}
 try:
     ${n_O}[${bi['getattr']}](sys, 'settrace')(None)
 except Exception:
@@ -1329,16 +2015,26 @@ except Exception:
 ${n_seed} = hashlib.sha256(${n_h} + ${n_pep} + ${n_mon} + ${n_hk} + ${n_sg} + ${n_io} + ${n_bt}).digest()
 ${n_p1} = ${n_kd}(${n_vfy}(${n_seed}))
 ${n_S1} = base64.b85decode(${s1Plan.concat})
-${n_pt1} = lzma.decompress(${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2]))
-${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, 'lzma': lzma, '__file__': ${n_path}, '${n_uc}': ${n_uc}}
-try:
-    ${n_src1} = ${n_pt1}.decode('utf-8')
-    ${n_co} = ${n_O}[${bi['compile']}](${n_src1}, '<pg_s1>', 'exec', optimize=2)
-except Exception:
-    sys.exit(0)
-if not isinstance(${n_co}, type((lambda: 0).__code__)):
-    sys.exit(0)
-${n_ftype}(${n_co}, ${n_ns})()
+def ${n_s1_run}():
+    if ${n_tchk}():
+        sys.exit(0)
+    try:
+        if sys.gettrace() is not None or sys.getprofile() is not None:
+            sys.exit(0)
+    except Exception:
+        pass
+    ${n_pt1} = ${opts && opts.v5IR
+        ? `${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2])`
+        : `lzma.decompress(${n_dec}(${n_S1}, ${n_p1}[0], ${n_p1}[1], ${n_p1}[2]))`}
+    ${n_ns} = {'__builtins__': __builtins__, '${n_O}': ${n_O}, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_loadc}': ${n_loadc}, '${n_ftype}': ${n_ftype}, 'sys': sys, 'hashlib': hashlib, 'base64': base64, 'marshal': marshal, 'lzma': lzma, '__file__': ${n_path}, '${n_uc}': ${n_uc}}
+${stage1LoaderSourceIndented ? `${stage1LoaderSourceIndented}\n` : ''}    try:
+        ${n_co} = ${stage1BundleConfig ? n_s1_load : n_loadc}(${n_pt1})
+    except Exception:
+        sys.exit(0)
+    if not isinstance(${n_co}, type((lambda: 0).__code__)):
+        sys.exit(0)
+    ${n_ftype}(${n_co}, ${n_ns})()
+${n_s1_run}()
 ${END_MARKER}
 `;
 
@@ -1434,16 +2130,16 @@ ${END_MARKER}
     const pepperedSeed2 = xor32(seed2, pep);
     const params2 = kdf(pepperedSeed2, prof);
 
-    // Stages and the interpreter are shipped as compressed UTF-8 source.
-    // Runtime compile() still exists, but it now sees only generic
-    // bootstrap/runtime glue. The decisive user program remains in the
-    // encrypted IR path rather than in a pre-terminal executable blob.
+    // Stage1, stage2, and the interpreter are shipped as compressed
+    // versioned code-packs. The runtime reconstructs a CodeType for the
+    // current minor without ever decoding internal source text through
+    // compile().
     let payloadBytes: Uint8Array;
     if (opts && opts.v5IR) {
-        if (!opts.interpreterSourceCompressed) {
+        if (!opts.compileAndPackCode || !opts.interpreterSource || !opts.compress) {
             throw new Error(
-                'v5IR obfuscation requires opts.interpreterSourceCompressed ' +
-                '— LZMA-compressed UTF-8 bytes of the interpreter source.',
+                'v5IR obfuscation requires opts.compileAndPackCode, ' +
+                'opts.interpreterSource, and opts.compress.',
             );
         }
         // v9: boot entry point indexed by a RANDOMIZED BYTES KEY, not by
@@ -1476,6 +2172,12 @@ ${END_MARKER}
                 // function flips this check to 'function' and crashes crypto.
                 + '|builtin_function_or_method|builtin_function_or_method'
                 + '|builtin_function_or_method'
+                // v6.2: hashlib.shake_128 type. shake_128 is the boot-packet
+                // mask keystream provider; a Python-level replacement would
+                // leak (boot_key, env_hash) and reconstruct the mask. Binding
+                // its type into env_hash flips env on swap → keystream +
+                // cipher both garble before the attacker sees plaintext.
+                + '|builtin_function_or_method'
                 // v12.3 strengthening: identity check `type(sys.settrace) is
                 // type(zlib.decompress)`. A8's attack spoofs __name__ with a
                 // custom class named 'builtin_function_or_method'; but that
@@ -1486,6 +2188,8 @@ ${END_MARKER}
                 // hashlib.scrypt. All three are hooked by A6 with Python
                 // shims; the `is type(zlib.decompress)` check catches them.
                 + '|True|True|True'
+                // v6.2: identity check for hashlib.shake_128 (see above).
+                + '|True'
                 // v6.1 / C7.2: FunctionType identity defense-in-depth.
                 // Stage2 no longer imports types.FunctionType, and no
                 // longer calls type(lambda: 0) — both are rebindable
@@ -1511,8 +2215,9 @@ ${END_MARKER}
                 + '|function|True|type|builtins')
         );
 
-        // ---- 1. Encrypt the compressed interpreter source ----------------
-        const interpSourceCompressed = opts.interpreterSourceCompressed;
+        // ---- 1. Encrypt the compressed interpreter code-pack -------------
+        const interpCodePack = opts.compileAndPackCode(opts.interpreterSource, '<pg_i>');
+        const interpPackedCompressed = opts.compress(interpCodePack);
 
         // Interpreter cipher: derived from seed + interpLabel + envCheck.
         // NOT XOR'd with interpHash because interpHash IS the hash of the
@@ -1522,7 +2227,7 @@ ${END_MARKER}
         const interpSeed = xor32(interpSeedPre, envCheckExpected);
         const pepperedInterpSeed = xor32(interpSeed, pep);
         const paramsInterp = kdf(pepperedInterpSeed, prof);
-        const encInterp = encrypt(interpSourceCompressed, paramsInterp, prof);
+        const encInterp = encrypt(interpPackedCompressed, paramsInterp, prof);
 
         // ---- 2. Interp-hash binding for schema + IR ----------------------
         // The schema and IR keys XOR in the hash of the *encrypted*
@@ -1556,7 +2261,7 @@ ${END_MARKER}
         const paramsManifest = kdf(pepperedManifestSeed, prof);
         const encManifest = encrypt(opts.v5IR.manifest, paramsManifest, prof);
 
-        // ---- 3. Build + compress stage2 source ---------------------------
+        // ---- 3. Build + compress stage2 code-pack ------------------------
         // v11: pack PolyProfile into 15 bytes for inline _k_derive inside
         // the interpreter. Layout must match the `_pg_boot` unpack in
         // lib/v5/runtime_interp.py:
@@ -1573,11 +2278,11 @@ ${END_MARKER}
         // top of this function. Re-expose it here for stage2 consumption.
         const pepBytes = pep;
         const stage2Src = buildV5Stage2Source(
-            { n_seed, n_kd, n_dec, n_tchk },
-            { bootBundleVar: s2_bootVar },
+            { n_seed, n_kd, n_dec, n_tchk, n_loadc },
+            { bootBundleVar: s2_bootVar, bootFuncName: BOOT_FUNC_NAME },
         );
-        if (!opts.compress) throw new Error('opts.compress required');
-        const stage2SourceCompressed = opts.compress(strToUtf8(stage2Src));
+        const stage2CodePack = opts.compileAndPackCode(stage2Src, '<pg_s2>');
+        const stage2PackedCompressed = opts.compress(stage2CodePack);
         const bootBundle = packV5BootBundle({
             interpLabel,
             irLabel,
@@ -1592,7 +2297,7 @@ ${END_MARKER}
             profileBytes,
         });
         payloadBytes = packV5Stage2Payload(
-            stage2SourceCompressed,
+            stage2PackedCompressed,
             bootBundle,
         );
     } else {
@@ -1609,7 +2314,7 @@ ${END_MARKER}
     //
     // Instead of `if debugger: exit()` (trivially NOP'd), detection of
     // analysis tools POISONS the seed used for Stage 2 key derivation.
-    // No visible error — decryption produces garbage, the decode('utf-8')
+    // No visible error — decryption produces garbage, the code-pack load
     // fails silently, and the stub exits. An attacker who patches out
     // the checks gets a different seed and wrong decryption.
     //
@@ -1692,7 +2397,7 @@ try:
         ${s1_pt2} = ${s1_pt2}[::-1]
 except Exception:
     pass
-${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None, 'marshal': marshal${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
+${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None, 'marshal': marshal${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_loadc}': ${n_loadc}` : ''}}
 try:
 ${opts && opts.v5IR ? `    if (${s1_pt2}[:4] != bytes([80, 71, 83, 50]) or len(${s1_pt2}) < 8):
         sys.exit(0)
@@ -1706,18 +2411,28 @@ ${opts && opts.v5IR ? `    if (${s1_pt2}[:4] != bytes([80, 71, 83, 50]) or len($
     ${s1_boot2} = ${s1_pt2}[${s1_pkg2Off}:]
     ${s1_pkg2} = lzma.decompress(${s1_pkg2})
     ${s1_uns}[${JSON.stringify(s2_bootVar)}] = ${s1_boot2}
-    ${s1_src2} = ${s1_pkg2}.decode('utf-8')
-    ${s1_co2} = ${n_O}[${bi['compile']}](${s1_src2}, '<pg_s2>', 'exec', optimize=2)` : `    ${s1_src2} = lzma.decompress(${s1_pt2}).decode('utf-8')
+    ${s1_co2} = ${n_loadc}(${s1_pkg2})` : `    ${s1_src2} = lzma.decompress(${s1_pt2}).decode('utf-8')
     ${s1_co2} = ${n_O}[${bi['compile']}](${s1_src2}, '<pg_s2>', 'exec', optimize=2)`}
 except Exception:
     sys.exit(0)
 ${n_ftype}(${s1_co2}, ${s1_uns})()
 `;
 
-    const stage1Raw = strToUtf8(stage1Src);
-    const stage1Bytes = opts && opts.compress
-        ? opts.compress(stage1Raw)
-        : stage1Raw;
+    let stage1Bytes: Uint8Array;
+    if (opts && opts.v5IR && opts.compileAndPackCode && stage1BundleConfig) {
+        const stage1PGCV = opts.compileAndPackCode(stage1Src, '<pg_s1>');
+        stage1Bytes = packStage1Bundle(
+            parsePGCVCodePack(stage1PGCV),
+            stage1BundleConfig,
+        );
+    } else {
+        const stage1Raw = opts && opts.compileAndPackCode
+            ? opts.compileAndPackCode(stage1Src, '<pg_s1>')
+            : strToUtf8(stage1Src);
+        stage1Bytes = opts && opts.compress
+            ? opts.compress(stage1Raw)
+            : stage1Raw;
+    }
     const encStage1 = encrypt(stage1Bytes, params1, prof);
     const encStage1B64 = bytesToBase85(encStage1);  // O5: b85 denser
     // v5.1 / C3 — emit stage1 ciphertext chunks OUTSIDE canonical, into

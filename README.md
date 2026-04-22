@@ -17,7 +17,7 @@ At a high level, v5:
 5. encrypts the payload in multiple stages
 6. runs it through an embedded, LZMA-compressed interpreter source
 
-It does not ship plaintext stage source, it does not rely on runtime `compile()` of decrypted user code, and it no longer exposes a `marshal.loads` execution boundary for stage0/stage1/stage2 or the interpreter itself — those are all compressed source blobs decrypted and exec'd at runtime.
+It does not ship plaintext stage source, it does not rely on runtime `compile()` of decrypted user code, and it no longer exposes a `marshal.loads` execution boundary for stage0/stage1/stage2 or the interpreter itself — those are all compressed source blobs decrypted and exec'd at runtime. The user IR, once parsed, is a packed binary, not a recoverable Python code object; there is no single `marshal`/`compile` stop that discloses a usable representation of the original program.
 
 ## Current Hardening Strategy
 
@@ -79,6 +79,17 @@ The newest important addition is semantic islands:
 - a recovered island payload by itself is therefore not enough to read the decisive literals, and a local frame write at a host-call boundary can no longer flip the island cleanly to success
 
 This targets the real root issue: preventing a protected secret check or reward path from collapsing into a tiny clean equivalent, and removing the single-stage choke points (one marshal dump, one frame walk, one local write) that make short-path attacks cheap.
+
+## Boot-Packet Hardening
+
+The stage2 → `_pg_boot` hand-off is the most attack-prone boundary in the stub: everything after it runs inside the interpreter, everything before it has the boot packet, boot key, and env available as plain Python state. The current path is hardened along four complementary axes:
+
+- **Env-bound mask (v6.2).** The boot packet is XOR-masked with a SHAKE-128 keystream derived from `boot_key || env_hash`. `env_hash` includes witnesses for `sys.settrace` / `sys.setprofile` / `sys.gettrace` / `sys.getprofile` / `sys.monitoring` / `hashlib.shake_128` types; any runtime tampering flips the keystream and yields garbage before the cipher even runs. `_pg_boot` re-derives `env_hash` internally via `_pg_compute_env`, so a demasker must also execute inside an un-tampered interpreter.
+- **Late-phase trace guard (v6.3).** `sys.gettrace()` / `sys.getprofile()` are re-checked immediately before the `_pg_boot(...)` call, and `sys.monitoring` tool slots 0–5 are scanned on 3.12+. This closes the window between stage2's entry check and the boot call during which an audit-hook-triggered late `settrace` could capture the boot args on the `call` event. `_pg_boot` itself repeats the check as defense-in-depth for paths where stage2 was bypassed.
+- **Authority split (v6.4).** The boot key is not in the args tuple; `_pg_boot` receives only `(boot_blob, builtins_snapshot, import_lut)`. Stage2 deletes the decrypted plaintext and its components before the call.
+- **Shard-split key delivery (v6.5).** The boot key is no longer retrievable from stage2's caller frame. Stage2 splits it into two shards (`key = shard_alpha XOR shard_beta`), stashes `shard_alpha` in the interpreter module's globals and `shard_beta` in the `_pg_boot` function's own `__dict__`, then deletes the original key. `_pg_boot` combines the shards from its own reflection surfaces — `sys._getframe(0).f_globals` and `f_globals[co_name].__dict__` — and never walks `f_back`. `shard_alpha` uses per-run entropy (`id()` of boot objects plus env hash), so a shard capture cannot be replayed against a different execution of the same stub.
+
+None of this makes the key "secret" in the cryptographic sense — an attacker who controls the process still recovers it eventually. It meaningfully raises the number of distinct reflection steps and the brittleness of each one, and removes the single-frame-walk path that used to disclose the key in one read.
 
 ## Release Gates
 

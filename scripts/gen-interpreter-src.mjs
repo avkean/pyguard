@@ -38,6 +38,7 @@ const trimmedRaw = cut >= 0 ? src.slice(0, cut).trimEnd() + '\n' : src;
 // If obfuscation or minification fails, fall back gracefully.
 let trimmed;
 let bootKeyHex = '';   // v9: per-regen randomized export key
+let bootFuncName = '';
 try {
     // v9: run obfuscate_runtime.py once, capturing both streams. The
     // script emits obfuscated source to stdout AND a line like
@@ -56,6 +57,8 @@ try {
     if (res.stderr) {
         const m = /PYG_BOOT_KEY_HEX=([0-9a-f]+)/.exec(res.stderr);
         if (m) bootKeyHex = m[1];
+        const fn = /PYG_BOOT_FUNC_NAME=([A-Za-z0-9_]+)/.exec(res.stderr);
+        if (fn) bootFuncName = fn[1];
     }
     console.log('[gen-interpreter-src] obfuscated interpreter source');
 } catch (err) {
@@ -67,6 +70,9 @@ try {
 }
 if (!bootKeyHex) {
     throw new Error('[gen-interpreter-src] FATAL: boot key not captured; stub would fail to boot');
+}
+if (!bootFuncName) {
+    throw new Error('[gen-interpreter-src] FATAL: boot func name not captured; stub would fail to boot');
 }
 try {
     trimmed = execFileSync(
@@ -120,6 +126,11 @@ export const INTERPRETER_SRC_B64 = ${JSON.stringify(compressedB64)};
 export const BOOT_KEY_BYTES = new Uint8Array([${
     Array.from(Buffer.from(bootKeyHex, 'hex')).join(', ')
 }]);
+
+// Current obfuscated identifier bound to _pg_boot in the generated
+// interpreter module. Stage2 uses this per-build name after module init
+// and never exposes a pre-boot provider object in interpreter globals.
+export const BOOT_FUNC_NAME = ${JSON.stringify(bootFuncName)};
 
 // Size metrics for the gen-time audit log.
 export const INTERPRETER_SRC_RAW_BYTES = ${trimmed.length};

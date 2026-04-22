@@ -829,86 +829,15 @@ def insert_dead_code(tree, n_funcs=12, n_methods_per_class=3):
 # ---------------------------------------------------------------------------
 
 def make_globals_registration(rename_map):
-    """v10: read pre-seeded boot args from globals and call _pg_boot inline.
+    """Stage2 calls the renamed _pg_boot directly after module init.
 
-    Prior rounds exported _pg_boot by writing
-        globals()[BOOT_KEY] = _pg_boot
-    at module-body end, then stage2 called that handle externally. The v9
-    red team defeated that by either (a) iterating globals for any bytes
-    key, or (b) scanning for a function with co_argcount==10.
-
-    v10 flips the direction: stage2 PRE-SEEDS `globals()[BOOT_KEY] = args`
-    BEFORE running the module body. The module body's last statement
-    reads the args tuple and calls `_pg_boot(*args)` inline. Then
-    `del globals()[BOOT_KEY]` scrubs the evidence.
-
-    After `FunctionType(code, ns)()` returns:
-      - the bytes-key slot is gone (deleted)
-      - user code has already run (synchronously inside _pg_boot)
-      - schema locals were scrubbed by _pg_boot before `interp.run`
-      - so an attacker reading `ns` post-call sees only obfuscated
-        class/function defs, not the transient args tuple
+    Older rounds ended the module body with an inline globals()-based
+    boot fetch. The current stage2 path performs module initialization
+    first, then resolves the renamed `_pg_boot` from the module globals
+    and calls it externally. That removes the pre-boot provider object
+    from interpreter globals and keeps this pass as a no-op.
     """
-    stmts = []
-    if '_pg_boot' not in rename_map:
-        return stmts
-    obf_name = rename_map['_pg_boot']
-    # bytes([b0, b1, ..., b11]) → literal bytes object used as the key
-    byte_elts = [ast.Constant(value=b) for b in BOOT_EXPORT_KEY]
-    key_expr = ast.Call(
-        func=ast.Name(id='bytes', ctx=ast.Load()),
-        args=[ast.List(elts=byte_elts, ctx=ast.Load())],
-        keywords=[],
-    )
-    # _boot_args = globals()[bytes([...])]
-    # del globals()[bytes([...])]
-    # _pg_boot_renamed(*_boot_args)
-    args_var = '_pg_boot_args_'  # will be xor-encoded by rename/string pass
-    # Since we emit AST *after* the rename pass, this name is a literal
-    # identifier in the output. To avoid it looking distinctive, we'll
-    # also pick a fresh token.
-    import random as _random_local
-    tok_chars = 'lI1O0'
-    args_var = '_' + ''.join(_random_local.choice(tok_chars) for _ in range(6))
-
-    # args_var = globals()[bytes([...])]
-    stmts.append(ast.Assign(
-        targets=[ast.Name(id=args_var, ctx=ast.Store())],
-        value=ast.Subscript(
-            value=ast.Call(
-                func=ast.Name(id='globals', ctx=ast.Load()),
-                args=[], keywords=[],
-            ),
-            slice=key_expr,
-            ctx=ast.Load(),
-        ),
-        lineno=0,
-    ))
-    # del globals()[bytes([...])]   — eliminate the slot before running user code
-    stmts.append(ast.Delete(
-        targets=[ast.Subscript(
-            value=ast.Call(
-                func=ast.Name(id='globals', ctx=ast.Load()),
-                args=[], keywords=[],
-            ),
-            slice=key_expr,
-            ctx=ast.Del(),
-        )],
-        lineno=0,
-    ))
-    # <renamed_pg_boot>(*args_var)
-    stmts.append(ast.Expr(
-        value=ast.Call(
-            func=ast.Name(id=obf_name, ctx=ast.Load()),
-            args=[ast.Starred(
-                value=ast.Name(id=args_var, ctx=ast.Load()),
-                ctx=ast.Load(),
-            )],
-            keywords=[],
-        ),
-        lineno=0,
-    ))
-    return stmts
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -983,19 +912,20 @@ def obfuscate(src):
     tree.body.extend(reg_stmts)
 
     ast.fix_missing_locations(tree)
-    return ast.unparse(tree)
+    return ast.unparse(tree), rename_map.get('_pg_boot', '_pg_boot')
 
 
 def main():
     src = open(INTERP_PATH, 'r').read()
     src = strip_self_test(src)
-    result = obfuscate(src)
+    result, boot_func_name = obfuscate(src)
     sys.stdout.write(result)
     sys.stdout.write('\n')
     # v9: emit the boot export key to stderr as a hex line so
     # gen-interpreter-src.mjs can capture it and export it alongside
     # INTERPRETER_SRC_B64 for stage2 to use.
     sys.stderr.write('PYG_BOOT_KEY_HEX=' + BOOT_EXPORT_KEY.hex() + '\n')
+    sys.stderr.write('PYG_BOOT_FUNC_NAME=' + boot_func_name + '\n')
     sys.stderr.flush()
 
 

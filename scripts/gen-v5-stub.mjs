@@ -14,6 +14,7 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { discoverPythons as discoverPythonsHelper } from './multi_marshal.mjs';
 
@@ -216,15 +217,14 @@ const args = parseArgs(process.argv);
 const userSource = fs.readFileSync(args.src, 'utf-8');
 const schema = makeV5Schema();
 
-// Discover Python build toolchains. v5 now needs only one local Python:
-// build_ir.py emits the decisive IR, and the generic bootstrap/runtime
-// layers ship as compressed source instead of per-minor marshal blobs.
+// Discover Python build toolchains. v5 uses the first one for IR
+// emission, and all discovered minors for the internal code-pack path.
 const pythons = discoverPythonsHelper();
 if (pythons.length === 0) {
     console.error('gen-v5-stub: no Python build toolchains discovered');
     process.exit(3);
 }
-console.error(`gen-v5-stub: using ${pythons[0].bin} for IR/source packaging`);
+console.error(`gen-v5-stub: using ${pythons[0].bin} for IR packaging`);
 const buildIrPython = pythons[0].bin;
 
 // Step 1: compile IR via build_ir.py.
@@ -245,23 +245,14 @@ if (py.status !== 0) {
 }
 const irArtifacts = JSON.parse(py.stdout.trim());
 
-// Step 2: call the TS obfuscator via a tsx driver.
-// Note: static imports of .ts files break under Node 24's native type
-// stripping (the re-export graph ends up empty). Dynamic import via tsx
-// works correctly.
-//
-const driver = `
-import zlib from 'node:zlib';
-import { spawnSync } from 'node:child_process';
-const { obfuscatePythonCode } = await import('./lib/obfuscate.ts');
-const { INTERPRETER_SRC_B64 } = await import('./lib/v5/interpreter_src.ts');
-const fs = await import('node:fs');
-
-const PYTHON_BIN = ${JSON.stringify(buildIrPython)};
+// Step 2: run the TS obfuscator in-process via tsx dynamic imports.
+const { obfuscatePythonCode } = await import('../lib/obfuscate.ts');
+const { INTERPRETER_SRC_B64 } = await import('../lib/v5/interpreter_src.ts');
+const { createCompileAndPackCode } = await import('./multi_marshal.mjs');
 
 function lzmaCompress(bytes) {
     const r = spawnSync(
-        PYTHON_BIN,
+        buildIrPython,
         ['-c', 'import sys, lzma; sys.stdout.buffer.write(lzma.compress(sys.stdin.buffer.read(), preset=9|lzma.PRESET_EXTREME))'],
         { input: Buffer.from(bytes), maxBuffer: 256 * 1024 * 1024 },
     );
@@ -270,41 +261,21 @@ function lzmaCompress(bytes) {
 }
 
 const interpSrcBytes = zlib.inflateRawSync(Buffer.from(INTERPRETER_SRC_B64, 'base64'));
-const interpreterSourceCompressed = lzmaCompress(interpSrcBytes);
+const interpreterSource = Buffer.from(interpSrcBytes).toString('utf8');
+const compileAndPackCode = createCompileAndPackCode(pythons);
 
-const userSource = fs.readFileSync(${JSON.stringify(args.src)}, 'utf-8');
-const compressed = Uint8Array.from(Buffer.from(${JSON.stringify(irArtifacts.compressed)}, 'base64'));
-const manifest = Uint8Array.from(Buffer.from(${JSON.stringify(irArtifacts.manifest)}, 'base64'));
+const compressed = Uint8Array.from(Buffer.from(irArtifacts.compressed, 'base64'));
+const manifest = Uint8Array.from(Buffer.from(irArtifacts.manifest, 'base64'));
 const stub = obfuscatePythonCode(userSource, {
-    v5IR: { compressed, manifest, schema: ${JSON.stringify(schema)} },
-    interpreterSourceCompressed,
+    v5IR: { compressed, manifest, schema },
+    interpreterSource,
+    compileAndPackCode,
     compress: lzmaCompress,
 });
-process.stdout.write(stub);
-`;
 
-const driverPath = path.join(root, '.v5-driver.mjs');
-fs.writeFileSync(driverPath, driver);
-try {
-    const ts = spawnSync(path.join(root, 'node_modules/.bin/tsx'), [driverPath], {
-        cwd: root,
-        encoding: 'utf-8',
-        maxBuffer: 64 * 1024 * 1024,
-        timeout: 120_000,
-        killSignal: 'SIGKILL',
-    });
-    if (ts.status !== 0) {
-        console.error('tsx driver failed:');
-        console.error(ts.stderr);
-        process.exit(ts.status || 1);
-    }
-    const stub = ts.stdout;
-    if (args.out) {
-        fs.writeFileSync(args.out, stub);
-        console.error(`wrote ${args.out} (${stub.length} chars)`);
-    } else {
-        process.stdout.write(stub);
-    }
-} finally {
-    try { fs.unlinkSync(driverPath); } catch {}
+if (args.out) {
+    fs.writeFileSync(args.out, stub);
+    console.error(`wrote ${args.out} (${stub.length} chars)`);
+} else {
+    process.stdout.write(stub);
 }

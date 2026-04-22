@@ -23,6 +23,7 @@ const ROOT = path.resolve(__dirname, '..');
 const BUILD_IR_PATH = path.join(ROOT, 'lib/v5/build_ir.py');
 
 const DEFAULT_MINORS = ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14'];
+const ENTRY_HEADER_LEN = 6;
 
 function probeBin(bin) {
     const r = spawnSync(bin, ['-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'], {
@@ -70,13 +71,13 @@ export function discoverPythons() {
     });
 }
 
-function compileAndMarshalOne(pythonBin, source, filename) {
+function compileWithModeOne(pythonBin, source, filename, mode, tagMagic) {
     const r = spawnSync(pythonBin, [BUILD_IR_PATH], {
         input: source,
         encoding: 'utf-8',
         env: {
             PATH: process.env.PATH,
-            PYGUARD_MODE: 'marshal',
+            PYGUARD_MODE: mode,
             PYGUARD_FILENAME: filename || '<pg>',
         },
         maxBuffer: 64 * 1024 * 1024,
@@ -87,24 +88,40 @@ function compileAndMarshalOne(pythonBin, source, filename) {
         throw new Error('compile_and_marshal subprocess timed out');
     }
     if (r.status !== 0) {
-        throw new Error('compile_and_marshal subprocess (' + pythonBin + ') failed: ' + r.stderr);
+        throw new Error('compile_with_mode subprocess (' + pythonBin + ') failed: ' + r.stderr);
     }
     const buf = Buffer.from(r.stdout.trim(), 'base64');
-    // build_ir outputs b'PGM1' + major + minor + marshal.dumps(code).
-    if (buf.length < 6 || buf[0] !== 0x50 || buf[1] !== 0x47 || buf[2] !== 0x4d || buf[3] !== 0x31) {
-        throw new Error('compile_and_marshal: missing PGM1 tag from ' + pythonBin);
+    const tag = Buffer.from(tagMagic, 'ascii');
+    if (buf.length < 6 ||
+        buf[0] !== tag[0] ||
+        buf[1] !== tag[1] ||
+        buf[2] !== tag[2] ||
+        buf[3] !== tag[3]) {
+        throw new Error('compile_with_mode: missing ' + tagMagic + ' tag from ' + pythonBin);
     }
     return { major: buf[4], minor: buf[5], bytes: Uint8Array.from(buf.subarray(6)) };
 }
 
-export function packPGMV(entries) {
+function compileAndMarshalOne(pythonBin, source, filename) {
+    return compileWithModeOne(pythonBin, source, filename, 'marshal', 'PGM1');
+}
+
+function compileAndPackCodeOne(pythonBin, source, filename) {
+    return compileWithModeOne(pythonBin, source, filename, 'codepack', 'PGC1');
+}
+
+function packVersioned(entries, magic) {
     if (entries.length === 0 || entries.length > 255) {
-        throw new Error('packPGMV: invalid entry count ' + entries.length);
+        throw new Error('packVersioned: invalid entry count ' + entries.length);
     }
     let total = 5;
-    for (const e of entries) total += 6 + e.bytes.length;
+    for (const e of entries) total += ENTRY_HEADER_LEN + e.bytes.length;
     const out = new Uint8Array(total);
-    out[0] = 0x50; out[1] = 0x47; out[2] = 0x4d; out[3] = 0x56; // 'PGMV'
+    const tag = Buffer.from(magic, 'ascii');
+    out[0] = tag[0];
+    out[1] = tag[1];
+    out[2] = tag[2];
+    out[3] = tag[3];
     out[4] = entries.length;
     let off = 5;
     for (const e of entries) {
@@ -120,6 +137,14 @@ export function packPGMV(entries) {
         off += e.bytes.length;
     }
     return out;
+}
+
+export function packPGMV(entries) {
+    return packVersioned(entries, 'PGMV');
+}
+
+export function packPGCV(entries) {
+    return packVersioned(entries, 'PGCV');
 }
 
 // Build a closure that compiles `source` with every discovered Python
@@ -141,5 +166,24 @@ export function createCompileAndMarshal(pythons) {
             entries.push(entry);
         }
         return packPGMV(entries);
+    };
+}
+
+export function createCompileAndPackCode(pythons) {
+    const builds = pythons || discoverPythons();
+    if (builds.length === 0) {
+        throw new Error('createCompileAndPackCode: no Python toolchains discovered');
+    }
+    return (source, filename) => {
+        const entries = [];
+        const seen = new Set();
+        for (const b of builds) {
+            const entry = compileAndPackCodeOne(b.bin, source, filename);
+            const key = entry.major + '.' + entry.minor;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            entries.push(entry);
+        }
+        return packPGCV(entries);
     };
 }

@@ -2945,13 +2945,63 @@ def _pg_scrub_post_run(_acc, _interp):
         pass
 
 
+def _pg_compute_env():
+    """Recompute the stage2 env-integrity hash inside the interpreter.
+
+    Recipe must match `_pg_env` in lib/v5/assemble.ts buildV5Stage2Source
+    AND `envCheckExpected` in lib/obfuscate.ts. The mask keystream and
+    crypto-key derivations both bind to this hash, so any drift between
+    stage2's and the interpreter's computation silently corrupts the
+    SHAKE-128 keystream used to unmask the boot packet AND the downstream
+    schema/IR keys — double-fail-closed on trace/profile/type tampering.
+    """
+    import hashlib as _h3
+    import sys as _sys3
+    import zlib as _z3
+    import marshal as _m3
+    _ft = (lambda: 0).__class__
+    _parts = [
+        str(len(_sys3._current_frames())),
+        type(_z3.decompress).__name__,
+        type(print).__name__,
+        type(getattr).__name__,
+        type(_sys3.settrace).__name__,
+        type(_sys3.setprofile).__name__,
+        type(_sys3.gettrace).__name__,
+        type(_sys3.getprofile).__name__,
+        type(exec).__name__,
+        type(_m3.loads).__name__,
+        type(_h3.scrypt).__name__,
+        # v6.2 closure: shake_128 is the mask keystream provider; a
+        # Python-level replacement would leak (boot_key, env_hash) and
+        # reconstruct the mask. Bind its type into env so such a swap
+        # flips env_hash, breaks the mask, and garbles the packet.
+        type(_h3.shake_128).__name__,
+        str(type(_sys3.settrace) is type(_z3.decompress)),
+        str(type(_sys3.setprofile) is type(_z3.decompress)),
+        str(type(_sys3.gettrace) is type(_z3.decompress)),
+        str(type(_sys3.getprofile) is type(_z3.decompress)),
+        str(type(exec) is type(_z3.decompress)),
+        str(type(_m3.loads) is type(_z3.decompress)),
+        str(type(_h3.scrypt) is type(_z3.decompress)),
+        str(type(_h3.shake_128) is type(_z3.decompress)),
+        _ft.__name__,
+        str(_ft is (lambda: None).__class__),
+        _ft.__class__.__name__,
+        _ft.__module__,
+    ]
+    return _h3.sha256('|'.join(_parts).encode()).digest()
+
+
 def _pg_boot(*_a):
     """PyGuard interpreter entry point.
 
-    Signature (9..12 positional args, no stage2 callables):
-      schema_ct, schema_label, ir_ct, ir_label, seed, interp_hash,
-      env_hash, pep, profile[, module_name='__main__'[, builtins_snapshot
-      [, import_pairs]]]
+    Signature:
+      - v13 packet path: boot_blob, boot_key, builtins_snapshot, import_pairs
+      - legacy path (9..12 positional args, no stage2 callables):
+        schema_ct, schema_label, ir_ct, ir_label, seed, interp_hash,
+        env_hash, pep, profile[, module_name='__main__'[, builtins_snapshot
+        [, import_pairs]]]
 
     All stage2-supplied "config" is inert bytes: a 32-byte `pep` pepper,
     and a 15-byte `profile` struct (rounds, rot_mod, sbx_nudge,
@@ -2962,10 +3012,120 @@ def _pg_boot(*_a):
 
     `co_argcount == 0` (vararg-only) defeats any structural fingerprint
     keyed on argument count.
+
+    Packet-path masking (v6.2): the boot packet is XOR-masked with a
+    SHAKE-128 keystream derived from (boot_key || env_hash), where
+    env_hash is re-derived locally via `_pg_compute_env`. Stage2 applies
+    the same mask using its own env_hash computation. Generic cross-build
+    demasking via a fixed formula no longer works — the demasker must
+    also run inside an un-tampered env, because a tampered env produces
+    a different keystream and garbage plaintext, before crypto keys are
+    even consulted.
     """
     _bi_snap = None
     _imp_lut = None
-    if len(_a) == 9:
+    _boot_slice = None
+    _schema_ct_len = None
+    _ir_ct_len = None
+    _mod_name_len = None
+    _schema_label_off = None
+    _ir_label_off = None
+    _seed_off = None
+    _interp_hash_off = None
+    _pep_off = None
+    _profile_off = None
+    _mod_name_off = None
+    _schema_ct_off = None
+    _ir_ct_off = None
+    _boot_buf = None
+    _boot_key_buf = None
+    _boot_key_len = None
+    _boot_total = None
+    _env_local = None
+    _mask_ks = None
+    if len(_a) == 3 and isinstance(_a[0], (bytes, bytearray)):
+        # v6.3: late-phase trace guard mirroring stage2's pre-call check.
+        # If an attacker's audit-hook-triggered trace captured our args
+        # BEFORE we reached this point, it's already too late for the
+        # blob — but we fail here so at least the remainder of boot
+        # never runs, and repeat-runs under the same hook still trip the
+        # stage2-side guard. Primary defense is the stage2 check; this
+        # is defense-in-depth for paths where stage2 was bypassed and
+        # _pg_boot was called directly via imported globals.
+        import sys as _sys_tg
+        if _sys_tg.gettrace() is not None or _sys_tg.getprofile() is not None:
+            raise SystemExit(0)
+        _mon_tg = getattr(_sys_tg, 'monitoring', None)
+        if _mon_tg is not None:
+            for _i_tg in range(6):
+                try:
+                    if _mon_tg.get_events(_i_tg) != 0:
+                        raise SystemExit(0)
+                except ValueError:
+                    pass
+        (_boot_blob, _bi_snap, _imp_lut) = _a
+        # v6.5 shard-combine: the boot key is NOT in the caller frame
+        # and NOT in the args tuple. Stage2 split it across two shards
+        # stashed in this function's OWN reflective surfaces:
+        #   - shard_alpha: sys._getframe(0).f_globals['_PG_KSA']
+        #                  (i.e. this interpreter module's dict)
+        #   - shard_beta:  self_fn.__dict__['_PG_KSB']
+        #                  (this function object's attribute dict,
+        #                   located via f_globals[co_name])
+        # Neither shard is the key on its own; the key is
+        # shard_alpha XOR shard_beta. stage2 uses fresh per-run entropy
+        # (id() + env hash) to derive shard_alpha, so shard captures
+        # from a prior run cannot be replayed.
+        _own_frame = _sys_tg._getframe(0)
+        _own_ns = _own_frame.f_globals
+        _self_fn = _own_ns.get(_own_frame.f_code.co_name)
+        if _self_fn is None:
+            raise SystemExit(0)
+        _ks_a = _own_ns.pop('_PG_KSA', None)
+        _ks_b = _self_fn.__dict__.pop('_PG_KSB', None)
+        if (not isinstance(_ks_a, (bytes, bytearray))
+                or not isinstance(_ks_b, (bytes, bytearray))
+                or len(_ks_a) != 12 or len(_ks_b) != 12):
+            raise SystemExit(0)
+        _boot_key = bytes(a ^ b for a, b in zip(_ks_a, _ks_b))
+        del _own_frame, _own_ns, _self_fn, _ks_a, _ks_b, _sys_tg, _mon_tg
+        _boot_buf = memoryview(_boot_blob)
+        _boot_key_buf = memoryview(_boot_key)
+        _boot_key_len = len(_boot_key_buf)
+        _boot_total = len(_boot_buf)
+        del _boot_blob
+        del _boot_key
+        # v6.2: env-bound SHAKE-128 mask keystream. Stage2 computed the
+        # same hash from its own env witnesses and produced the matching
+        # keystream. Any trace/profile/type-name tampering flips env,
+        # keystream, and the packet is garbage before cipher runs.
+        _env_local = _pg_compute_env()
+        import hashlib as _h_pkt
+        _mask_ks = _h_pkt.shake_128(
+            bytes(_boot_key_buf) + _env_local
+        ).digest(_boot_total)
+        def _boot_slice(_off, _ln):
+            return _PGBT(
+                _boot_buf[_off + _i] ^ _mask_ks[_off + _i]
+                for _i in range(_ln)
+            )
+        _o = 0
+        _schema_ct_len = int.from_bytes(_boot_slice(_o, 4), 'little'); _o += 4
+        _ir_ct_len = int.from_bytes(_boot_slice(_o, 4), 'little'); _o += 4
+        _mod_name_len = int.from_bytes(_boot_slice(_o, 4), 'little'); _o += 4
+        _schema_label_off = _o; _o += 6
+        _ir_label_off = _o; _o += 6
+        _seed_off = _o; _o += 32
+        _interp_hash_off = _o; _o += 32
+        _pep_off = _o; _o += 32
+        _profile_off = _o; _o += 15
+        _mod_name_off = _o; _o += _mod_name_len
+        _schema_ct_off = _o; _o += _schema_ct_len
+        _ir_ct_off = _o; _o += _ir_ct_len
+        if _o != _boot_total:
+            raise TypeError("_pg_boot: bad packet")
+        module_name = '__main__'
+    elif len(_a) == 9:
         (schema_ct, schema_label, ir_ct, ir_label, seed,
          interp_hash, env_hash, pep, profile) = _a
         module_name = '__main__'
@@ -2996,6 +3156,8 @@ def _pg_boot(*_a):
 
     # Unpack the 15-byte profile struct (layout must match TS emission
     # in lib/obfuscate.ts / lib/v5/assemble.ts).
+    if _boot_slice is not None:
+        profile = _boot_slice(_profile_off, 15)
     _rounds = profile[0]
     _rot_mod = profile[1]
     _sbx_nudge = profile[2]
@@ -3008,7 +3170,31 @@ def _pg_boot(*_a):
     import zlib as _z
 
     # --- decrypt schema (v8: positional binary, not JSON) ---
-    _schema_seed_pre = _h.sha256(seed + schema_label).digest()
+    if _boot_slice is not None:
+        _schema_seed_pre = _h.sha256(
+            _boot_slice(_seed_off, 32) +
+            _boot_slice(_schema_label_off, 6)
+        ).digest()
+        seed = _boot_slice(_seed_off, 32)
+        interp_hash = _boot_slice(_interp_hash_off, 32)
+        # v6.2: env_hash no longer travels in the packet. It is live-
+        # computed and also gates the SHAKE mask keystream, so a tampered
+        # env hits both the mask and the cipher-key paths.
+        env_hash = _env_local
+        pep = _boot_slice(_pep_off, 32)
+        profile = _boot_slice(_profile_off, 15)
+        schema_label = _boot_slice(_schema_label_off, 6)
+        schema_ct = _boot_slice(_schema_ct_off, _schema_ct_len)
+        ir_label = _boot_slice(_ir_label_off, 6)
+        ir_ct = _boot_slice(_ir_ct_off, _ir_ct_len)
+        module_name = _boot_slice(_mod_name_off, _mod_name_len).decode('utf-8')
+        del _boot_slice
+        del _boot_buf
+        del _boot_key_buf
+        del _boot_key_len
+        del _boot_total
+        del _env_local
+        del _mask_ks
     _schema_seed = _PGBT(a ^ b ^ c for a, b, c in zip(
         _schema_seed_pre, interp_hash, env_hash))
     _schema_p = _k_derive(_schema_seed, pep, _rounds, _rk_label,

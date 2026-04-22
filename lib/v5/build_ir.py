@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import hashlib
+import struct as _struct
 
 
 _SEM_ISLAND_SENTINEL = '__pyguard_semantic_island__'
@@ -1297,6 +1298,7 @@ def _enc(v):
 
 
 _MARSHAL_TAG = b'PGM1'
+_CODEPACK_TAG = b'PGC1'
 
 
 def _strip_debuginfo(co):
@@ -1345,6 +1347,77 @@ def compile_and_marshal(source, filename='<pg>'):
     return tag + marshal.dumps(code)
 
 
+def _pack_code_value(v):
+    t = type(v)
+    if v is None:
+        return b'\x00'
+    if v is True:
+        return b'\x01'
+    if v is False:
+        return b'\x02'
+    if v is Ellipsis:
+        return b'\x0A'
+    if t is int:
+        n = (v.bit_length() // 8) + 1
+        b = v.to_bytes(n, 'little', signed=True)
+        return b'\x03' + len(b).to_bytes(4, 'little') + b
+    if t is float:
+        return b'\x04' + _struct.pack('<d', v)
+    if t is complex:
+        return b'\x05' + _struct.pack('<dd', v.real, v.imag)
+    if t is bytes:
+        return b'\x06' + len(v).to_bytes(4, 'little') + v
+    if t is str:
+        eb = v.encode('utf-8')
+        return b'\x07' + len(eb).to_bytes(4, 'little') + eb
+    if t is tuple:
+        parts = [_pack_code_value(x) for x in v]
+        return b'\x08' + len(v).to_bytes(4, 'little') + b''.join(parts)
+    if t is frozenset:
+        vals = tuple(v)
+        parts = [_pack_code_value(x) for x in vals]
+        return b'\x09' + len(vals).to_bytes(4, 'little') + b''.join(parts)
+    if t is slice:
+        return b'\x0C' + _pack_code_value((v.start, v.stop, v.step))
+    if hasattr(v, 'co_code'):
+        qualname = getattr(v, 'co_qualname', v.co_name)
+        line_buf = getattr(v, 'co_linetable', getattr(v, 'co_lnotab', b''))
+        exc_buf = getattr(v, 'co_exceptiontable', b'')
+        payload = (
+            v.co_argcount,
+            getattr(v, 'co_posonlyargcount', 0),
+            v.co_kwonlyargcount,
+            v.co_nlocals,
+            v.co_stacksize,
+            v.co_flags,
+            v.co_code,
+            v.co_consts,
+            v.co_names,
+            v.co_varnames,
+            v.co_freevars,
+            v.co_cellvars,
+            v.co_name,
+            qualname,
+            v.co_firstlineno,
+            line_buf,
+            exc_buf,
+        )
+        return b'\x0B' + _pack_code_value(payload)
+    raise TypeError(f"unsupported codepack value: {type(v).__name__}")
+
+
+def compile_and_pack_code(source, filename='<pg>'):
+    import sys
+
+    code = compile(source, filename, 'exec', optimize=2)
+    code = _strip_debuginfo(code)
+    tag = _CODEPACK_TAG + bytes([
+        sys.version_info.major & 0xFF,
+        sys.version_info.minor & 0xFF,
+    ])
+    return tag + _pack_code_value(code)
+
+
 # Self-test entry point — used by the build drivers.
 #
 # Default mode reads Python source from stdin and writes the zlib-compressed
@@ -1360,6 +1433,9 @@ if __name__ == '__main__':
     mode = os.environ.get('PYGUARD_MODE', 'ir')
     if mode == 'marshal':
         blob = compile_and_marshal(src, os.environ.get('PYGUARD_FILENAME', '<pg>'))
+        sys.stdout.write(base64.b64encode(blob).decode('ascii'))
+    elif mode == 'codepack':
+        blob = compile_and_pack_code(src, os.environ.get('PYGUARD_FILENAME', '<pg>'))
         sys.stdout.write(base64.b64encode(blob).decode('ascii'))
     else:
         arts = compile_to_artifacts(src, os.environ.get('PYGUARD_V5_SCHEMA'))

@@ -18,6 +18,49 @@ function buildStub(srcPath: string, outPath: string): void {
     runCmd("node", ["--import", "tsx", path.join(ROOT, "scripts", "gen-v5-stub.mjs"), srcPath, "-o", outPath]);
 }
 
+function assertNoInternalSourceMaterialization(stubPath: string): void {
+    const script = `
+import os, sys
+
+target = os.path.abspath(${JSON.stringify(stubPath)})
+hits = []
+
+def hook(event, args):
+    if event != 'compile':
+        return
+    try:
+        src = args[0]
+        fname = args[1] if len(args) > 1 else ''
+    except Exception:
+        return
+    if fname == target:
+        return
+    if isinstance(src, str):
+        size = len(src.encode('utf-8', errors='ignore'))
+    elif isinstance(src, (bytes, bytearray)):
+        size = len(src)
+    else:
+        return
+    if fname == '<string>' and size < 200:
+        return
+    if str(fname).startswith('<') or size >= 200:
+        hits.append((str(fname), size))
+
+sys.addaudithook(hook)
+ns = {'__name__': '__main__', '__file__': target, '__builtins__': __builtins__}
+try:
+    exec(compile(open(target, 'rb').read().decode('utf-8', errors='replace'), target, 'exec'), ns)
+except BaseException:
+    pass
+print(repr(hits))
+`;
+    const out = runCmd("python3", ["-c", script]).trim();
+    const last = out.split(/\r?\n/).pop()?.trim() ?? "";
+    if (last !== "[]") {
+        throw new Error(`internal-source materialization regression: saw internal compile events ${out}`);
+    }
+}
+
 function assertNoCompileLeak(stubPath: string): void {
     const out = runCmd("python3", [path.join(ROOT, "tests", "pentest", "attack8_audit_hook_dumper.py"), stubPath]);
     const forbidden = [
@@ -332,6 +375,8 @@ function main(): void {
 
         const auditStub = path.join(td, "01_print.py");
         buildStub(path.join(ROOT, "tests", "cases", "01_print.py"), auditStub);
+        assertNoInternalSourceMaterialization(auditStub);
+        console.log("PASS  internal source materialization gate");
         assertNoCompileLeak(auditStub);
         console.log("PASS  audit leak gate");
         assertNoMarshalExecutionBoundary(auditStub);

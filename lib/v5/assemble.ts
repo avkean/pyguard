@@ -42,6 +42,7 @@ export interface AssembleNames {
     n_kd: string;       // stage1 injects _kd function here
     n_dec: string;      // stage1 injects _dec function here
     n_tchk: string;     // stage1 injects traceback-based trace checker here
+    n_loadc: string;    // stage1 injects the shared code-pack loader here
 }
 
 // Runtime cipher primitives — must match encrypt() in lib/obfuscate.ts.
@@ -68,6 +69,7 @@ export interface V5BootBundle {
 
 export interface AssembleStage2 {
     bootBundleVar: string;
+    bootFuncName: string;
 }
 
 function concatBytes(...arrs: Uint8Array[]): Uint8Array {
@@ -143,16 +145,17 @@ export function packV5Stage2Payload(
 }
 
 // Build the stage2 source — the Python source string that the obfuscator
-// will compile+marshal at build time, then encrypt + wrap inside stage1.
+// will compile into a versioned code-pack at build time, then encrypt +
+// wrap inside stage1.
 //
-// When executed (via FunctionType(marshaled_code, isolated_ns)), this code:
+// When executed (via FunctionType(code_object, isolated_ns)), this code:
 //   1. Trace/profile nullification + env-integrity hash
 //   2. Unpack the binary boot bundle supplied by stage1
 //   3. Decrypt the encrypted manifest blob and resolve it into opaque
-//      `(id, value)` pairs before the interpreter source is compiled
-//   4. Decrypt the compressed interpreter source bytes
+//      `(id, value)` pairs before the interpreter code is loaded
+//   4. Decrypt the compressed interpreter code-pack bytes
 //   5. Pre-seed the boot argument tuple into `interp_ns[bootKey]`
-//   6. compile() + FunctionType(code, interp_ns)()
+//   6. load-code() + FunctionType(code, interp_ns)()
 //
 // The schema is NEVER written to any globals dict outside the boot frame.
 // `run_blob` is NEVER assigned to a globals name. Profile-hooking stage2's
@@ -161,10 +164,11 @@ export function buildV5Stage2Source(
     names: AssembleNames,
     stage2: AssembleStage2,
 ): string {
-    const { n_seed, n_kd, n_dec, n_tchk } = names;
-    const { bootBundleVar } = stage2;
+    const { n_seed, n_kd, n_dec, n_tchk, n_loadc } = names;
+    const { bootBundleVar, bootFuncName } = stage2;
+    const bootFuncNameExpr = JSON.stringify(bootFuncName);
 
-    // Stage2 source (compiled+marshaled at build time):
+    // Stage2 source (compiled+packed at build time):
     //   - stage2 reads one binary boot bundle from its globals dict, then
     //     deletes that slot before touching the interpreter
     //   - the schema is decrypted inside the interpreter's own boot frame,
@@ -186,8 +190,7 @@ except Exception:
 if ${n_tchk}():
     raise SystemExit(0)
 _pg_ft = (lambda: 0).__class__
-_pg_env = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), _pg_ft.__name__, str(_pg_ft is (lambda: None).__class__), _pg_ft.__class__.__name__, _pg_ft.__module__]).encode()).digest()
-_pg_bi_snap = dict(__builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__)
+_pg_env = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, type(hashlib.shake_128).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), str(type(hashlib.shake_128) is type(zlib.decompress)), _pg_ft.__name__, str(_pg_ft is (lambda: None).__class__), _pg_ft.__class__.__name__, _pg_ft.__module__]).encode()).digest()
 _pg_pkg = ${bootBundleVar}
 del ${bootBundleVar}
 if len(_pg_pkg) < 103 or _pg_pkg[:4] != bytes([80, 71, 66, 49]):
@@ -211,11 +214,26 @@ _pg_manifest_ct = _pg_pkg[_pg_o:_pg_o + _pg_manifest_len]; _pg_o += _pg_manifest
 _pg_schema_ct = _pg_pkg[_pg_o:_pg_o + _pg_schema_len]; _pg_o += _pg_schema_len
 _pg_ir_ct = _pg_pkg[_pg_o:_pg_o + _pg_ir_len]
 _pg_interp_hash = hashlib.sha256(_pg_interp_ct).digest()
+_pg_interp_seed = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + _pg_interp_label).digest(), _pg_env))
+_pg_interp_p = ${n_kd}(_pg_interp_seed)
+_pg_interp_pack = lzma.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2]))
+_pg_interp_code = ${n_loadc}(_pg_interp_pack)
+del _pg_interp_pack
+_pg_interp_ns = {bytes([95, 95, 98, 117, 105, 108, 116, 105, 110, 115, 95, 95]).decode(): __builtins__, bytes([95, 95, 110, 97, 109, 101, 95, 95]).decode(): bytes([60, 112, 103, 95, 105, 62]).decode()}
+_pg_interp_fn = _pg_ft(_pg_interp_code, _pg_interp_ns)
+del _pg_interp_ns, _pg_interp_code
+try:
+    if sys.gettrace() is not None or sys.getprofile() is not None:
+        raise SystemExit(0)
+except Exception:
+    pass
+_pg_interp_fn()
 _pg_manifest_seed = bytes(a ^ b ^ c for a, b, c in zip(hashlib.sha256(${n_seed} + _pg_manifest_label).digest(), _pg_interp_hash, _pg_env))
 _pg_manifest_p = ${n_kd}(_pg_manifest_seed)
 _pg_manifest_blob = zlib.decompress(${n_dec}(_pg_manifest_ct, _pg_manifest_p[0], _pg_manifest_p[1], _pg_manifest_p[2]), -15)
 _pg_manifest_pairs = []
 _pg_manifest_mods = {}
+_pg_bi_snap = dict(__builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__)
 _pg_mod_type = type(sys)
 _pg_mod_dict = _pg_mod_type.__dict__.get(bytes([95, 95, 100, 105, 99, 116, 95, 95]).decode())
 _pg_manifest_off = 0
@@ -261,19 +279,79 @@ for _ in range(_pg_manifest_cnt):
     except BaseException as _pg_exc:
         _pg_manifest_pairs.append((_pg_mid, _pg_exc))
 _pg_manifest_pairs = tuple(_pg_manifest_pairs)
-_pg_interp_seed = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + _pg_interp_label).digest(), _pg_env))
-_pg_interp_p = ${n_kd}(_pg_interp_seed)
-_pg_interp_src = lzma.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2])).decode('utf-8')
-_pg_interp_code = compile(_pg_interp_src, '<pg_i>', 'exec', optimize=2)
 for _pg_mod_name, _pg_mod in _pg_manifest_mods.items():
     try:
         sys.modules[_pg_mod_name] = _pg_mod
     except Exception:
         pass
-_pg_interp_ns = {bytes([95, 95, 98, 117, 105, 108, 116, 105, 110, 115, 95, 95]).decode(): __builtins__, bytes([95, 95, 110, 97, 109, 101, 95, 95]).decode(): bytes([60, 112, 103, 95, 105, 62]).decode()}
-_pg_interp_ns[_pg_boot_key] = (_pg_schema_ct, _pg_schema_label, _pg_ir_ct, _pg_ir_label, ${n_seed}, _pg_interp_hash, _pg_env, _pg_pep, _pg_profile, bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode(), _pg_bi_snap, _pg_manifest_pairs)
-_pg_ft(_pg_interp_code, _pg_interp_ns)()
-del _pg_pkg, _pg_interp_ct, _pg_manifest_ct, _pg_schema_ct, _pg_ir_ct, _pg_manifest_blob, _pg_manifest_mods, _pg_manifest_pairs
+_pg_boot_fn = _pg_interp_fn.__globals__[${bootFuncNameExpr}]
+_pg_mod_name = bytes([95, 95, 109, 97, 105, 110, 95, 95]).decode()
+_pg_mod_name_b = _pg_mod_name.encode(bytes([117, 116, 102, 45, 56]).decode())
+_pg_boot_plain = bytes().join((len(_pg_schema_ct).to_bytes(4, bytes([108, 105, 116, 116, 108, 101]).decode()), len(_pg_ir_ct).to_bytes(4, bytes([108, 105, 116, 116, 108, 101]).decode()), len(_pg_mod_name_b).to_bytes(4, bytes([108, 105, 116, 116, 108, 101]).decode()), _pg_schema_label, _pg_ir_label, ${n_seed}, _pg_interp_hash, _pg_pep, _pg_profile, _pg_mod_name_b, _pg_schema_ct, _pg_ir_ct))
+_pg_boot_mask = hashlib.shake_128(bytes(_pg_boot_key) + _pg_env).digest(len(_pg_boot_plain))
+_pg_boot_blob = bytes(a ^ b for a, b in zip(_pg_boot_plain, _pg_boot_mask))
+# v6.4 Cut A/B: demask authority material is purged from stage2 scope
+# BEFORE the _pg_boot call so that a frame-local capture at the call
+# site no longer yields either the unmasked packet (was _pg_boot_plain,
+# direct plaintext of every decisive field) or the individual
+# reconstruction components (_pg_schema_ct / _pg_ir_ct / labels /
+# hashes / seed / pep / profile / mod_name_b — any subset reassembles
+# the plaintext without the key). Only the masked blob remains live.
+del _pg_boot_mask, _pg_boot_plain, _pg_schema_ct, _pg_ir_ct, _pg_schema_label, _pg_ir_label, _pg_interp_hash, _pg_pep, _pg_profile, _pg_mod_name_b, _pg_mod_name, _pg_pkg, _pg_interp_ct, _pg_manifest_ct, _pg_manifest_blob, _pg_manifest_mods
+# v6.5 shard split: instead of leaving _pg_boot_key in stage2's caller
+# frame for _pg_boot to retrieve via f_back, split the key into two
+# shards (alpha XOR beta = key) and stash each in a distinct reflection
+# scope that _pg_boot can reach WITHOUT touching the caller frame:
+#   - shard_alpha → _pg_interp_fn.__globals__[<name_a>] (interp module
+#     dict; reachable from _pg_boot via sys._getframe(0).f_globals)
+#   - shard_beta  → _pg_boot_fn.__dict__[<name_b>] (function object's
+#     own attribute dict; reachable from _pg_boot via its self-ref)
+# After stashing, _pg_boot_key is deleted from stage2 locals, so a
+# caller-frame dump at the _pg_boot call site yields no key material.
+# A single reflection step at EITHER shard location is still a 12-byte
+# bytes value that is useless on its own — the attacker must locate
+# BOTH shards and know the XOR combination before any demask attempt.
+# shard_alpha uses fresh per-run entropy via id()+env hash so that a
+# shard capture from one execution cannot be replayed against another
+# execution of the same stub.
+_pg_ks_a = hashlib.sha256(id(_pg_boot_blob).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + id(_pg_env).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + id(_pg_interp_fn).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + _pg_env).digest()[:12]
+_pg_ks_b = bytes(a ^ b for a, b in zip(bytes(_pg_boot_key), _pg_ks_a))
+_pg_interp_fn.__globals__[bytes([95, 80, 71, 95, 75, 83, 65]).decode()] = _pg_ks_a
+_pg_boot_fn.__dict__[bytes([95, 80, 71, 95, 75, 83, 66]).decode()] = _pg_ks_b
+del _pg_boot_key, _pg_ks_a, _pg_ks_b
+# v6.3: late-phase trace guard. The gettrace check at the top of stage2
+# is a snapshot — an attacker with an addaudithook listening for
+# 'import' events can install sys.settrace DURING the manifest load
+# (which fires 'import' audit events for each stdlib module resolved).
+# By the time _pg_boot_fn is called here, that trace would fire on the
+# 'call' event and capture (boot_blob, boot_key) from frame.f_locals.
+# Env_hash is deterministic on a clean interpreter, so the attacker can
+# reproduce the mask keystream offline and fully demask the packet.
+# Re-verify now, so the window between the top-of-stage2 check and this
+# call is closed. Also scan sys.monitoring tool-ids on 3.12+, which can
+# install a CALL-event callback via a separate API.
+if sys.gettrace() is not None or sys.getprofile() is not None:
+    raise SystemExit(0)
+_pg_mon_sv = getattr(sys, bytes([109, 111, 110, 105, 116, 111, 114, 105, 110, 103]).decode(), None)
+if _pg_mon_sv is not None:
+    for _pg_mon_i in range(6):
+        try:
+            if _pg_mon_sv.get_events(_pg_mon_i) != 0:
+                raise SystemExit(0)
+        except ValueError:
+            pass
+del _pg_mon_sv
+# v6.5: the boot key is NOT passed through the args tuple AND is NOT in
+# stage2's caller-frame locals. Two shards live in _pg_boot's own scope
+# (interp globals + boot-fn attribute dict); _pg_boot combines them
+# internally without ever walking f_back to this frame. A caller-frame
+# dump at this call-site therefore yields zero key material.
+_pg_boot_fn(_pg_boot_blob, _pg_bi_snap, _pg_manifest_pairs)
+try:
+    del _pg_interp_fn.__globals__[${bootFuncNameExpr}]
+except Exception:
+    pass
+del _pg_boot_fn, _pg_boot_blob, _pg_interp_fn, _pg_env, _pg_bi_snap, _pg_manifest_pairs
 `;
 }
 
