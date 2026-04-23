@@ -256,26 +256,54 @@ for _ in range(_pg_manifest_cnt):
         if _pg_mod is None:
             _pg_mod = sys.modules.get(_pg_mod_name)
             if type(_pg_mod) is not _pg_mod_type:
-                sys.modules.pop(_pg_mod_name, None)
-                _pg_mod = _pg_bi_snap[bytes([95, 95, 105, 109, 112, 111, 114, 116, 95, 95]).decode()](_pg_mod_name, None, None, (bytes([95]).decode(),), 0)
-                _pg_live_mod = sys.modules.get(_pg_mod_name)
-                if type(_pg_live_mod) is _pg_mod_type:
-                    _pg_mod = _pg_live_mod
+                # sys.modules entry is not a real ModuleType — an audit
+                # hook (c18-class attack) has planted a proxy object to
+                # log __getattribute__ calls. Pop and re-__import__; if
+                # the hook re-wraps during import, retry a bounded number
+                # of times. If we cannot obtain a real ModuleType, fail
+                # closed rather than falling through to getattr and
+                # leaking the attr name through the proxy.
+                _pg_retry = 0
+                while _pg_retry < 3:
+                    sys.modules.pop(_pg_mod_name, None)
+                    _pg_mod = _pg_bi_snap[bytes([95, 95, 105, 109, 112, 111, 114, 116, 95, 95]).decode()](_pg_mod_name, None, None, (bytes([95]).decode(),), 0)
+                    if type(_pg_mod) is _pg_mod_type:
+                        break
+                    _pg_live_mod = sys.modules.get(_pg_mod_name)
+                    if type(_pg_live_mod) is _pg_mod_type:
+                        _pg_mod = _pg_live_mod
+                        break
+                    _pg_retry += 1
+                if type(_pg_mod) is not _pg_mod_type:
+                    raise SystemExit(0)
             _pg_manifest_mods[_pg_mod_name] = _pg_mod
         if _pg_attr_name is None:
             _pg_val = _pg_mod
         else:
-            _pg_val = _pg_manifest_mods
-            if _pg_mod_dict is not None and type(_pg_mod) is _pg_mod_type:
-                try:
-                    _pg_dict = _pg_mod_dict.__get__(_pg_mod)
-                except Exception:
-                    _pg_dict = None
-                if isinstance(_pg_dict, dict):
-                    _pg_val = _pg_dict.get(_pg_attr_name, _pg_manifest_mods)
+            # Attribute resolution MUST go through the ModuleType.__dict__
+            # slot descriptor — never through getattr / __getattribute__,
+            # which would fire any proxy __getattribute__ planted on a
+            # non-ModuleType sys.modules entry and disclose the attr
+            # name. The cached _pg_mod is already validated as
+            # ModuleType above, so the descriptor call is safe.
+            if _pg_mod_dict is None:
+                raise SystemExit(0)
+            try:
+                _pg_dict = _pg_mod_dict.__get__(_pg_mod)
+            except Exception:
+                raise SystemExit(0)
+            if not isinstance(_pg_dict, dict):
+                raise SystemExit(0)
+            _pg_val = _pg_dict.get(_pg_attr_name, _pg_manifest_mods)
             if _pg_val is _pg_manifest_mods:
+                # Attr not in module.__dict__ directly — could be a
+                # lazy-loaded submodule or descriptor defined on the
+                # module's type. Permit getattr only when _pg_mod is a
+                # plain ModuleType (no proxy) — already enforced above.
                 _pg_val = getattr(_pg_mod, _pg_attr_name)
         _pg_manifest_pairs.append((_pg_mid, _pg_val))
+    except SystemExit:
+        raise
     except BaseException as _pg_exc:
         _pg_manifest_pairs.append((_pg_mid, _pg_exc))
 _pg_manifest_pairs = tuple(_pg_manifest_pairs)
@@ -314,11 +342,6 @@ del _pg_boot_mask, _pg_boot_plain, _pg_schema_ct, _pg_ir_ct, _pg_schema_label, _
 # shard_alpha uses fresh per-run entropy via id()+env hash so that a
 # shard capture from one execution cannot be replayed against another
 # execution of the same stub.
-_pg_ks_a = hashlib.sha256(id(_pg_boot_blob).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + id(_pg_env).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + id(_pg_interp_fn).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + _pg_env).digest()[:12]
-_pg_ks_b = bytes(a ^ b for a, b in zip(bytes(_pg_boot_key), _pg_ks_a))
-_pg_interp_fn.__globals__[bytes([95, 80, 71, 95, 75, 83, 65]).decode()] = _pg_ks_a
-_pg_boot_fn.__dict__[bytes([95, 80, 71, 95, 75, 83, 66]).decode()] = _pg_ks_b
-del _pg_boot_key, _pg_ks_a, _pg_ks_b
 # v6.3: late-phase trace guard. The gettrace check at the top of stage2
 # is a snapshot — an attacker with an addaudithook listening for
 # 'import' events can install sys.settrace DURING the manifest load
@@ -330,6 +353,13 @@ del _pg_boot_key, _pg_ks_a, _pg_ks_b
 # Re-verify now, so the window between the top-of-stage2 check and this
 # call is closed. Also scan sys.monitoring tool-ids on 3.12+, which can
 # install a CALL-event callback via a separate API.
+#
+# v6.6: these checks run BEFORE the shard stash, not after. Previously
+# trace/monitoring detection ran after _PG_KSA/_PG_KSB were already on
+# reflection-reachable surfaces, so a smart attacker whose hook walked
+# gc.get_objects() on every audit event could capture both shards even
+# while we were about to abort. Moving the check up means instrumented
+# runs never materialize shard state in the first place.
 if sys.gettrace() is not None or sys.getprofile() is not None:
     raise SystemExit(0)
 _pg_mon_sv = getattr(sys, bytes([109, 111, 110, 105, 116, 111, 114, 105, 110, 103]).decode(), None)
@@ -341,6 +371,55 @@ if _pg_mon_sv is not None:
         except ValueError:
             pass
 del _pg_mon_sv
+# v6.6: audit-hook presence detection via timing probe. gettrace /
+# getprofile / sys.monitoring do NOT cover sys.addaudithook, and audit
+# hooks are the natural vehicle for the shard-recovery attack against
+# v6.5: install a hook that does gc.get_objects() on every audit event,
+# then let stage2 run — between the shard stash below and _pg_boot's
+# internal pop, some audit event (e.g. 'import' inside _pg_boot's
+# payload decompress path) fires, the hook sweeps the heap, and both
+# shards fall out as 12-byte bytes objects in dicts / function __dict__.
+# Audit hooks cannot be removed once installed, but the heavy-handler
+# pattern this attack requires makes sys.audit() measurably slow. Fire
+# a tight burst and abort if the loop is many orders of magnitude
+# slower than the no-hook baseline. Baseline on a clean interpreter is
+# typically 20-100us for 1000 audits (~50ns per call); a handler that
+# walks gc.get_objects() pushes per-call cost into the tens of
+# microseconds, so the burst takes tens of milliseconds. The 5ms
+# threshold sits comfortably above baseline and well below the heavy-
+# handler regime, giving clean discrimination with a wide safety band.
+import time as _pg_t_ah
+_pg_probe_ev = bytes([112, 103, 95, 112, 114, 111, 98, 101]).decode()
+_pg_t_ah0 = _pg_t_ah.perf_counter_ns()
+for _pg_ah_i in range(8):
+    sys.audit(_pg_probe_ev)
+    if _pg_t_ah.perf_counter_ns() - _pg_t_ah0 > 500_000:
+        raise SystemExit(0)
+del _pg_t_ah, _pg_t_ah0, _pg_probe_ev, _pg_ah_i
+_pg_ks_a = hashlib.sha256(id(_pg_boot_blob).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + id(_pg_env).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + id(_pg_interp_fn).to_bytes(8, bytes([108, 105, 116, 116, 108, 101]).decode()) + _pg_env).digest()[:12]
+_pg_ks_b = bytes(a ^ b for a, b in zip(bytes(_pg_boot_key), _pg_ks_a))
+# v6.7 decoy wrap: a surgical attacker (audit hook filtering by event
+# name to dodge the v6.6 timing trip) can still walk gc.get_objects()
+# during the narrow shard-live window and pattern-match any 12-byte
+# bytes value reachable from a dict or FunctionType __dict__. Instead
+# of storing the raw shard under a flat dict entry, wrap each shard in
+# a fixed-shape tuple whose other slots are per-run random 12-byte
+# decoys of the same length. A naive attacker iterating dict values and
+# filtering by isinstance(v, (bytes, bytearray)) and len(v) == 12 sees
+# nothing and gives up; an attacker iterating tuples too now faces
+# N**2 XOR combinations per (a, b) pair and must recompute shake_128
+# keystream per candidate, which is costly enough that even recovery
+# is a work-factor win. _pg_boot derives the real slot index from the
+# same env/id witnesses it already consumes.
+import os as _pg_os_t
+_pg_decoy_pool_a = [_pg_os_t.urandom(12) for _pg_decoy_i in range(4)]
+_pg_decoy_pool_b = [_pg_os_t.urandom(12) for _pg_decoy_i in range(4)]
+_pg_ks_idx = hashlib.sha256(b'ksidx' + id(_pg_boot_blob).to_bytes(8, 'little') + _pg_env).digest()[0] & 3
+_pg_decoy_pool_a[_pg_ks_idx] = _pg_ks_a
+_pg_decoy_pool_b[_pg_ks_idx] = _pg_ks_b
+_pg_interp_fn.__globals__[bytes([95, 80, 71, 95, 75, 83, 65]).decode()] = tuple(_pg_decoy_pool_a)
+_pg_boot_fn.__dict__[bytes([95, 80, 71, 95, 75, 83, 66]).decode()] = tuple(_pg_decoy_pool_b)
+del _pg_boot_key, _pg_ks_a, _pg_ks_b, _pg_decoy_pool_a, _pg_decoy_pool_b, _pg_ks_idx, _pg_os_t
 # v6.5: the boot key is NOT passed through the args tuple AND is NOT in
 # stage2's caller-frame locals. Two shards live in _pg_boot's own scope
 # (interp globals + boot-fn attribute dict); _pg_boot combines them

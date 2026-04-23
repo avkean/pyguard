@@ -33,6 +33,9 @@ Placeholders substituted by `build_v13_3_stub.py`:
     __MAX_STEPS__              — int (per-stage instruction cap).
 """
 from __future__ import annotations
+import ast
+import io
+import tokenize
 
 
 BOOTSTRAP_TEMPLATE = r'''#!/usr/bin/env python3
@@ -179,4 +182,57 @@ def render(*, vm_source: str, salt: bytes, nonce_a: bytes, nonce_b: bytes,
     out = BOOTSTRAP_TEMPLATE
     for k, v in subs.items():
         out = out.replace(k, v)
+    return _minify_python_source(out)
+
+
+def _docstring_lines(src: str) -> set[int]:
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return set()
+    out: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = getattr(node, "body", None)
+        if not body or len(body) == 1:
+            continue
+        first = body[0]
+        if (isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            for ln in range(first.lineno, getattr(first, "end_lineno", first.lineno) + 1):
+                out.add(ln)
     return out
+
+
+def _minify_python_source(src: str) -> str:
+    """Strip comments, blank lines, and docstrings from generated stubs."""
+    doc_lines = _docstring_lines(src)
+    lines = src.splitlines(keepends=True)
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except tokenize.TokenizeError:
+        toks = []
+    for tok in reversed(toks):
+        if tok.type != tokenize.COMMENT:
+            continue
+        sl, sc = tok.start
+        _, ec = tok.end
+        line = lines[sl - 1]
+        if sl == 1 and line.startswith("#!"):
+            continue
+        before = line[:sc].rstrip()
+        after = line[ec:]
+        if before:
+            lines[sl - 1] = before + ("\n" if line.endswith("\n") else "")
+        else:
+            lines[sl - 1] = after if after.endswith("\n") else after + "\n"
+    out = []
+    for i, line in enumerate(lines, start=1):
+        if i in doc_lines:
+            continue
+        if line.strip() == "":
+            continue
+        out.append(line if line.endswith("\n") else line + "\n")
+    return "".join(out)

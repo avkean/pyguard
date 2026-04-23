@@ -14,6 +14,7 @@ import builtins
 import struct as _pg_struct
 import sys
 import hashlib as _pg_hashlib
+import os as _pg_os
 
 
 # v6.5 / C17 — capture real built-in type objects via C-slot __class__ reads
@@ -397,13 +398,13 @@ _S_M = b''  # XOR mask
 _S_L = {}   # field layouts
 _S_IS = b''  # schema-derived semantic-island build secret
 
-# v6.5 / C19 — pinned builtins snapshot. Populated by `_pg_boot` from an
-# 11th arg supplied by stage2, which captures `dict(__builtins__)` after
-# stage2's envCheck snapshot and BEFORE stage2's `marshal.loads` — the
+# v6.5 / C19 — pinned builtins snapshot. Populated by `_pg_boot` from
+# the stage2 packet call (`boot_blob, builtins_snapshot, import_lut`).
+# Stage2 captures `dict(__builtins__)` after envCheck and before the
 # first post-envCheck audit-event opportunity an attacker can use to
 # swap `builtins.print`. `Scope.get` consults `_PG_BI` before falling
-# back to `getattr(builtins, name)`, so a post-boot `builtins.print = spy`
-# swap is invisible to user name resolution.
+# back to `getattr(builtins, name)`, so a post-boot swap is invisible to
+# user name resolution.
 _PG_BI = {}
 # Static import lookup table resolved inside `_pg_boot` from the encrypted
 # manifest blob. Maps manifest ids -> resolved module objects, imported
@@ -654,6 +655,177 @@ def _nf(node, field, default=_MISSING):
 
 
 # --- scope ---------------------------------------------------------------
+#
+# v6.8 / C19 — opaque module-level str/bytes binding.
+#
+# Pre-v6.8 hole: at a hostile `input()` callback, a frame walker could
+# deep-walk `Scope.globals` (the module's backing dict) and find any
+# module-level decisive literal — e.g., `FLAG = "EC3{REDACTED}"` landed
+# as a plaintext `str` under that key, visible via
+#   sys._getframe(2).f_locals['<scope_local>'].globals['<flag_name>']
+# which the disclosure-check deep-frame scanner confirmed as an OPEN
+# leak against the v5/v6 fixture.
+#
+# `_PgB` is an opaque XOR-encoded wrapper holding `(enc_bytes, nonce, t)`
+# in `__slots__` only — no adjacent key slot, no `__dict__`, no
+# content-revealing `__repr__`, and no instance-level unwrap helper that
+# a hostile walker could call directly off the stored object. `_PgGlobals`
+# stores every non-dunder module-scope str/bytes binding in this opaque
+# form; keyed lookup unwraps via runtime-private helpers so user
+# semantics stay intact.
+# The plaintext never materializes inside the raw `scope.globals`
+# storage or its `dict.items()` walk — it only exists transiently on the
+# interpreter's value stack during a specific keyed read.
+
+_PG_WRAP_SEED = _pg_hashlib.shake_128(_pg_os.urandom(32))
+_PG_INPUT_FREEZE_DEPTH = 0
+
+
+def _pg_wrap_key(nonce, length):
+    if _PG_INPUT_FREEZE_DEPTH:
+        raise RuntimeError("input boundary")
+    h = _PG_WRAP_SEED.copy()
+    h.update(nonce)
+    return h.digest(length)
+
+
+class _PgB:
+    """Opaque wrapper for module-level str/bytes bindings.
+
+    Stores the value XOR-encoded with a per-instance nonce in `__slots__`.
+    The stream key is derived from process-local runtime state, not stored on
+    the wrapper next to the ciphertext. Default `__repr__` yields only
+    `<_PgB object at 0x...>`, never the plaintext.
+    """
+
+    __slots__ = ('_e', '_n', '_t')
+
+    def __init__(self, value):
+        import os as _os
+        if isinstance(value, bytes):
+            raw = bytes(value)
+            self._t = 1
+        else:
+            raw = value.encode('utf-8')
+            self._t = 0
+        nonce = _pg_os.urandom(16)
+        key = _pg_wrap_key(nonce, len(raw)) if raw else b''
+        self._e = bytes(a ^ b for a, b in zip(raw, key))
+        self._n = nonce
+
+def _pg_maybe_wrap(value):
+    if isinstance(value, (str, bytes)):
+        return _PgB(value)
+    return value
+
+
+def _pg_unwrap(value):
+    if isinstance(value, _PgB):
+        raw = bytes(a ^ b for a, b in zip(value._e, _pg_wrap_key(value._n, len(value._e))))
+        if value._t == 0:
+            return raw.decode('utf-8')
+        return raw
+    return value
+
+
+def _pg_should_wrap_name(name, value):
+    if not isinstance(value, (str, bytes)):
+        return False
+    if isinstance(name, str) and name[:2] == '__' and name[-2:] == '__':
+        return False
+    return True
+
+
+class _PgGlobals(dict):
+    """Live module namespace with opaque storage and unwrapped lookup.
+
+    The underlying dict storage keeps module-scope str/bytes bindings as
+    `_PgB` wrappers so deep frame walkers that recurse through raw dict
+    items do not see plaintext. Normal keyed lookup (`globals()['x']`,
+    `globals().get('x')`) unwraps transparently, and Python-level writes
+    (`globals()['x'] = ...`) write through to the real backing dict.
+
+    C-level writes performed by `types.FunctionType(..., globals())()`
+    bypass `__setitem__` and land raw in the dict storage. `__getitem__`
+    seals those values on first keyed read so later storage snapshots
+    return to the opaque form.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, initial=None):
+        dict.__init__(self)
+        if initial:
+            self.update(initial)
+
+    def _seal_if_needed(self, key):
+        v = dict.__getitem__(self, key)
+        if _pg_should_wrap_name(key, v) and not isinstance(v, _PgB):
+            v = _pg_maybe_wrap(v)
+            dict.__setitem__(self, key, v)
+        return v
+
+    def __getitem__(self, key):
+        if _PG_INPUT_FREEZE_DEPTH and _pg_should_wrap_name(key, dict.get(self, key)):
+            raise KeyError(key)
+        return _pg_unwrap(self._seal_if_needed(key))
+
+    def __setitem__(self, key, value):
+        if _pg_should_wrap_name(key, value):
+            value = _pg_maybe_wrap(value)
+        dict.__setitem__(self, key, value)
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return self[key]
+        return default
+
+    def setdefault(self, key, default=None):
+        if dict.__contains__(self, key):
+            return self[key]
+        self[key] = default
+        return self[key]
+
+    def update(self, *args, **kwargs):
+        for k, v in dict(*args, **kwargs).items():
+            self[k] = v
+
+
+def _pg_call_host(scope, fn, args, kwargs=None):
+    if fn is builtins.input or fn is _PG_BI.get('input'):
+        return _pg_call_input_with_depth(args, kwargs)
+    if kwargs is None:
+        return fn(*args)
+    return fn(*args, **kwargs)
+
+
+def _pg_safe_input(args, kwargs=None):
+    if kwargs:
+        raise TypeError("input() takes no keyword arguments")
+    if len(args) > 1:
+        raise TypeError("input expected at most 1 argument, got " + str(len(args)))
+    prompt = args[0] if args else ''
+    if prompt:
+        sys.__stdout__.write(str(prompt))
+        sys.__stdout__.flush()
+    line = sys.__stdin__.readline()
+    if line == '':
+        raise EOFError
+    if line.endswith('\n'):
+        line = line[:-1]
+        if line.endswith('\r'):
+            line = line[:-1]
+    return line
+
+
+def _pg_call_input_with_depth(args, kwargs=None):
+    global _PG_INPUT_FREEZE_DEPTH
+    _PG_INPUT_FREEZE_DEPTH += 1
+    try:
+        return _pg_safe_input(args, kwargs)
+    finally:
+        _PG_INPUT_FREEZE_DEPTH -= 1
+
 
 class Scope:
     """Lexical scope. Chains via parent. Module scope has vars==globals."""
@@ -664,11 +836,14 @@ class Scope:
     def __init__(self, parent=None, globals_=None, is_module=False):
         self.parent = parent
         if globals_ is not None:
-            self.globals = globals_
+            if is_module and not isinstance(globals_, _PgGlobals):
+                self.globals = _PgGlobals(globals_)
+            else:
+                self.globals = globals_
         elif parent is not None:
             self.globals = parent.globals
         else:
-            self.globals = {}
+            self.globals = _PgGlobals() if is_module else {}
         if is_module:
             self.vars = self.globals
         else:
@@ -678,9 +853,11 @@ class Scope:
         self.is_module = is_module
 
     def get(self, name):
+        if _PG_INPUT_FREEZE_DEPTH:
+            raise NameError(name)
         if name in self.global_names:
             if name in self.globals:
-                return self.globals[name]
+                return _pg_unwrap(self.globals[name])
             if name in _PG_BI:
                 return _PG_BI[name]
             try:
@@ -691,18 +868,18 @@ class Scope:
             p = self.parent
             while p is not None:
                 if not p.is_module and name in p.vars:
-                    return p.vars[name]
+                    return _pg_unwrap(p.vars[name])
                 p = p.parent
             raise NameError(name)
         if name in self.vars:
-            return self.vars[name]
+            return _pg_unwrap(self.vars[name])
         p = self.parent
         while p is not None:
             if name in p.vars:
-                return p.vars[name]
+                return _pg_unwrap(p.vars[name])
             p = p.parent
         if name in self.globals:
-            return self.globals[name]
+            return _pg_unwrap(self.globals[name])
         if name in _PG_BI:
             return _PG_BI[name]
         try:
@@ -1475,7 +1652,7 @@ class Interp:
                     args = [stack.pop() for _ in range(argc)]
                     args.reverse()
                     fn = stack.pop()
-                    stack.append(fn(*args))
+                    stack.append(_pg_call_host(scope, fn, tuple(args)))
                     continue
                 if op == 'UNARY':
                     stack.append(_pg_si_unary(_u8(), stack.pop()))
@@ -1528,7 +1705,7 @@ class Interp:
                 return
             fn, args = request
             try:
-                value = fn(*args)
+                value = _pg_call_host(scope, fn, args)
             except BaseException as exc:
                 raised = exc
 
@@ -2013,17 +2190,17 @@ class Interp:
                     return builtins.super(cls_v, self_v)
                 return builtins.super()
             # Intercept builtins.globals() / builtins.locals() so they
-            # return the user's simulated scope dicts, not the interpreter
-            # module's native Python globals. Needed because _SecretGate
-            # emits `FunctionType(co, globals())()`: without this intercept
-            # the compiled code writes into the interpreter's globals dict
-            # instead of scope.globals, and later user-level name lookups
-            # miss the assignment.
+            # return the user's simulated module namespace object, not the
+            # interpreter module's native Python globals. `_PgGlobals` keeps
+            # the backing storage live for write-through compatibility while
+            # storing module-scope str/bytes opaquely at rest.
             if (func is builtins.globals
                     and not _nf(node, 'args') and not _nf(node, 'keywords')):
                 return scope.globals
             if (func is builtins.locals
                     and not _nf(node, 'args') and not _nf(node, 'keywords')):
+                if scope.vars is scope.globals:
+                    return scope.vars
                 return scope.vars
             args = []
             for a in _nf(node, 'args'):
@@ -2042,7 +2219,7 @@ class Interp:
                 else:
                     kv = yield from self.step_expr(_nf(kw, 'value'), scope)
                     kwargs[self.s(arg_idx)] = kv
-            return func(*args, **kwargs)
+            return _pg_call_host(scope, func, tuple(args), kwargs)
 
         if op == 'Attribute':
             v = yield from self.step_expr(_nf(node, 'value'), scope)
@@ -2997,11 +3174,7 @@ def _pg_boot(*_a):
     """PyGuard interpreter entry point.
 
     Signature:
-      - v13 packet path: boot_blob, boot_key, builtins_snapshot, import_pairs
-      - legacy path (9..12 positional args, no stage2 callables):
-        schema_ct, schema_label, ir_ct, ir_label, seed, interp_hash,
-        env_hash, pep, profile[, module_name='__main__'[, builtins_snapshot
-        [, import_pairs]]]
+      - packet path: boot_blob, builtins_snapshot, import_pairs
 
     All stage2-supplied "config" is inert bytes: a 32-byte `pep` pepper,
     and a 15-byte `profile` struct (rounds, rot_mod, sbx_nudge,
@@ -3081,14 +3254,27 @@ def _pg_boot(*_a):
         _self_fn = _own_ns.get(_own_frame.f_code.co_name)
         if _self_fn is None:
             raise SystemExit(0)
-        _ks_a = _own_ns.pop('_PG_KSA', None)
-        _ks_b = _self_fn.__dict__.pop('_PG_KSB', None)
+        # v6.7: stash is now a 4-tuple of 12-byte blobs (3 per-run decoys
+        # + 1 real shard) per side. Real slot index is derived from the
+        # same env/id witnesses stage2 used; stage2 and here must agree.
+        _ks_tup_a = _own_ns.pop('_PG_KSA', None)
+        _ks_tup_b = _self_fn.__dict__.pop('_PG_KSB', None)
+        if (not isinstance(_ks_tup_a, tuple) or not isinstance(_ks_tup_b, tuple)
+                or len(_ks_tup_a) != 4 or len(_ks_tup_b) != 4):
+            raise SystemExit(0)
+        import hashlib as _h_ks
+        _boot_blob_ref = _boot_blob
+        _env_ks = _pg_compute_env()
+        _ks_idx = _h_ks.sha256(b'ksidx' + id(_boot_blob_ref).to_bytes(8, 'little') + _env_ks).digest()[0] & 3
+        _ks_a = _ks_tup_a[_ks_idx]
+        _ks_b = _ks_tup_b[_ks_idx]
         if (not isinstance(_ks_a, (bytes, bytearray))
                 or not isinstance(_ks_b, (bytes, bytearray))
                 or len(_ks_a) != 12 or len(_ks_b) != 12):
             raise SystemExit(0)
         _boot_key = bytes(a ^ b for a, b in zip(_ks_a, _ks_b))
         del _own_frame, _own_ns, _self_fn, _ks_a, _ks_b, _sys_tg, _mon_tg
+        del _ks_tup_a, _ks_tup_b, _ks_idx, _h_ks, _boot_blob_ref, _env_ks
         _boot_buf = memoryview(_boot_blob)
         _boot_key_buf = memoryview(_boot_key)
         _boot_key_len = len(_boot_key_buf)
@@ -3125,21 +3311,8 @@ def _pg_boot(*_a):
         if _o != _boot_total:
             raise TypeError("_pg_boot: bad packet")
         module_name = '__main__'
-    elif len(_a) == 9:
-        (schema_ct, schema_label, ir_ct, ir_label, seed,
-         interp_hash, env_hash, pep, profile) = _a
-        module_name = '__main__'
-    elif len(_a) == 10:
-        (schema_ct, schema_label, ir_ct, ir_label, seed,
-         interp_hash, env_hash, pep, profile, module_name) = _a
-    elif len(_a) == 11:
-        (schema_ct, schema_label, ir_ct, ir_label, seed,
-         interp_hash, env_hash, pep, profile, module_name, _bi_snap) = _a
-    elif len(_a) == 12:
-        (schema_ct, schema_label, ir_ct, ir_label, seed,
-         interp_hash, env_hash, pep, profile, module_name, _bi_snap, _imp_lut) = _a
     else:
-        raise TypeError("_pg_boot: expected 9..12 args, got " + str(len(_a)))
+        raise TypeError("_pg_boot: expected packet args, got " + str(len(_a)))
     del _a
     global _PG_BI, _PG_IMP
     if isinstance(_bi_snap, dict):
