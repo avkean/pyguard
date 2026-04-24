@@ -275,7 +275,7 @@ def evil(_prompt=''):
         machine = frame.f_locals.get('machine')
         if machine is not None:
             scope.globals['wins'] = 99
-            machine._name_seals[:] = [None] * len(machine._name_seals)
+            machine._name_seals.clear()
             break
         depth += 1
     return 'rock'

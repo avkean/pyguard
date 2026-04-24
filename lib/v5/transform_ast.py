@@ -1861,10 +1861,6 @@ class _SemanticIslandCompiler:
         self._build_secret = bytes(build_secret or b'')
         self._uses_slot = False
         self._used_slots = set()
-        self._names = []
-        self._name_idx = {}
-        self._consts = []
-        self._const_idx = {}
         self._insts = []
         self._labels = {}
         self._loop_stack = []
@@ -1911,8 +1907,6 @@ class _SemanticIslandCompiler:
             'compareop': (rng.randint(0, 255), rng.randint(0, 255)),
         }
         self._u16_keys = {
-            'name': (rng.randint(0, 0xFFFF), rng.randint(0, 0xFFFF)),
-            'const': (rng.randint(0, 0xFFFF), rng.randint(0, 0xFFFF)),
             'slot': (rng.randint(0, 0xFFFF), rng.randint(0, 0xFFFF)),
             'jump': (rng.randint(0, 0xFFFF), rng.randint(0, 0xFFFF)),
         }
@@ -1925,33 +1919,6 @@ class _SemanticIslandCompiler:
     def aux_key(self):
         ident = (self._island_id & 0xFFFFFFFF).to_bytes(4, 'little')
         return hashlib.sha256(self._build_secret + b'|pgsi-key|' + ident + b'|').digest()
-
-    def _key_for_const(self, value):
-        t = type(value)
-        if t is list:
-            return ('list', tuple(self._key_for_const(x) for x in value))
-        if t is tuple:
-            return ('tuple', tuple(self._key_for_const(x) for x in value))
-        if t is bytes:
-            return ('bytes', bytes(value))
-        return (t.__name__, repr(value))
-
-    def _const(self, value):
-        key = self._key_for_const(value)
-        idx = self._const_idx.get(key)
-        if idx is None:
-            idx = len(self._consts)
-            self._const_idx[key] = idx
-            self._consts.append(value)
-        return idx
-
-    def _name(self, value):
-        idx = self._name_idx.get(value)
-        if idx is None:
-            idx = len(self._names)
-            self._name_idx[value] = idx
-            self._names.append(value)
-        return idx
 
     def _emit(self, opname, *operands):
         self._insts.append({'op': opname, 'operands': list(operands)})
@@ -2066,10 +2033,10 @@ class _SemanticIslandCompiler:
             self._emit('LOAD_SLOT', ('slot', slot_idx))
             return
         if isinstance(node, ast.Constant):
-            self._emit('LOAD_CONST', ('const', self._const(node.value)))
+            self._emit('LOAD_CONST', ('const', self._pack_const(node.value)))
             return
         if isinstance(node, ast.Name):
-            self._emit('LOAD_NAME', ('name', self._name(node.id)))
+            self._emit('LOAD_NAME', ('name', self._pack_const(node.id)))
             return
         if isinstance(node, ast.List):
             for elt in node.elts:
@@ -2115,10 +2082,10 @@ class _SemanticIslandCompiler:
             l_false = self._new_label()
             l_end = self._new_label()
             self._compile_test_jump_false(node, l_false)
-            self._emit('LOAD_CONST', ('const', self._const(True)))
+            self._emit('LOAD_CONST', ('const', self._pack_const(True)))
             self._emit('JUMP', ('label', l_end))
             self._label(l_false)
-            self._emit('LOAD_CONST', ('const', self._const(False)))
+            self._emit('LOAD_CONST', ('const', self._pack_const(False)))
             self._label(l_end)
             return
         raise ValueError('unsupported expr')
@@ -2131,7 +2098,7 @@ class _SemanticIslandCompiler:
             self._emit('STORE_SLOT', ('slot', slot_idx))
             return
         if isinstance(target, ast.Name):
-            self._emit('STORE_NAME', ('name', self._name(target.id)))
+            self._emit('STORE_NAME', ('name', self._pack_const(target.id)))
             return
         raise ValueError('unsupported store target')
 
@@ -2192,7 +2159,7 @@ class _SemanticIslandCompiler:
             return
         if isinstance(stmt, ast.Return):
             if stmt.value is None:
-                self._emit('LOAD_CONST', ('const', self._const(None)))
+                self._emit('LOAD_CONST', ('const', self._pack_const(None)))
             else:
                 self._compile_expr(stmt.value, allow_bool=False)
             self._emit('RETURN')
@@ -2308,12 +2275,46 @@ class _SemanticIslandCompiler:
             out[i] = (state >> 16) & 0xFF
         return bytes(out)
 
+    def _inline_stream(self, kind, site, n):
+        seed = hashlib.sha256(
+            self.aux_key + b'|pgsi-inline|' +
+            bytes([kind & 0xFF]) + site.to_bytes(2, 'little')
+        ).digest()
+        out = bytearray()
+        ctr = 0
+        while len(out) < n:
+            out.extend(
+                hashlib.sha256(
+                    seed + ctr.to_bytes(2, 'little')
+                ).digest()
+            )
+            ctr += 1
+        return bytes(out[:n])
+
+    def _inline_len_mask(self, kind, site):
+        return int.from_bytes(
+            hashlib.sha256(
+                self.aux_key + b'|pgsi-inline-len|' +
+                bytes([kind & 0xFF]) + site.to_bytes(2, 'little')
+            ).digest()[:2],
+            'little',
+        )
+
+    def _pack_inline_operand(self, kind, site, raw):
+        length = len(raw)
+        enc_length = length ^ self._inline_len_mask(kind, site)
+        stream = self._inline_stream(kind, site, length)
+        enc = bytes(raw[i] ^ stream[i] for i in range(length))
+        return enc_length.to_bytes(2, 'little') + enc
+
     def _inst_size(self, inst):
         size = 1
-        for kind, _value in inst['operands']:
+        for kind, value in inst['operands']:
             if kind in ('count', 'unaryop', 'binaryop', 'compareop'):
                 size += 1
-            elif kind in ('name', 'const', 'slot', 'label'):
+            elif kind in ('name', 'const'):
+                size += 2 + len(value)
+            elif kind in ('slot', 'label'):
                 size += 2
             else:
                 raise ValueError(kind)
@@ -2321,17 +2322,9 @@ class _SemanticIslandCompiler:
 
     def _assemble(self):
         rng = self.ng._rng
-        name_order = list(range(len(self._names)))
-        const_order = list(range(len(self._consts)))
         slot_order = sorted(self._used_slots)
-        rng.shuffle(name_order)
-        rng.shuffle(const_order)
         rng.shuffle(slot_order)
-        name_map = {old: new for new, old in enumerate(name_order)}
-        const_map = {old: new for new, old in enumerate(const_order)}
         slot_map = {old: new for new, old in enumerate(slot_order)}
-        names = [self._names[idx] for idx in name_order]
-        consts = [self._consts[idx] for idx in const_order]
 
         pcs = []
         pc = 0
@@ -2357,11 +2350,9 @@ class _SemanticIslandCompiler:
                 elif kind == 'compareop':
                     code.append(self._enc_u8(self._compare_codes[value], 'compareop'))
                 elif kind == 'name':
-                    enc = self._enc_u16(name_map[value], 'name')
-                    code.extend((enc & 0xFF, (enc >> 8) & 0xFF))
+                    code.extend(self._pack_inline_operand(1, cur_pc, value))
                 elif kind == 'const':
-                    enc = self._enc_u16(const_map[value], 'const')
-                    code.extend((enc & 0xFF, (enc >> 8) & 0xFF))
+                    code.extend(self._pack_inline_operand(2, cur_pc, value))
                 elif kind == 'slot':
                     enc = self._enc_u16(slot_map[value], 'slot')
                     code.extend((enc & 0xFF, (enc >> 8) & 0xFF))
@@ -2374,7 +2365,7 @@ class _SemanticIslandCompiler:
                     code.extend((enc & 0xFF, (enc >> 8) & 0xFF))
                 else:
                     raise ValueError(kind)
-        return names, consts, slot_order, bytes(code)
+        return slot_order, bytes(code)
 
     def compile(self, node):
         if isinstance(node, list):
@@ -2382,7 +2373,7 @@ class _SemanticIslandCompiler:
                 self._compile_stmt(stmt)
         else:
             self._compile_stmt(node)
-        names, consts, slot_order, code_plain = self._assemble()
+        slot_order, code_plain = self._assemble()
         seed = self.ng._rng.getrandbits(32)
         mask = self._mask_stream(seed, len(code_plain))
         code = bytes((code_plain[i] ^ mask[i]) for i in range(len(code_plain)))
@@ -2412,12 +2403,6 @@ class _SemanticIslandCompiler:
         parts.append(len(slot_order).to_bytes(2, 'little'))
         for slot_idx in slot_order:
             parts.append(slot_idx.to_bytes(2, 'little'))
-        parts.append(len(names).to_bytes(2, 'little'))
-        for name in names:
-            parts.append(self._pack_const(name))
-        parts.append(len(consts).to_bytes(2, 'little'))
-        for const in consts:
-            parts.append(self._pack_const(const))
         parts.append(bytes(self._opcodes[name] for name in self._LOGICAL_OPS))
         parts.append(bytes(self._unary_codes[name] for name in self._UNARY_LOGICAL))
         parts.append(bytes(self._binary_codes[name] for name in self._BINARY_LOGICAL))
@@ -2425,7 +2410,7 @@ class _SemanticIslandCompiler:
         for kind in ('count', 'unaryop', 'binaryop', 'compareop'):
             add, xor = self._u8_keys[kind]
             parts.append(bytes([add, xor]))
-        for kind in ('name', 'const', 'slot', 'jump'):
+        for kind in ('slot', 'jump'):
             add, xor = self._u16_keys[kind]
             parts.append(add.to_bytes(2, 'little'))
             parts.append(xor.to_bytes(2, 'little'))

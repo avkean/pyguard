@@ -831,10 +831,14 @@ class Scope:
     """Lexical scope. Chains via parent. Module scope has vars==globals."""
 
     __slots__ = ('vars', 'parent', 'globals', 'global_names',
-                 'nonlocal_names', 'is_module')
+                 'nonlocal_names', 'is_module', '_gate')
 
     def __init__(self, parent=None, globals_=None, is_module=False):
         self.parent = parent
+        if parent is not None:
+            self._gate = parent._gate
+        else:
+            self._gate = {'live': True}
         if globals_ is not None:
             if is_module and not isinstance(globals_, _PgGlobals):
                 self.globals = _PgGlobals(globals_)
@@ -852,9 +856,12 @@ class Scope:
         self.nonlocal_names = set()
         self.is_module = is_module
 
-    def get(self, name):
-        if _PG_INPUT_FREEZE_DEPTH:
+    def _check_live(self, name):
+        if _PG_INPUT_FREEZE_DEPTH or not self._gate.get('live', True):
             raise NameError(name)
+
+    def get(self, name):
+        self._check_live(name)
         if name in self.global_names:
             if name in self.globals:
                 return _pg_unwrap(self.globals[name])
@@ -888,6 +895,7 @@ class Scope:
             raise NameError(name)
 
     def set(self, name, value):
+        self._check_live(name)
         if name in self.global_names:
             self.globals[name] = value
             return
@@ -902,6 +910,7 @@ class Scope:
         self.vars[name] = value
 
     def delete(self, name):
+        self._check_live(name)
         if name in self.global_names:
             del self.globals[name]
             return
@@ -909,6 +918,14 @@ class Scope:
             del self.vars[name]
             return
         raise NameError(name)
+
+
+def _pg_freeze_scope(scope):
+    try:
+        if scope is not None:
+            scope._gate['live'] = False
+    except Exception:
+        pass
 
 
 # --- user function -------------------------------------------------------
@@ -1018,7 +1035,6 @@ _PGSI_NOARG = object()
 class _IslandMachine:
     __slots__ = (
         '_scope', '_iid', '_flags', '_layout', '_slot_layout',
-        '_names_buf', '_name_idx', '_const_buf', '_const_idx',
         '_ops', '_unary', '_binary', '_compare',
         '_u8', '_u16', '_seed', '_enc', '_code_len',
         '_state', '_name_seals', '_slot_seals', '_tr', '_hold',
@@ -1051,24 +1067,6 @@ class _IslandMachine:
             slot_layout.append(int.from_bytes(payload[pos:pos+2], 'little'))
             pos += 2
 
-        name_count = int.from_bytes(payload[pos:pos+2], 'little')
-        pos += 2
-        name_start = pos
-        name_idx = []
-        for _ in range(name_count):
-            name_idx.append(pos - name_start)
-            _value, pos = _pg_si_unpack_const(payload, pos)
-        names_buf = payload[name_start:pos]
-
-        const_count = int.from_bytes(payload[pos:pos+2], 'little')
-        pos += 2
-        const_start = pos
-        const_idx = []
-        for _ in range(const_count):
-            const_idx.append(pos - const_start)
-            _value, pos = _pg_si_unpack_const(payload, pos)
-        const_buf = payload[const_start:pos]
-
         ops = _PGBT(payload[pos:pos + 20])
         pos += 20
         unary = _PGBT(payload[pos:pos + 4])
@@ -1083,7 +1081,7 @@ class _IslandMachine:
             u8.append((payload[pos], payload[pos + 1]))
             pos += 2
         u16 = []
-        for _ in range(4):
+        for _ in range(2):
             add = int.from_bytes(payload[pos:pos+2], 'little')
             xor = int.from_bytes(payload[pos+2:pos+4], 'little')
             pos += 4
@@ -1110,10 +1108,6 @@ class _IslandMachine:
         self._flags = flags
         self._layout = (pc_i, stack_i, slot_i, scratch_i)
         self._slot_layout = tuple(slot_layout)
-        self._names_buf = _PGBT(names_buf)
-        self._name_idx = tuple(name_idx)
-        self._const_buf = _PGBT(const_buf)
-        self._const_idx = tuple(const_idx)
         self._ops = ops
         self._unary = unary
         self._binary = binary
@@ -1124,7 +1118,7 @@ class _IslandMachine:
         self._enc = enc
         self._code_len = code_len
         self._state = state
-        self._name_seals = [None] * name_count
+        self._name_seals = {}
         self._slot_seals = [None] * slot_count
         self._tr = _pg_hashlib.sha256(
             _pg_si_island_key(island_id) + b'|pgsi-transcript|' +
@@ -1176,7 +1170,7 @@ class _IslandMachine:
             self._pc(),
             self._state[self._layout[3]],
             tuple(self._stack()),
-            tuple(self._name_seals),
+            tuple(sorted(self._name_seals.items())),
             tuple(self._slot_seals),
         )
         return _pg_hashlib.sha256(
@@ -1227,7 +1221,7 @@ class _IslandMachine:
         return ((raw ^ xor) - add) & 0xFFFF
 
     def _jump_target(self):
-        raw = self._dec_u16(self._u16_raw(), 3)
+        raw = self._dec_u16(self._u16_raw(), 1)
         if self._relative_jumps():
             if raw >= 0x8000:
                 raw -= 0x10000
@@ -1240,12 +1234,46 @@ class _IslandMachine:
                 return idx
         return -1
 
-    def _decode_name(self, idx):
-        value, _pos = _pg_si_unpack_const(self._names_buf, self._name_idx[idx])
+    def _inline_stream(self, kind, site, n):
+        seed = _pg_hashlib.sha256(
+            self._key() + b'|pgsi-inline|' +
+            bytes([kind & 0xFF]) + site.to_bytes(2, 'little')
+        ).digest()
+        out = bytearray()
+        ctr = 0
+        while len(out) < n:
+            out.extend(
+                _pg_hashlib.sha256(
+                    seed + ctr.to_bytes(2, 'little')
+                ).digest()
+            )
+            ctr += 1
+        return _PGBT(out[:n])
+
+    def _inline_len_mask(self, kind, site):
+        return int.from_bytes(
+            _pg_hashlib.sha256(
+                self._key() + b'|pgsi-inline-len|' +
+                bytes([kind & 0xFF]) + site.to_bytes(2, 'little')
+            ).digest()[:2],
+            'little',
+        )
+
+    def _inline_blob(self, kind, site):
+        enc_len = self._u16_raw()
+        raw_len = enc_len ^ self._inline_len_mask(kind, site)
+        stream = self._inline_stream(kind, site, raw_len)
+        out = bytearray(raw_len)
+        for i in range(raw_len):
+            out[i] = self._u8_raw() ^ stream[i]
+        return _PGBT(out)
+
+    def _inline_name(self, site):
+        value, _pos = _pg_si_unpack_const(self._inline_blob(1, site), 0)
         return _pg_si_materialize(value, self._key())
 
-    def _decode_const(self, idx):
-        value, _pos = _pg_si_unpack_const(self._const_buf, self._const_idx[idx])
+    def _inline_const(self, site):
+        value, _pos = _pg_si_unpack_const(self._inline_blob(2, site), 0)
         return _pg_si_materialize(value, self._key())
 
     def _slot_ref(self, idx):
@@ -1266,22 +1294,45 @@ class _IslandMachine:
         slot_ref[slot_idx] = value
         self._slot_seals[idx] = _pg_si_state_seal(self._key(), slot_idx, value)
 
-    def _load_name_value(self, idx):
-        name = self._decode_name(idx)
+    def _load_name_value(self, site):
+        name = self._inline_name(site)
         value = self._scope.get(name)
-        seal = self._name_seals[idx]
+        seal = self._name_seals.get(name)
         key = self._key()
+        tag = _pg_si_state_seal(key, 0x80000000, value)
         if seal is None:
-            self._name_seals[idx] = _pg_si_state_seal(key, 0x80000000 | idx, value)
-        elif seal != _pg_si_state_seal(key, 0x80000000 | idx, value):
+            self._name_seals[name] = tag
+        elif seal != tag:
             raise ValueError('semantic-island name state tampered')
         return value
 
-    def _store_name_value(self, idx, value):
-        name = self._decode_name(idx)
+    def _store_name_value(self, site, value):
+        name = self._inline_name(site)
         self._scope.set(name, value)
-        self._name_seals[idx] = _pg_si_state_seal(
-            self._key(), 0x80000000 | idx, value)
+        self._name_seals[name] = _pg_si_state_seal(
+            self._key(), 0x80000000, value)
+
+    def _scrub(self):
+        try:
+            if isinstance(self._state, list):
+                for idx in range(len(self._state)):
+                    self._state[idx] = None
+        except Exception:
+            pass
+        self._scope = None
+        self._slot_layout = ()
+        self._ops = b''
+        self._unary = b''
+        self._binary = b''
+        self._compare = b''
+        self._u8 = ()
+        self._u16 = ()
+        self._enc = b''
+        self._code_len = 0
+        self._name_seals = {}
+        self._slot_seals = []
+        self._tr = b''
+        self._hold = None
 
     def run(self, value=_PGSI_NOARG, raised=None):
         self._resume_host(value, raised)
@@ -1293,23 +1344,20 @@ class _IslandMachine:
             self._tick(0xA0, bytes([raw, pc & 0xFF, (pc >> 8) & 0xFF]))
             op = self._logical(raw)
             if op == 0:
-                idx = self._dec_u16(self._u16_raw(), 1)
-                self._push(self._decode_const(idx))
+                self._push(self._inline_const(pc))
                 continue
             if op == 1:
-                idx = self._dec_u16(self._u16_raw(), 0)
-                self._push(self._load_name_value(idx))
+                self._push(self._load_name_value(pc))
                 continue
             if op == 2:
-                idx = self._dec_u16(self._u16_raw(), 2)
+                idx = self._dec_u16(self._u16_raw(), 0)
                 self._push(self._slot_ref(idx))
                 continue
             if op == 3:
-                idx = self._dec_u16(self._u16_raw(), 0)
-                self._store_name_value(idx, self._pop())
+                self._store_name_value(pc, self._pop())
                 continue
             if op == 4:
-                idx = self._dec_u16(self._u16_raw(), 2)
+                idx = self._dec_u16(self._u16_raw(), 0)
                 self._slot_store(idx, self._pop())
                 continue
             if op == 5:
@@ -1471,6 +1519,9 @@ class Interp:
                 _drive_sync(self.step_block(_nf(tree, 'body'), scope))
         except _Return:
             pass
+        except BaseException:
+            _pg_freeze_scope(scope)
+            raise
 
     # ---- statement stepper (generator-of-events) ----
 
@@ -1697,17 +1748,29 @@ class Interp:
         machine = _IslandMachine(payload, scope)
         value = _PGSI_NOARG
         raised = None
-        while True:
-            request = machine.run(value, raised)
-            value = _PGSI_NOARG
-            raised = None
-            if request is None:
-                return
-            fn, args = request
+        try:
+            while True:
+                request = machine.run(value, raised)
+                value = _PGSI_NOARG
+                raised = None
+                if request is None:
+                    return
+                fn, args = request
+                try:
+                    value = _pg_call_host(scope, fn, args)
+                except BaseException as exc:
+                    raised = exc
+        except BaseException as exc:
             try:
-                value = _pg_call_host(scope, fn, args)
-            except BaseException as exc:
-                raised = exc
+                machine._scrub()
+            except Exception:
+                pass
+            raise exc.with_traceback(None)
+        finally:
+            try:
+                machine._scrub()
+            except Exception:
+                pass
 
     def step_inst(self, node, scope):
         if False:
@@ -3102,6 +3165,10 @@ def _pg_scrub_post_run(_acc, _interp):
                 _cell.cell_contents = None
             except Exception:
                 pass
+    except Exception:
+        pass
+    try:
+        setattr(_interp, '_a', None)
     except Exception:
         pass
     _g = globals()

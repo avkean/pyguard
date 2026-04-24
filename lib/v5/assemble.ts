@@ -190,7 +190,17 @@ except Exception:
 if ${n_tchk}():
     raise SystemExit(0)
 _pg_ft = (lambda: 0).__class__
-_pg_env = hashlib.sha256(bytes([124]).decode().join([str(len(sys._current_frames())), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, type(hashlib.shake_128).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), str(type(hashlib.shake_128) is type(zlib.decompress)), _pg_ft.__name__, str(_pg_ft is (lambda: None).__class__), _pg_ft.__class__.__name__, _pg_ft.__module__]).encode()).digest()
+def _pg_frame_probe():
+    try:
+        raise RuntimeError
+    except RuntimeError as _pg_probe_exc:
+        _pg_tb = _pg_probe_exc.__traceback__
+    _pg_depth = 0
+    while _pg_tb is not None:
+        _pg_depth += 1
+        _pg_tb = _pg_tb.tb_next
+    return _pg_depth
+_pg_env = hashlib.sha256(bytes([124]).decode().join([str(_pg_frame_probe()), type(zlib.decompress).__name__, type(print).__name__, type(getattr).__name__, type(sys.settrace).__name__, type(sys.setprofile).__name__, type(sys.gettrace).__name__, type(sys.getprofile).__name__, type(exec).__name__, type(marshal.loads).__name__, type(hashlib.scrypt).__name__, type(hashlib.shake_128).__name__, str(type(sys.settrace) is type(zlib.decompress)), str(type(sys.setprofile) is type(zlib.decompress)), str(type(sys.gettrace) is type(zlib.decompress)), str(type(sys.getprofile) is type(zlib.decompress)), str(type(exec) is type(zlib.decompress)), str(type(marshal.loads) is type(zlib.decompress)), str(type(hashlib.scrypt) is type(zlib.decompress)), str(type(hashlib.shake_128) is type(zlib.decompress)), _pg_ft.__name__, str(_pg_ft is (lambda: None).__class__), _pg_ft.__class__.__name__, _pg_ft.__module__]).encode()).digest()
 _pg_pkg = ${bootBundleVar}
 del ${bootBundleVar}
 if len(_pg_pkg) < 103 or _pg_pkg[:4] != bytes([80, 71, 66, 49]):
