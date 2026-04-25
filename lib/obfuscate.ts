@@ -1379,6 +1379,18 @@ export function obfuscatePythonCode(input: string, opts?: ObfuscateOpts): string
     const s1_m2Len   = ng.gen();
     const s1_boot2   = ng.gen();
     const s2_bootVar = ng.gen();
+    // v6.9: stage1 pre-loads the interpreter code-pack so `_loadc` does
+    // not need to live in stage2's globals. The names below are scratch
+    // for the stage1 decrypt / lzma / loadc pipeline; the loaded code
+    // object is handed to stage2 under `s2_interpVar`.
+    const s1_il        = ng.gen(); // interp ciphertext length
+    const s1_ilbl      = ng.gen(); // interp label bytes
+    const s1_ict       = ng.gen(); // interp ciphertext bytes
+    const s1_isd       = ng.gen(); // interp seed (sha256(seed || label))
+    const s1_ip        = ng.gen(); // params tuple from _kd
+    const s1_ipack     = ng.gen(); // decrypted + lzma'd PGCV bytes
+    const s1_icode     = ng.gen(); // loaded code object handed to stage2
+    const s2_interpVar = ng.gen();
 
     // Fast bulk-decrypt injected at stage1 (marshaled, so tight loop is
     // fine — no source-visible cipher to flatten). Produces byte-identical
@@ -2219,12 +2231,23 @@ ${END_MARKER}
         const interpCodePack = opts.compileAndPackCode(opts.interpreterSource, '<pg_i>');
         const interpPackedCompressed = opts.compress(interpCodePack);
 
-        // Interpreter cipher: derived from seed + interpLabel + envCheck.
-        // NOT XOR'd with interpHash because interpHash IS the hash of the
-        // interpreter ciphertext (known at stage2 runtime only after decode).
+        // Interpreter cipher: seed + interpLabel only.
+        //
+        // v6.9 trade-off: not XOR'd with envCheckExpected because stage1
+        // (which now performs the interp decrypt) lacks the zlib import
+        // needed to recompute the env-hash witness — adding it would put
+        // a zlib reference into canonical for the interp seed alone.
+        // The env-binding witness is preserved on the manifest, schema,
+        // and IR ciphertexts below, so a hooked-types attacker who
+        // bypasses the interp witness reaches only the public-equivalent
+        // interpreter (lib/v5/runtime_interp.py modulo namespace
+        // randomization) and still hits a closed manifest / schema / IR.
+        //
+        // NOT XOR'd with interpHash either: interpHash is the hash of
+        // the interpreter ciphertext, only knowable at runtime after
+        // decode.
         const interpLabel = randomBytes(6);
-        const interpSeedPre = sha256(concatBytes(seed, interpLabel));
-        const interpSeed = xor32(interpSeedPre, envCheckExpected);
+        const interpSeed = sha256(concatBytes(seed, interpLabel));
         const pepperedInterpSeed = xor32(interpSeed, pep);
         const paramsInterp = kdf(pepperedInterpSeed, prof);
         const encInterp = encrypt(interpPackedCompressed, paramsInterp, prof);
@@ -2278,8 +2301,8 @@ ${END_MARKER}
         // top of this function. Re-expose it here for stage2 consumption.
         const pepBytes = pep;
         const stage2Src = buildV5Stage2Source(
-            { n_seed, n_kd, n_dec, n_tchk, n_loadc },
-            { bootBundleVar: s2_bootVar, bootFuncName: BOOT_FUNC_NAME },
+            { n_seed, n_kd, n_dec, n_tchk },
+            { bootBundleVar: s2_bootVar, bootFuncName: BOOT_FUNC_NAME, interpCodeVar: s2_interpVar },
         );
         const stage2CodePack = opts.compileAndPackCode(stage2Src, '<pg_s2>');
         const stage2PackedCompressed = opts.compress(stage2CodePack);
@@ -2397,20 +2420,45 @@ try:
         ${s1_pt2} = ${s1_pt2}[::-1]
 except Exception:
     pass
-${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None, 'marshal': marshal${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}, '${n_loadc}': ${n_loadc}` : ''}}
+${s1_uns} = {'__name__': '__main__', '__builtins__': ${s1_b}, '__file__': __file__, '__package__': None, '__doc__': None, '__loader__': None, '__spec__': None, 'marshal': marshal${opts && opts.v5IR ? `, '${n_seed}': ${n_seed}, '${n_kd}': ${n_kd}, '${n_dec}': ${n_dec}, '${n_tchk}': ${n_tchk}` : ''}}
 try:
-${opts && opts.v5IR ? `    if (${s1_pt2}[:4] != bytes([80, 71, 83, 50]) or len(${s1_pt2}) < 8):
-        sys.exit(0)
-    ${s1_pkg2Off} = 4
-    ${s1_m2Len} = int.from_bytes(${s1_pt2}[${s1_pkg2Off}:${s1_pkg2Off} + 4], 'little')
+${opts && opts.v5IR ? `    # v6.9: stage2 plaintext is [pkg2_len: u32 LE][pkg2][boot2] with no
+    # leading magic. We clamp pkg2_len rather than fail-fast on mismatch
+    # so a 1-byte ciphertext tamper cannot be distinguished from valid
+    # plaintext by exit timing — garbage instead falls through to the
+    # uniform lzma/loadc except below.
+    ${s1_pkg2Off} = 0
+    ${s1_m2Len} = int.from_bytes(${s1_pt2}[${s1_pkg2Off}:${s1_pkg2Off} + 4], 'little') if len(${s1_pt2}) >= 4 else 0
     ${s1_pkg2Off} += 4
+    if ${s1_m2Len} < 0:
+        ${s1_m2Len} = 0
     if ${s1_pkg2Off} + ${s1_m2Len} > len(${s1_pt2}):
-        sys.exit(0)
+        ${s1_m2Len} = max(0, len(${s1_pt2}) - ${s1_pkg2Off})
     ${s1_pkg2} = ${s1_pt2}[${s1_pkg2Off}:${s1_pkg2Off} + ${s1_m2Len}]
     ${s1_pkg2Off} += ${s1_m2Len}
     ${s1_boot2} = ${s1_pt2}[${s1_pkg2Off}:]
     ${s1_pkg2} = lzma.decompress(${s1_pkg2})
+    # v6.9: pre-load the interpreter code-pack here so the PGCV decoder
+    # (\`${n_loadc}\`) never lands in stage2's globals dict.
+    #
+    # Boot bundle layout (must match packV5BootBundle in lib/v5/assemble.ts):
+    #   0..4    PGB1 magic
+    #   4..8    interp_len (u32 LE)
+    #   8..12   manifest_len, 12..16 schema_len, 16..20 ir_len
+    #   20..26  interp_label    26..32 manifest_label   32..38 schema_label
+    #   38..44  ir_label        44..56 boot_key         56..88 pep
+    #   88..103 profile         103..  ciphertext blobs (interp, manifest,
+    #                                  schema, ir)
+    ${s1_il} = int.from_bytes(${s1_boot2}[4:8], 'little')
+    ${s1_ilbl} = ${s1_boot2}[20:26]
+    ${s1_ict} = ${s1_boot2}[103:103 + ${s1_il}]
+    ${s1_isd} = hashlib.sha256(${n_seed} + ${s1_ilbl}).digest()
+    ${s1_ip} = ${n_kd}(${s1_isd})
+    ${s1_ipack} = lzma.decompress(${n_dec}(${s1_ict}, ${s1_ip}[0], ${s1_ip}[1], ${s1_ip}[2]))
+    ${s1_icode} = ${n_loadc}(${s1_ipack})
+    del ${s1_ipack}, ${s1_ict}, ${s1_ip}, ${s1_isd}, ${s1_ilbl}, ${s1_il}
     ${s1_uns}[${JSON.stringify(s2_bootVar)}] = ${s1_boot2}
+    ${s1_uns}[${JSON.stringify(s2_interpVar)}] = ${s1_icode}
     ${s1_co2} = ${n_loadc}(${s1_pkg2})` : `    ${s1_src2} = lzma.decompress(${s1_pt2}).decode('utf-8')
     ${s1_co2} = ${n_O}[${bi['compile']}](${s1_src2}, '<pg_s2>', 'exec', optimize=2)`}
 except Exception:

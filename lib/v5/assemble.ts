@@ -42,7 +42,10 @@ export interface AssembleNames {
     n_kd: string;       // stage1 injects _kd function here
     n_dec: string;      // stage1 injects _dec function here
     n_tchk: string;     // stage1 injects traceback-based trace checker here
-    n_loadc: string;    // stage1 injects the shared code-pack loader here
+    // v6.9: `n_loadc` is intentionally absent — stage1 pre-loads the
+    // interpreter code-pack and passes the resulting code object to
+    // stage2 via `AssembleStage2.interpCodeVar`, so the PGCV decoder is
+    // no longer reachable through stage2's __globals__.
 }
 
 // Runtime cipher primitives — must match encrypt() in lib/obfuscate.ts.
@@ -70,6 +73,9 @@ export interface V5BootBundle {
 export interface AssembleStage2 {
     bootBundleVar: string;
     bootFuncName: string;
+    // v6.9: stage1 pre-loads the interpreter code object and injects it
+    // into stage2's globals dict under this randomized name.
+    interpCodeVar: string;
 }
 
 function concatBytes(...arrs: Uint8Array[]): Uint8Array {
@@ -94,7 +100,11 @@ function u32le(n: number): Uint8Array {
 }
 
 const BOOT_BUNDLE_MAGIC = new Uint8Array([80, 71, 66, 49]);    // PGB1
-const STAGE2_PAYLOAD_MAGIC = new Uint8Array([80, 71, 83, 50]); // PGS2
+// v6.9: the stage2 plaintext envelope intentionally has no leading
+// magic. Removing the "PGS2" sentinel closed the cheapest single-byte
+// tamper oracle on the stage2 ciphertext (magic-mismatch fail-fast vs
+// proceed); residual oracles still exist via lzma / PGCV rejection but
+// require the tamper to traverse more of the canonical chain per probe.
 
 export function packV5BootBundle(bundle: V5BootBundle): Uint8Array {
     if (bundle.interpLabel.length !== 6 ||
@@ -136,8 +146,10 @@ export function packV5Stage2Payload(
     stage2Marshal: Uint8Array,
     bootBundle: Uint8Array,
 ): Uint8Array {
+    // Layout: [pkg2_len: u32 LE][pkg2: pkg2_len][boot2: rest]. No
+    // leading magic — the canonical region clamps pkg2_len and lets
+    // garbage fall through to the uniform lzma/loadc except clause.
     return concatBytes(
-        STAGE2_PAYLOAD_MAGIC,
         u32le(stage2Marshal.length),
         stage2Marshal,
         bootBundle,
@@ -164,8 +176,8 @@ export function buildV5Stage2Source(
     names: AssembleNames,
     stage2: AssembleStage2,
 ): string {
-    const { n_seed, n_kd, n_dec, n_tchk, n_loadc } = names;
-    const { bootBundleVar, bootFuncName } = stage2;
+    const { n_seed, n_kd, n_dec, n_tchk } = names;
+    const { bootBundleVar, bootFuncName, interpCodeVar } = stage2;
     const bootFuncNameExpr = JSON.stringify(bootFuncName);
 
     // Stage2 source (compiled+packed at build time):
@@ -210,7 +222,10 @@ _pg_interp_len = int.from_bytes(_pg_pkg[_pg_o:_pg_o + 4], 'little'); _pg_o += 4
 _pg_manifest_len = int.from_bytes(_pg_pkg[_pg_o:_pg_o + 4], 'little'); _pg_o += 4
 _pg_schema_len = int.from_bytes(_pg_pkg[_pg_o:_pg_o + 4], 'little'); _pg_o += 4
 _pg_ir_len = int.from_bytes(_pg_pkg[_pg_o:_pg_o + 4], 'little'); _pg_o += 4
-_pg_interp_label = _pg_pkg[_pg_o:_pg_o + 6]; _pg_o += 6
+# v6.9: skip the interp_label slot — stage1 read its own copy from the
+# boot bundle when it pre-loaded the interpreter code-pack, so stage2
+# does not need to materialize the label at all.
+_pg_o += 6
 _pg_manifest_label = _pg_pkg[_pg_o:_pg_o + 6]; _pg_o += 6
 _pg_schema_label = _pg_pkg[_pg_o:_pg_o + 6]; _pg_o += 6
 _pg_ir_label = _pg_pkg[_pg_o:_pg_o + 6]; _pg_o += 6
@@ -224,11 +239,10 @@ _pg_manifest_ct = _pg_pkg[_pg_o:_pg_o + _pg_manifest_len]; _pg_o += _pg_manifest
 _pg_schema_ct = _pg_pkg[_pg_o:_pg_o + _pg_schema_len]; _pg_o += _pg_schema_len
 _pg_ir_ct = _pg_pkg[_pg_o:_pg_o + _pg_ir_len]
 _pg_interp_hash = hashlib.sha256(_pg_interp_ct).digest()
-_pg_interp_seed = bytes(a ^ b for a, b in zip(hashlib.sha256(${n_seed} + _pg_interp_label).digest(), _pg_env))
-_pg_interp_p = ${n_kd}(_pg_interp_seed)
-_pg_interp_pack = lzma.decompress(${n_dec}(_pg_interp_ct, _pg_interp_p[0], _pg_interp_p[1], _pg_interp_p[2]))
-_pg_interp_code = ${n_loadc}(_pg_interp_pack)
-del _pg_interp_pack
+# v6.9: stage1 already produced the interpreter code object and stashed
+# it under a randomized globals name. Pop+clear the slot so neither the
+# decoder nor the loaded code stays reachable through stage2 globals.
+_pg_interp_code = globals().pop(${JSON.stringify(interpCodeVar)})
 _pg_interp_ns = {bytes([95, 95, 98, 117, 105, 108, 116, 105, 110, 115, 95, 95]).decode(): __builtins__, bytes([95, 95, 110, 97, 109, 101, 95, 95]).decode(): bytes([60, 112, 103, 95, 105, 62]).decode()}
 _pg_interp_fn = _pg_ft(_pg_interp_code, _pg_interp_ns)
 del _pg_interp_ns, _pg_interp_code

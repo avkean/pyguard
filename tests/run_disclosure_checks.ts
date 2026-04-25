@@ -108,6 +108,118 @@ print(len(hits))
     }
 }
 
+// v6.9 release gate: stage2's globals dict must not expose a callable
+// PGCV decoder. Pre-v6.9 stage1 injected `_loadc` into stage2 so the
+// interpreter code-pack could be decrypted at runtime; v6.9 moves that
+// work into stage1 and hands stage2 only the resulting code object.
+//
+// The probe monkey-patches `os.urandom` (stage2 calls it 8x for the
+// v6.7 decoy pool), identifies the stage2 frame by a globals-name
+// signature (PyGuard's PGCV loader strips co_filename, so '<pg_s2>' is
+// not visible), and scans every callable in that frame's globals for
+// the PGCV magic embedded in its `co_consts`. The hook target is
+// chosen to sit outside stage2's env-hash witness list — replacing a
+// function whose `type(...).__name__` participates in the witness
+// (zlib.decompress, hashlib.shake_128, marshal.loads, etc.) shifts it
+// from `builtin_function_or_method` to `function` and corrupts the
+// cipher. `os.urandom` is not in that list.
+function assertNoStage2LoaderInGlobals(stubPath: string): void {
+    const script = `
+import json, os, sys
+
+target = os.path.abspath(${JSON.stringify(stubPath)})
+captured = []
+PGCV_MAGIC = bytes([80, 71, 67, 86])
+real_urandom = os.urandom
+
+def code_carries_pgcv(code, depth=0):
+    # \`_loadc\` writes the magic as \`bytes([80, 71, 67, 86])\`, which the
+    # CPython compiler lowers to a 4-int tuple constant fed to bytes().
+    # Accept either form (tuple or bytes constant) for robustness.
+    if depth > 4 or code is None:
+        return False
+    for c in getattr(code, 'co_consts', ()):
+        if isinstance(c, (bytes, bytearray)) and PGCV_MAGIC in bytes(c):
+            return True
+        if (isinstance(c, tuple) and len(c) == 4
+                and all(isinstance(x, int) for x in c)
+                and bytes(c) == PGCV_MAGIC):
+            return True
+        if hasattr(c, 'co_code') and code_carries_pgcv(c, depth + 1):
+            return True
+    return False
+
+def is_stage2_frame(fr):
+    # Match by the globals-name signature unique to stage2's module body.
+    g = fr.f_globals
+    return ('_pg_boot_blob' in g and '_pg_interp_fn' in g
+            and '_pg_env' in g and '_pg_manifest_pairs' in g)
+
+def snap_stage2():
+    depth = 0
+    while True:
+        try:
+            fr = sys._getframe(depth)
+        except ValueError:
+            return
+        if is_stage2_frame(fr):
+            loaders = []
+            for vname, val in list(fr.f_globals.items()):
+                code = getattr(val, '__code__', None) if callable(val) else None
+                if code is None:
+                    continue
+                try:
+                    if code_carries_pgcv(code):
+                        loaders.append(vname)
+                except Exception:
+                    pass
+            captured.append(sorted(loaders))
+            return
+        depth += 1
+
+def hook(*a, **kw):
+    if not captured:
+        try:
+            snap_stage2()
+        except Exception:
+            pass
+    return real_urandom(*a, **kw)
+
+os.urandom = hook
+ns = {'__name__': '__main__', '__file__': target, '__builtins__': __builtins__}
+with open(target, 'r', encoding='utf-8', errors='replace') as fh:
+    src = fh.read()
+try:
+    exec(compile(src, target, 'exec'), ns)
+except BaseException:
+    pass
+print(json.dumps(captured))
+`;
+    const out = runCmd("python3", ["-c", script]).trim();
+    const last = out.split(/\r?\n/).pop()?.trim() ?? "";
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(last);
+    } catch {
+        throw new Error(`stage2 loader gate: unparseable output ${out}`);
+    }
+    if (!Array.isArray(parsed)) {
+        throw new Error(`stage2 loader gate: expected array, saw ${out}`);
+    }
+    if (parsed.length === 0) {
+        throw new Error(
+            `stage2 loader gate: stage2 frame never seen by os.urandom hook — test cannot measure. Did stage2 fail to start?`,
+        );
+    }
+    for (const inner of parsed as unknown[]) {
+        if (Array.isArray(inner) && inner.length > 0) {
+            throw new Error(
+                `stage2 loader gate: PGCV-decoder callable still reachable in stage2 globals: ${JSON.stringify(inner)}`,
+            );
+        }
+    }
+}
+
 function assertImportProxyHeld(stubPath: string, fingerprint: string): void {
     const out = runCmd("python3", [path.join(ROOT, "tests", "pentest", "c18_attack_sysmodules_proxy.py"), stubPath]);
     if (out.includes(fingerprint)) {
@@ -692,6 +804,8 @@ function main(): void {
         console.log("PASS  audit leak gate");
         assertNoMarshalExecutionBoundary(auditStub);
         console.log("PASS  marshal boundary gate");
+        assertNoStage2LoaderInGlobals(auditStub);
+        console.log("PASS  stage2 loader reachability gate");
 
         const revStub = path.join(td, "test_rev.py");
         buildStub(path.join(ROOT, "tests", "test_rev", "dist.py"), revStub);
