@@ -11,7 +11,7 @@
 # ============================================================
 
 # -------------------- builder (Node + any python3) --------------------
-FROM node:20-bookworm-slim AS builder
+FROM node:24-bookworm-slim AS builder
 
 WORKDIR /app
 
@@ -38,12 +38,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000
 
-# Node 20 from NodeSource + Python 3.9..3.14 from deadsnakes.
+# Node 24 from NodeSource + Python 3.9..3.14 from deadsnakes.
 RUN set -eux \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg software-properties-common \
- && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
  && add-apt-repository -y ppa:deadsnakes/ppa \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
